@@ -2,9 +2,15 @@ import Foundation
 
 /// One row of results. A value type, so nothing the panel holds points into memory
 /// that Rust owns.
+enum MatchKind {
+    case app
+    case file
+}
+
 struct Match: Identifiable, Equatable {
     let id: UInt64
     let name: String
+    let kind: MatchKind
     /// The bundle path. Used twice — for the icon and for the launch — which is why it
     /// travels in the result struct rather than being re-derived from `id`.
     let path: String
@@ -61,12 +67,14 @@ final class Core {
         Int(bs_max_results(handle))
     }
 
-    func query(_ text: String, limit: Int) -> [Match] {
+    /// `pending` is true while a file search is still running, meaning more results may
+    /// arrive for the same query. Always false for a query with no `?` prefix.
+    func query(_ text: String, limit: Int) -> (matches: [Match], pending: Bool) {
         let results = text.withCString { bs_query(handle, $0, limit) }
         // `defer`, not a trailing call: this must run on every path out of the
         // function, and Rust owns every allocation inside `results`.
         defer { bs_free_results(results) }
-        return Self.decode(results)
+        return (Self.decode(results), results.pending)
     }
 
     /// The M3 frecency seam. A no-op in the core today; called anyway so that landing
@@ -86,7 +94,7 @@ final class Core {
     /// so a limit past any plausible index size returns all of it — no extra FFI entry
     /// point and no header regeneration needed.
     func allPaths() -> [String] {
-        query("", limit: 4096).map(\.path)
+        query("", limit: 4096).matches.map(\.path)
     }
 
     private static func decode(_ results: BsResults) -> [Match] {
@@ -95,6 +103,7 @@ final class Core {
             Match(
                 id: result.id,
                 name: string(result.name, result.name_len),
+                kind: result.kind == UInt8(BS_KIND_FILE) ? .file : .app,
                 path: string(result.path, result.path_len),
                 score: result.score
             )

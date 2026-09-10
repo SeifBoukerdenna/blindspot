@@ -57,7 +57,7 @@ enum LatencyBench {
         panel.orderFrontRegardless()
 
         // Steady state is what a typing user experiences; first-touch view setup is not.
-        for query in queries { results.update(core.query(query, limit: core.maxResults)) }
+        for query in queries { results.update(core.query(query, limit: core.maxResults).matches) }
 
         var ffi: [Double] = [], update: [Double] = [], reframe: [Double] = [], total: [Double] = []
         var lastHeight: CGFloat = -1
@@ -65,7 +65,7 @@ enum LatencyBench {
         for _ in 0..<iterations {
             for query in queries {
                 let t0 = DispatchTime.now().uptimeNanoseconds
-                let matches = core.query(query, limit: core.maxResults)
+                let matches = core.query(query, limit: core.maxResults).matches
                 let t1 = DispatchTime.now().uptimeNanoseconds
                 results.update(matches)
                 let t2 = DispatchTime.now().uptimeNanoseconds

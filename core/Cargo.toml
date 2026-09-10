@@ -9,6 +9,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 nucleo-matcher = "0.3.1"
 plist = "1.10.1"
+redb = "4.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.5"
 

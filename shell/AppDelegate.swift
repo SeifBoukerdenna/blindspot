@@ -1,26 +1,5 @@
 import AppKit
 
-/// Opt-in tracing for the show/dismiss/hotkey cycle. Silent unless `BLINDSPOT_DEBUG` is
-/// set in the environment, so running the binary directly is the only way to see it.
-@MainActor
-enum Diagnostics {
-    static let enabled = ProcessInfo.processInfo.environment["BLINDSPOT_DEBUG"] != nil
-
-    static func log(_ message: @autoclosure () -> String) {
-        guard enabled else { return }
-        FileHandle.standardError.write(Data("blindspot: \(message())\n".utf8))
-    }
-
-    /// Runs `body` later, to catch state that changes *after* the call that set it up.
-    static func after(_ seconds: Double, _ body: @escaping @MainActor () -> Void) {
-        guard enabled else { return }
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(Int(seconds * 1000)))
-            body()
-        }
-    }
-}
-
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {

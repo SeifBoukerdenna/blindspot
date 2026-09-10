@@ -10,6 +10,23 @@
 #include <stdlib.h>
 
 /**
+ * A [`BsResult`] that is an application bundle.
+ */
+#define BS_KIND_APP 0
+
+/**
+ * A [`BsResult`] that is a file found through Spotlight.
+ */
+#define BS_KIND_FILE 1
+
+/**
+ * A query beginning with this searches the filesystem instead of only the app index.
+ *
+ * Explicit rather than automatic, so no subprocess ever runs unless it was asked for.
+ */
+#define PREFIX '?'
+
+/**
  * Opaque to C. Swift only ever holds a `BsHandle *`.
  */
 typedef struct BsHandle BsHandle;
@@ -32,6 +49,11 @@ typedef struct {
   const uint8_t *path;
   size_t path_len;
   uint32_t score;
+  /**
+   * [`BS_KIND_APP`] or [`BS_KIND_FILE`]. Swift needs it to choose between launching
+   * an application and opening a document in whatever owns it.
+   */
+  uint8_t kind;
 } BsResult;
 
 /**
@@ -41,6 +63,12 @@ typedef struct {
 typedef struct {
   BsResult *items;
   size_t len;
+  /**
+   * True while a file search for this query is still running, meaning more results
+   * may follow. Swift polls until it goes false. Always false for a query with no
+   * `?` prefix, because nothing asynchronous was started.
+   */
+  bool pending;
 } BsResults;
 
 #ifdef __cplusplus
@@ -84,9 +112,13 @@ BsResults bs_query(BsHandle *handle, const char *query, size_t limit);
 /**
  * Records that the user launched `result_id`.
  *
- * A no-op at M1. It exists now so that M3's frecency store is a pure-Rust change with
- * no header regeneration and no Swift edit — the call site is already in place and
- * already passing the stable id it will need.
+ * Updates the in-memory frecency score immediately and persists it on a detached
+ * thread, so this returns without waiting on an fsync. Later queries rank a
+ * frequently-launched app above an equally-good textual match.
+ *
+ * An id that matches nothing is recorded anyway and simply never scores against a
+ * result — ids are hashes of bundle paths, so a stale one belongs to an app that has
+ * been uninstalled and may yet come back.
  *
  * # Safety
  *

@@ -178,7 +178,9 @@ half_life_days = 14
 
 ## Open questions
 
-- redb vs rusqlite for the frecency store — decide at M3, whichever is less friction.
+- ~~redb vs rusqlite for the frecency store~~ — settled at M3: **redb**. Measured, on its
+  own "less friction" criterion: redb adds 1 transitive crate and no C build, rusqlite
+  adds 11 and a `libsqlite3-sys` build. See the note at the top of `core/src/store.rs`.
 - Whether the Swift results view should be an `NSTableView` or hand-drawn. Table view
   is more correct, hand-drawn is faster to get right for 8 fixed-height rows.
 - Whether to sign/notarize. Not needed for personal use; needed the moment you want to

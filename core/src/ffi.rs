@@ -18,8 +18,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::files::FileSearch;
+use crate::frecency::Frecency;
 use crate::index::{AppEntry, Index, apps};
 use crate::matching::Ranker;
+use crate::store::Store;
 
 /// How often a rescan may actually run.
 ///
@@ -43,7 +46,17 @@ pub struct BsHandle {
     rescanning: Arc<AtomicBool>,
     /// When the last rescan started. Seeded at init, which has already scanned.
     last_scan: Mutex<Option<Instant>>,
+    frecency: Mutex<Frecency>,
+    files: FileSearch,
+    /// `None` if the store could not be opened. Frecency then works for the session and
+    /// is forgotten at exit, which is a far better failure than refusing to launch.
+    store: Option<Arc<Store>>,
 }
+
+/// A [`BsResult`] that is an application bundle.
+pub const BS_KIND_APP: u8 = 0;
+/// A [`BsResult`] that is a file found through Spotlight.
+pub const BS_KIND_FILE: u8 = 1;
 
 /// One ranked match.
 ///
@@ -62,6 +75,9 @@ pub struct BsResult {
     pub path: *const u8,
     pub path_len: usize,
     pub score: u32,
+    /// [`BS_KIND_APP`] or [`BS_KIND_FILE`]. Swift needs it to choose between launching
+    /// an application and opening a document in whatever owns it.
+    pub kind: u8,
 }
 
 /// A pointer and a length, so one query is one struct rather than a Swift-side array
@@ -70,6 +86,10 @@ pub struct BsResult {
 pub struct BsResults {
     pub items: *mut BsResult,
     pub len: usize,
+    /// True while a file search for this query is still running, meaning more results
+    /// may follow. Swift polls until it goes false. Always false for a query with no
+    /// `?` prefix, because nothing asynchronous was started.
+    pub pending: bool,
 }
 
 impl BsResults {
@@ -77,6 +97,7 @@ impl BsResults {
         Self {
             items: std::ptr::null_mut(),
             len: 0,
+            pending: false,
         }
     }
 }
@@ -146,9 +167,13 @@ pub unsafe extern "C" fn bs_query(
 
 /// Records that the user launched `result_id`.
 ///
-/// A no-op at M1. It exists now so that M3's frecency store is a pure-Rust change with
-/// no header regeneration and no Swift edit — the call site is already in place and
-/// already passing the stable id it will need.
+/// Updates the in-memory frecency score immediately and persists it on a detached
+/// thread, so this returns without waiting on an fsync. Later queries rank a
+/// frequently-launched app above an equally-good textual match.
+///
+/// An id that matches nothing is recorded anyway and simply never scores against a
+/// result — ids are hashes of bundle paths, so a stale one belongs to an app that has
+/// been uninstalled and may yet come back.
 ///
 /// # Safety
 ///
@@ -261,13 +286,42 @@ fn init(explicit: Option<String>) -> *mut BsHandle {
     let index = Arc::new(Index::new());
     index.replace(apps::scan(&config.resolved_app_paths()));
 
+    let store = match Store::default_path().and_then(|path| Store::open(&path)) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            eprintln!("blindspot: {e}; frecency will not persist");
+            None
+        }
+    };
+    let visits = match store.as_ref().map(|s| s.load()) {
+        Some(Ok(rows)) => rows,
+        Some(Err(e)) => {
+            eprintln!("blindspot: {e}; starting with no history");
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
+    let frecency = Frecency::load(config.frecency.half_life_days, visits);
+
     Box::into_raw(Box::new(BsHandle {
         config,
         index,
         ranker: Mutex::new(Ranker::new()),
         rescanning: Arc::new(AtomicBool::new(false)),
         last_scan: Mutex::new(Some(Instant::now())),
+        frecency: Mutex::new(frecency),
+        files: FileSearch::new(),
+        store,
     }))
+}
+
+/// Seconds since the Unix epoch, or 0 if the clock is before it. Frecency arithmetic
+/// saturates on time going backwards, so a nonsense clock costs ranking quality and
+/// nothing more.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Split out as a pure function so the window is unit-testable without a test that
@@ -282,29 +336,100 @@ fn should_rescan(last: Option<Instant>, now: Instant, interval: Duration) -> boo
 }
 
 impl BsHandle {
-    fn query(&self, query: &str, limit: usize) -> BsResults {
-        let snapshot = self.index.snapshot();
-        let ranked = match self.ranker.lock() {
-            Ok(mut ranker) => ranker.rank(query, &snapshot, limit),
-            // A poisoned ranker means an earlier query panicked while holding it. Its
-            // contents are scratch buffers with no invariant to violate, so recovering
-            // beats leaving the launcher permanently unable to answer a keystroke.
-            Err(poisoned) => poisoned.into_inner().rank(query, &snapshot, limit),
-        };
-
-        // `get` rather than indexing: the ranker's indices are into this same snapshot
-        // so they are in range, but a panic here would abort the process and that is
-        // too high a price for an assumption.
-        let items: Vec<BsResult> = ranked
-            .iter()
-            .filter_map(|r| snapshot.get(r.index).map(|e| BsResult::new(e, r.score)))
-            .collect();
-
-        leak_results(items)
+    /// Both locks recover from poisoning rather than propagating: a poisoned lock here
+    /// means an earlier call panicked, and the contents — scratch buffers and a score
+    /// map — have no invariant a stale value could violate. Losing the launcher forever
+    /// is much worse than one odd ranking.
+    fn with_ranker<T>(&self, f: impl FnOnce(&mut Ranker) -> T) -> T {
+        match self.ranker.lock() {
+            Ok(mut guard) => f(&mut guard),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
     }
 
-    /// The M3 frecency seam. See [`bs_activate`].
-    fn record_activation(&self, _result_id: u64) {}
+    fn with_frecency<T>(&self, f: impl FnOnce(&mut Frecency) -> T) -> T {
+        match self.frecency.lock() {
+            Ok(mut guard) => f(&mut guard),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    fn query(&self, query: &str, limit: usize) -> BsResults {
+        let snapshot = self.index.snapshot();
+        let now = unix_now();
+
+        let file_query = crate::files::strip_prefix(query);
+        let text = file_query.unwrap_or(query);
+
+        // A bare `?` has nothing to match yet. Falling through would rank the empty
+        // string against the app index and return its alphabetical head — exactly the
+        // noise the empty state exists to suppress.
+        if file_query.is_some() && text.is_empty() {
+            return BsResults::empty();
+        }
+
+        // Kicked and read in one breath: `search` is idempotent, so calling it on every
+        // keystroke and every poll needs no bookkeeping here.
+        let (hits, pending) = match file_query {
+            Some(text) => {
+                self.files.search(text);
+                self.files.results(text)
+            }
+            None => (Vec::new(), false),
+        };
+
+        let (apps, files) = self.with_frecency(|frecency| {
+            self.with_ranker(|ranker| {
+                let apps = ranker.rank_with(text, &snapshot, limit, |id| frecency.boost(id, now));
+                // Apps first, files fill what is left. `mdfind` returns paths in no
+                // useful order, so ranking their basenames is real value for free — and
+                // it picks up frecency through the same boost.
+                let remaining = limit.saturating_sub(apps.len());
+                let files = if remaining > 0 && !hits.is_empty() {
+                    ranker.rank_with(text, &hits, remaining, |id| frecency.boost(id, now))
+                } else {
+                    Vec::new()
+                };
+                (apps, files)
+            })
+        });
+
+        // `get` rather than indexing: a panic here would abort the process, which is too
+        // high a price for an assumption about the ranker's indices.
+        let mut items: Vec<BsResult> = apps
+            .iter()
+            .filter_map(|r| {
+                snapshot
+                    .get(r.index)
+                    .map(|e| BsResult::new(e, r.score, BS_KIND_APP))
+            })
+            .collect();
+        items.extend(files.iter().filter_map(|r| {
+            hits.get(r.index)
+                .map(|e| BsResult::new(e, r.score, BS_KIND_FILE))
+        }));
+
+        leak_results(items, pending)
+    }
+
+    fn record_activation(&self, result_id: u64) {
+        let now = unix_now();
+        let visit = self.with_frecency(|frecency| frecency.record(result_id, now));
+
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        // Persisted off-thread. A redb commit is an fsync, and this runs immediately
+        // before Swift hands off to Launch Services — the in-memory score is already
+        // updated, so ranking reflects the launch whether or not the write has landed.
+        let _ = std::thread::Builder::new()
+            .name("blindspot-frecency".to_owned())
+            .spawn(move || {
+                if let Err(e) = store.put(result_id, visit) {
+                    eprintln!("blindspot: {e}");
+                }
+            });
+    }
 
     fn last_scan_at(&self) -> Option<Instant> {
         match self.last_scan.lock() {
@@ -368,7 +493,7 @@ impl Drop for RescanGuard {
 }
 
 impl BsResult {
-    fn new(entry: &AppEntry, score: u32) -> Self {
+    fn new(entry: &AppEntry, score: u32, kind: u8) -> Self {
         let (name, name_len) = leak_bytes(entry.name.as_bytes());
         // A macOS path is bytes, not a `String`. Going through `as_bytes` rather than
         // `to_string_lossy` means a bundle with a non-UTF-8 name still launches.
@@ -380,6 +505,7 @@ impl BsResult {
             path,
             path_len,
             score,
+            kind,
         }
     }
 }
@@ -394,15 +520,19 @@ fn leak_bytes(bytes: &[u8]) -> (*const u8, usize) {
     (Box::into_raw(boxed).cast::<u8>(), len)
 }
 
-fn leak_results(items: Vec<BsResult>) -> BsResults {
+fn leak_results(items: Vec<BsResult>, pending: bool) -> BsResults {
     if items.is_empty() {
-        return BsResults::empty();
+        return BsResults {
+            pending,
+            ..BsResults::empty()
+        };
     }
     let boxed = items.into_boxed_slice();
     let len = boxed.len();
     BsResults {
         items: Box::into_raw(boxed).cast::<BsResult>(),
         len,
+        pending,
     }
 }
 
@@ -483,6 +613,9 @@ mod tests {
             ranker: Mutex::new(Ranker::new()),
             rescanning: Arc::new(AtomicBool::new(false)),
             last_scan: Mutex::new(None),
+            frecency: Mutex::new(Frecency::new(14.0)),
+            files: FileSearch::new(),
+            store: None,
         }))
     }
 
@@ -511,6 +644,17 @@ mod tests {
         // SAFETY: exactly one free, of exactly what `bs_query` returned.
         unsafe { bs_free_results(results) };
         out
+    }
+
+    /// As `query`, but also reports whether a file search is still running.
+    fn query_pending(h: *mut BsHandle, q: &str) -> bool {
+        let c = CString::new(q).expect("test query has no interior NUL");
+        // SAFETY: `h` is live for the duration of each test and `c` outlives the call.
+        let results = unsafe { bs_query(h, c.as_ptr(), 8) };
+        let pending = results.pending;
+        // SAFETY: exactly one free, of exactly what `bs_query` returned.
+        unsafe { bs_free_results(results) };
+        pending
     }
 
     fn query(h: *mut BsHandle, q: &str, limit: usize) -> Vec<(String, String, u64)> {
@@ -556,6 +700,94 @@ mod tests {
         let h = handle(&["Safari", "Slack", "Stocks", "System Settings"]);
         assert_eq!(query(h, "s", 2).len(), 2);
         assert!(query(h, "s", 0).is_empty());
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn launching_an_app_promotes_it_for_later_queries() {
+        // The M3 acceptance test, and CLAUDE.md's own example: a single character ties
+        // every fuzzy score, so cold order is alphabetical and only frecency can break it.
+        let h = handle(&["Safari", "Slack", "Stocks"]);
+        let slack = AppEntry::new("Slack".into(), "/Applications/Slack.app".into()).id;
+
+        assert_eq!(
+            query(h, "s", 8)[0].0,
+            "Safari",
+            "cold, the tie breaks alphabetically"
+        );
+
+        // SAFETY: `h` is live and `slack` is one of its ids.
+        unsafe { bs_activate(h, slack) };
+        assert_eq!(
+            query(h, "s", 8)[0].0,
+            "Slack",
+            "one launch should win the tie"
+        );
+
+        // A better textual match still beats a favourite.
+        assert_eq!(query(h, "sto", 8)[0].0, "Stocks");
+
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn activating_an_unknown_id_is_harmless() {
+        let h = handle(&["Safari"]);
+        // SAFETY: NULL and unknown ids are both part of the contract.
+        unsafe { bs_activate(h, 0xDEAD_BEEF) };
+        assert_eq!(query(h, "s", 8)[0].0, "Safari");
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn a_query_without_the_prefix_never_starts_a_file_search() {
+        // The whole promise of the explicit-prefix decision: no `mdfind` behind your back.
+        let h = handle(&["Safari", "Slack"]);
+        assert!(!query_pending(h, "saf"), "a plain query is never pending");
+
+        // SAFETY: `h` is live.
+        let files = unsafe { &(*h).files };
+        let (results, pending) = files.results("saf");
+        assert!(
+            results.is_empty() && !pending,
+            "nothing was ever searched for"
+        );
+
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn a_bare_prefix_returns_nothing_rather_than_the_app_index() {
+        let h = handle(&["Safari", "Slack", "Stocks"]);
+        assert!(query(h, "?", 8).is_empty());
+        assert!(!query_pending(h, "?"));
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn a_prefixed_query_still_ranks_apps() {
+        let h = handle(&["Safari", "Slack"]);
+        // `?s` sits under the spawn floor, so this proves apps rank against the stripped
+        // query without the test depending on the filesystem or spawning anything.
+        let names: Vec<String> = query(h, "?s", 8).into_iter().map(|(n, _, _)| n).collect();
+        assert_eq!(
+            names,
+            ["Safari", "Slack"],
+            "apps rank against the stripped query"
+        );
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn a_prefixed_query_under_the_floor_does_not_leave_the_caller_polling() {
+        let h = handle(&["Safari"]);
+        assert!(!query_pending(h, "?a"), "the floor must not spawn or hang");
         // SAFETY: one shutdown, no calls after it.
         unsafe { bs_shutdown(h) };
     }
@@ -640,6 +872,9 @@ mod tests {
             ranker: Mutex::new(Ranker::new()),
             rescanning: Arc::new(AtomicBool::new(false)),
             last_scan: Mutex::new(None),
+            frecency: Mutex::new(Frecency::new(14.0)),
+            files: FileSearch::new(),
+            store: None,
         }));
 
         let got = query(h, "odd", 8);

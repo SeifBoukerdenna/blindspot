@@ -96,7 +96,6 @@ final class HotKey {
     }
 
     fileprivate func fire() {
-        Diagnostics.log("hotkey fired")
         onPress()
     }
 }

@@ -54,6 +54,20 @@ impl Ranker {
     /// before the user has typed, so it yields the first `limit` entries in index
     /// order, which is alphabetical.
     pub fn rank(&mut self, query: &str, entries: &[AppEntry], limit: usize) -> Vec<Ranked> {
+        self.rank_with(query, entries, limit, |_| 1.0)
+    }
+
+    /// As [`Ranker::rank`], but scales each match by `boost(entry.id)`.
+    ///
+    /// The multiplier comes from the caller so this module stays ignorant of frecency —
+    /// it knows how to match text and nothing else.
+    pub fn rank_with(
+        &mut self,
+        query: &str,
+        entries: &[AppEntry],
+        limit: usize,
+        boost: impl Fn(u64) -> f64,
+    ) -> Vec<Ranked> {
         if limit == 0 {
             return Vec::new();
         }
@@ -77,7 +91,13 @@ impl Ranker {
         for (index, entry) in entries.iter().enumerate() {
             let haystack = Utf32Str::new(&entry.name, buf);
             if let Some(score) = pattern.score(haystack, matcher) {
-                candidates.push(Ranked { index, score });
+                // `as u32` on a float saturates rather than wrapping, and the boost is
+                // bounded well under 2x, so this cannot overflow into a bogus rank.
+                let blended = (f64::from(score) * boost(entry.id)).round() as u32;
+                candidates.push(Ranked {
+                    index,
+                    score: blended,
+                });
             }
         }
 
@@ -98,7 +118,12 @@ mod tests {
     fn entries(names: &[&str]) -> Vec<AppEntry> {
         names
             .iter()
-            .map(|n| AppEntry::new((*n).to_owned(), PathBuf::from(format!("/Applications/{n}.app"))))
+            .map(|n| {
+                AppEntry::new(
+                    (*n).to_owned(),
+                    PathBuf::from(format!("/Applications/{n}.app")),
+                )
+            })
             .collect()
     }
 
@@ -169,7 +194,34 @@ mod tests {
         let mut reused = Ranker::new();
         let _ = reused.rank("term", &apps, 8);
         let _ = reused.rank("saf", &apps, 8);
-        assert_eq!(reused.rank("s", &apps, 8), Ranker::new().rank("s", &apps, 8));
+        assert_eq!(
+            reused.rank("s", &apps, 8),
+            Ranker::new().rank("s", &apps, 8)
+        );
+    }
+
+    #[test]
+    fn a_boost_reorders_a_tie_without_rescuing_a_bad_match() {
+        // Real numbers from the index: "s" ties every result at 36, and "x" scores
+        // Xcode 36 against Firefox 16.
+        let apps = entries(&["Safari", "Slack"]);
+        let slack = apps[1].id;
+        let got = Ranker::new().rank_with("s", &apps, 8, |id| if id == slack { 1.6 } else { 1.0 });
+        assert_eq!(
+            ranked_names(&apps, &got).first(),
+            Some(&"Slack"),
+            "frecency should win a tie the text cannot break"
+        );
+
+        let apps = entries(&["Xcode", "Firefox"]);
+        let firefox = apps[0].id;
+        let got =
+            Ranker::new().rank_with("x", &apps, 8, |id| if id == firefox { 1.6 } else { 1.0 });
+        assert_eq!(
+            ranked_names(&apps, &got).first(),
+            Some(&"Xcode"),
+            "a favourite must not overtake a much better textual match"
+        );
     }
 
     #[test]

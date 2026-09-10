@@ -152,7 +152,6 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     // MARK: - Showing and dismissing
 
     func toggle() {
-        Diagnostics.log("toggle: isVisible=\(isVisible) key=\(isKeyWindow) appActive=\(NSApp.isActive)")
         if isVisible {
             dismiss(restoringFocus: true)
         } else {
@@ -183,21 +182,6 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // just the cell's backing value.
         field.stringValue = ""
         refresh()
-        Diagnostics.log(
-            "shown: visible=\(isVisible) key=\(isKeyWindow) appActive=\(NSApp.isActive) "
-                + "frame=\(NSStringFromRect(frame)) rows=\(results.matches.count)")
-        // `isVisible` only means the window is ordered in — it does not mean the user
-        // can see it, and an Apple-acknowledged bug (FB15657061) has it reporting true
-        // for windows absent from the on-screen list entirely. `occlusionState` is the
-        // property that answers the real question, and sampling it after `show()` has
-        // returned is what caught AppKit un-mapping the panel behind our back.
-        Diagnostics.after(0.4) { [weak self] in
-            guard let self else { return }
-            Diagnostics.log(
-                "  +400ms: visible=\(self.isVisible) key=\(self.isKeyWindow) "
-                    + "appActive=\(NSApp.isActive) onActiveSpace=\(self.isOnActiveSpace) "
-                    + "onScreen=\(self.occlusionState.contains(.visible))")
-        }
     }
 
     /// Guards against re-entry: `orderOut` makes the panel resign key, which calls
@@ -229,7 +213,6 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         if restoringFocus {
             _ = previousApp?.activate()
         }
-        Diagnostics.log("dismissed: restoringFocus=\(restoringFocus) to=\(previousApp?.localizedName ?? "none")")
         previousApp = nil
 
         // Deferred a turn so dismissal itself stays snappy, and done here rather than on
@@ -260,11 +243,28 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // which is the same eight alphabetically-first apps every single time — noise,
         // not a starting point, and no real launcher shows it. It also means the panel
         // opens as one field with no rows and no icons to render.
-        let matches =
-            text.trimmingCharacters(in: .whitespaces).isEmpty
-            ? [] : core.query(text, limit: core.maxResults)
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
+            results.update([])
+            layoutForResults()
+            return
+        }
+
+        let (matches, pending) = core.query(text, limit: core.maxResults)
         results.update(matches)
         layoutForResults()
+
+        // A file search is still running in Rust, so re-ask shortly. Polling rather than
+        // a callback keeps the FFI at one entry point and keeps threads out of Swift; a
+        // re-query costs ~0.4ms, so the poll is free next to the ~120ms `mdfind` it is
+        // waiting on. Guarded on the text being unchanged so a stale poll cannot
+        // overwrite what the user has since typed.
+        if pending {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(60))
+                guard let self, self.isVisible, self.field.stringValue == text else { return }
+                self.refresh()
+            }
+        }
     }
 
     private func launchSelected() {
@@ -280,12 +280,22 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         configuration.createsNewApplicationInstance = false
 
         let path = match.path
-        NSWorkspace.shared.openApplication(
-            at: URL(fileURLWithPath: path), configuration: configuration
-        ) { _, error in
-            // Runs off the main thread, so nothing here may touch AppKit.
-            if let error {
-                NSLog("blindspot: could not launch %@: %@", path, error.localizedDescription)
+        let url = URL(fileURLWithPath: path)
+        switch match.kind {
+        case .app:
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+                // Runs off the main thread, so nothing here may touch AppKit.
+                if let error {
+                    NSLog("blindspot: could not launch %@: %@", path, error.localizedDescription)
+                }
+            }
+        case .file:
+            // Hands the file to whichever application owns it, rather than treating the
+            // path as a bundle to launch.
+            NSWorkspace.shared.open(url, configuration: configuration) { _, error in
+                if let error {
+                    NSLog("blindspot: could not open %@: %@", path, error.localizedDescription)
+                }
             }
         }
 
