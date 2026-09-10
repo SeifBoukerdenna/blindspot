@@ -1,0 +1,10 @@
+# Rust build output
+core/target/
+
+# Hand-assembled app bundle
+build/
+
+# Machine-specific Claude Code settings (see SETUP.md step 2)
+.claude/settings.local.json
+
+.DS_Store

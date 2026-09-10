@@ -1,0 +1,20 @@
+[package]
+name = "blindspot_core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+nucleo-matcher = "0.3.1"
+plist = "1.10.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.5"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "query"
+harness = false
