@@ -1,4 +1,6 @@
 import AppKit
+import Carbon.HIToolbox
+import ServiceManagement
 
 @main
 @MainActor
@@ -17,31 +19,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Redundant with `LSUIElement` in the bundle's Info.plist, but it also makes the
         // binary behave when run straight out of the build directory with no bundle.
         app.setActivationPolicy(.accessory)
-        app.mainMenu = makeMainMenu()
+        app.mainMenu = MainMenu.make()
         app.delegate = owner
         app.run()
-    }
-
-    /// With no main menu at all, Cmd+Q does nothing — quitting is normally satisfied by
-    /// the standard Quit item's key equivalent, and an accessory app has no menu bar to
-    /// hold one. A two-item menu is less plumbing than intercepting the keystroke, and
-    /// it picks up Cmd+H on the same principle rather than as a special case.
-    private static func makeMainMenu() -> NSMenu {
-        let appMenu = NSMenu()
-        appMenu.addItem(
-            withTitle: "Hide blindspot",
-            action: #selector(NSApplication.hide(_:)),
-            keyEquivalent: "h")
-        appMenu.addItem(
-            withTitle: "Quit blindspot",
-            action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q")
-
-        let appItem = NSMenuItem()
-        appItem.submenu = appMenu
-        let main = NSMenu()
-        main.addItem(appItem)
-        return main
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -62,8 +42,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let panel = Panel(core: core, watcher: watcher)
         self.panel = panel
 
-        let hotKey = HotKey { [weak panel] in panel?.toggle() }
+        let settings = core.settings
+        reconcileLoginItem(wanted: settings.launch_at_login)
+
+        let hotKey = HotKey(
+            keyCode: settings.hotkey_key_code, modifiers: settings.hotkey_modifiers
+        ) { [weak panel] in panel?.toggle() }
         self.hotKey = hotKey
+
+        // Registered regardless; the alert only explains why it is silent for now. Whether
+        // the registration starts firing on its own once Spotlight lets go is untested, so
+        // the alert asks for a restart, which is certain to work.
+        if hotKey.keyCode == UInt32(kVK_Space), hotKey.modifiers == UInt32(cmdKey),
+            spotlightOwnsCommandSpace()
+        {
+            warnSpotlightOwnsCommandSpace()
+        }
 
         guard hotKey.register() else {
             // Note this is *not* how a clash with another app shows up: Carbon returns
@@ -71,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // simply never fires. A failure here means Carbon refused outright.
             die(
                 "blindspot could not register its hotkey.",
-                "Carbon rejected \u{2318}\u{21E7}Space. If another copy of blindspot is "
+                "Carbon rejected the configured hotkey. If another copy of blindspot is "
                     + "running, quit it and try again.")
             return
         }
@@ -98,6 +92,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // prove `bs_shutdown` frees correctly, which is what the explicit teardown was for.
         panel?.close()
         hotKey = nil
+    }
+
+    /// Keeps the login item in step with config.toml on every launch — registering when it
+    /// is wanted, removing it when it is not. `SMAppService` records the bundle's current
+    /// path, so an app that has moved simply re-registers here next time.
+    private func reconcileLoginItem(wanted: Bool) {
+        let service = SMAppService.mainApp
+        do {
+            switch (wanted, service.status) {
+            case (true, .notRegistered), (true, .notFound):
+                try service.register()
+            case (false, .enabled), (false, .requiresApproval):
+                try service.unregister()
+            default:
+                break
+            }
+        } catch {
+            NSLog("blindspot: login item: %@", error.localizedDescription)
+        }
+        if service.status == .requiresApproval {
+            NSLog("blindspot: approve blindspot in System Settings > General > Login Items")
+        }
+    }
+
+    /// Whether Spotlight's own ⌘Space binding (symbolic hotkey 64) is still live.
+    ///
+    /// Read, never written: rebinding Spotlight is a deliberate manual step. An absent entry
+    /// means the system default, which is enabled on ⌘Space. A present one is checked for
+    /// the chord itself, so someone who moved Spotlight to another key is not warned wrongly.
+    private func spotlightOwnsCommandSpace() -> Bool {
+        let all =
+            CFPreferencesCopyAppValue(
+                "AppleSymbolicHotKeys" as CFString, "com.apple.symbolichotkeys" as CFString)
+            as? [String: Any]
+        guard let spotlight = all?["64"] as? [String: Any] else { return true }
+        guard spotlight["enabled"] as? Bool ?? true else { return false }
+        let parameters = (spotlight["value"] as? [String: Any])?["parameters"] as? [Int]
+        guard let parameters, parameters.count >= 3 else { return true }
+        // [character, key code, NSEvent modifier flags]: 49 is Space, 1 << 20 is ⌘.
+        return parameters[1] == kVK_Space && parameters[2] == 1 << 20
+    }
+
+    private func warnSpotlightOwnsCommandSpace() {
+        let alert = NSAlert()
+        alert.messageText = "Spotlight still owns \u{2318}Space."
+        alert.informativeText =
+            "blindspot is set to \u{2318}Space, but macOS gives it to Spotlight first, so "
+            + "the hotkey will do nothing until you turn Spotlight's off: System Settings > "
+            + "Keyboard > Keyboard Shortcuts > Spotlight. Then quit and reopen blindspot."
+        NSApp.activate()
+        alert.runModal()
     }
 
     private func die(_ message: String, _ detail: String) {

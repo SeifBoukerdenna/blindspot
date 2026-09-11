@@ -14,6 +14,18 @@
 /// Returns `None` for anything that is not a complete, finite expression — including a
 /// bare number. `2` on its own is far more likely to be the start of an app name than a
 /// sum the user wants echoed back, and an operator is what separates the two.
+/// As [`evaluate`] but accepts a bare number, for tools that take an expression argument —
+/// `hex 255` has no operator and must still produce a value.
+pub fn evaluate_value(input: &str) -> Option<f64> {
+    let tokens = tokenize(input)?;
+    let mut parser = Parser {
+        tokens: &tokens,
+        at: 0,
+    };
+    let value = parser.expression()?;
+    (parser.at == tokens.len() && value.is_finite()).then_some(value)
+}
+
 pub fn evaluate(input: &str) -> Option<f64> {
     let tokens = tokenize(input)?;
     if !tokens
@@ -94,6 +106,17 @@ fn tokenize(input: &str) -> Option<Vec<Token>> {
             ')' => {
                 tokens.push(Token::Close);
                 i += 1;
+            }
+            // `0xff`: a hex literal, so `0xff + 1` works as arithmetic.
+            '0' if chars.get(i + 1).is_some_and(|x| *x == 'x' || *x == 'X') => {
+                let start = i + 2;
+                let mut end = start;
+                while end < chars.len() && chars[end].is_ascii_hexdigit() {
+                    end += 1;
+                }
+                let digits: String = chars[start..end].iter().collect();
+                tokens.push(Token::Number(u64::from_str_radix(&digits, 16).ok()? as f64));
+                i = end;
             }
             c if c.is_ascii_digit() || c == '.' => {
                 let start = i;

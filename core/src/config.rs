@@ -27,8 +27,11 @@ const DEFAULT_MAX_RESULTS: usize = 8;
 pub struct Config {
     pub max_results: usize,
     pub app_paths: Vec<String>,
-    /// Parsed but unused: M1 hardcodes a development binding in the Swift shell.
+    /// The global hotkey, e.g. `"cmd+shift+space"`. See [`crate::hotkey::parse`].
     pub hotkey: String,
+    /// Register blindspot as a login item. On by default: a launcher that is not running
+    /// after a reboot is not a launcher.
+    pub launch_at_login: bool,
     pub frecency: Frecency,
 }
 
@@ -52,7 +55,10 @@ impl Default for Config {
         Self {
             max_results: DEFAULT_MAX_RESULTS,
             app_paths: DEFAULT_APP_PATHS.iter().map(|s| (*s).to_owned()).collect(),
-            hotkey: "cmd+space".to_owned(),
+            // ⌘⇧Space, not ⌘Space: see `hotkey::DEFAULT` for why the obvious default would
+            // register cleanly and then never fire.
+            hotkey: "cmd+shift+space".to_owned(),
+            launch_at_login: true,
             frecency: Frecency::default(),
         }
     }
@@ -88,6 +94,21 @@ impl Config {
             Ok(text) => toml::from_str(&text).map_err(ConfigError::Parse),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(ConfigError::Read(e)),
+        }
+    }
+
+    /// The configured hotkey, or the default plus `false` if the config's value does not
+    /// parse. A typo must cost the user their custom binding, never their launcher.
+    pub fn hotkey(&self) -> (crate::hotkey::Hotkey, bool) {
+        match crate::hotkey::parse(&self.hotkey) {
+            Ok(hotkey) => (hotkey, true),
+            Err(e) => {
+                eprintln!(
+                    "blindspot: hotkey {:?}: {e}; using cmd+shift+space",
+                    self.hotkey
+                );
+                (crate::hotkey::DEFAULT, false)
+            }
         }
     }
 
@@ -151,6 +172,21 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_hotkey_falls_back_rather_than_failing() {
+        let cfg: Config = toml::from_str("hotkey = \"cmd+nope\"").expect("parses");
+        assert_eq!(cfg.hotkey(), (crate::hotkey::DEFAULT, false));
+        let cfg: Config = toml::from_str("hotkey = \"ctrl+opt+k\"").expect("parses");
+        assert!(cfg.hotkey().1);
+    }
+
+    #[test]
+    fn launch_at_login_defaults_on_and_can_be_turned_off() {
+        assert!(Config::default().launch_at_login);
+        let cfg: Config = toml::from_str("launch_at_login = false").expect("parses");
+        assert!(!cfg.launch_at_login);
+    }
+
+    #[test]
     fn frecency_table_is_parsed() {
         let cfg: Config = toml::from_str("[frecency]\nhalf_life_days = 30.0").expect("parses");
         assert_eq!(cfg.frecency.half_life_days, 30.0);
@@ -171,6 +207,9 @@ mod tests {
     fn home_relative_paths_are_dropped_when_home_is_unset() {
         assert_eq!(expand_tilde_with("~/Applications", None), None);
         // Absolute paths still resolve with no home.
-        assert_eq!(expand_tilde_with("/Applications", None), Some("/Applications".into()));
+        assert_eq!(
+            expand_tilde_with("/Applications", None),
+            Some("/Applications".into())
+        );
     }
 }

@@ -36,7 +36,7 @@ ARCH       := arm64
 # rather than a closure that happens to work.
 SWIFTFLAGS := -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
               -import-objc-header $(HEADER) \
-              -framework AppKit -framework Carbon -framework Vision \
+              -framework AppKit -framework Carbon -framework Vision -framework ServiceManagement \
               -L $(CORE_DIR)/target/release -lblindspot_core
 
 .PHONY: all core header app sign run clean test bench bench-shell check

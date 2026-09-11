@@ -7,9 +7,13 @@ enum MatchKind {
     case file
     /// A calculated answer. Has no path — there is nothing on disk — and Enter copies it.
     case calc
+    /// An SRE tool's answer — an epoch, a unit, an encoding. Copied on Enter, like `calc`.
+    case tool
     /// Clipboard history. No path either; Enter puts the content back on the pasteboard.
     case clipText
     case clipImage
+    /// A welcome-screen section title. Never selected, never acted on.
+    case header
 
     var isClip: Bool { self == .clipText || self == .clipImage }
 }
@@ -27,6 +31,8 @@ struct Match: Identifiable, Equatable {
     /// Pixel size of an image clip; zero for everything else.
     let width: Int
     let height: Int
+    /// A tool row's form — "binary", "ISO 8601". Empty for everything else.
+    let detail: String
 
     /// The containing folder, shown as the row's second line.
     ///
@@ -38,6 +44,11 @@ struct Match: Identifiable, Equatable {
         switch kind {
         case .calc:
             return "Press ↩ to copy"
+        case .tool:
+            // An epoch's local time is rendered by `ResultRow`, which owns the formatter.
+            return detail
+        case .header:
+            return ""
         case .clipText, .clipImage:
             // Relative time, which `ResultRow` renders because the formatter is main-actor
             // state and this is a plain value type.
@@ -108,6 +119,11 @@ final class Core {
         bs_activate(handle, id)
     }
 
+    /// Hotkey and login-item settings from config.toml.
+    var settings: BsSettings {
+        bs_settings(handle)
+    }
+
     /// Returns immediately; the walk happens on a thread inside Rust.
     func reindex() {
         bs_reindex(handle)
@@ -142,7 +158,8 @@ final class Core {
                 score: result.score,
                 timestamp: result.timestamp,
                 width: Int(result.width),
-                height: Int(result.height)
+                height: Int(result.height),
+                detail: string(result.detail, result.detail_len)
             )
         }
     }
@@ -154,6 +171,8 @@ final class Core {
         switch raw {
         case UInt8(BS_KIND_FILE): return .file
         case UInt8(BS_KIND_CALC): return .calc
+        case UInt8(BS_KIND_TOOL): return .tool
+        case UInt8(BS_KIND_HEADER): return .header
         case UInt8(BS_KIND_CLIP_TEXT): return .clipText
         case UInt8(BS_KIND_CLIP_IMAGE): return .clipImage
         default: return .app

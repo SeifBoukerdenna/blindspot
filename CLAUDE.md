@@ -184,13 +184,21 @@ survive rebuilds if one is ever needed — unverified, since none has been neede
 `~/.config/blindspot/config.toml`
 
 ```toml
-hotkey = "cmd+space"
+hotkey = "cmd+shift+space"
 max_results = 8
+launch_at_login = true
 app_paths = ["/Applications", "/System/Applications", "~/Applications"]
 
 [frecency]
 half_life_days = 14
 ```
+
+The default hotkey is **not** `cmd+space`. Spotlight owns ⌘Space until the user unbinds it
+by hand, and Carbon reports success registering a chord another app already holds — so a
+`cmd+space` default would register cleanly and then never fire. Set `hotkey = "cmd+space"`
+after unbinding Spotlight's; blindspot warns at launch if Spotlight still has it. An
+unparseable hotkey falls back to the default with a line on stderr, never a dead launcher.
+Both settings are read once at launch: quit and reopen after changing them.
 
 ## Open questions
 

@@ -78,6 +78,14 @@ enum IconCache {
         }
     }
 
+    /// Every tool row's icon — one symbol for all of them, since the subtitle already says
+    /// which form each row is.
+    static let tool: NSImage? = {
+        NSImage(
+            systemSymbolName: "wrench.and.screwdriver",
+            accessibilityDescription: "Converted value")
+    }()
+
     /// The calculator row's icon. A symbol, not a file icon, because a calculated result
     /// has no path to look one up from.
     static let calculator: NSImage? = {
@@ -151,6 +159,81 @@ enum IconCache {
     }
 }
 
+/// An epoch's instant in the viewer's own zone, in the same shape as the UTC row above it so
+/// the two read side by side.
+@MainActor
+private enum LocalTime {
+    private static let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss zzz"
+        return formatter
+    }()
+
+    static func describe(_ timestamp: UInt64) -> String {
+        formatter.string(from: Date(timeIntervalSince1970: TimeInterval(timestamp)))
+    }
+}
+
+/// What the selected row shows in place of its folder: the keys that act on it beyond ↩.
+/// Only on the selected row — on every row it would be the same line fifty times over.
+@MainActor
+enum ActionHint {
+    /// Bundle paths of running apps, seeded once and then kept current. Not asked for on
+    /// each show: building this set there measured 5.2ms median, a third of the frame, for
+    /// one line of hint text.
+    private static var running: Set<String> = []
+    private static var observation: NSKeyValueObservation?
+
+    static func startTracking() {
+        guard observation == nil else { return }
+        let workspace = NSWorkspace.shared
+        running = Set(workspace.runningApplications.compactMap { $0.bundleURL?.path })
+        // KVO, not the launch and terminate notifications: measured, those are posted only
+        // for Dock apps, and the index deliberately holds menu-bar ones like Docker and
+        // Ollama. KVO reported both kinds, as deltas, within 130ms.
+        observation = workspace.observe(\.runningApplications, options: [.new, .old]) { _, change in
+            let added = (change.newValue ?? []).compactMap { $0.bundleURL?.path }
+            let removed = (change.oldValue ?? []).compactMap { $0.bundleURL?.path }
+            let apply: @MainActor () -> Void = {
+                running.subtract(removed)
+                running.formUnion(added)
+            }
+            // AppKit documents this property as changing only while the main run loop runs,
+            // so this is the main thread — checked rather than assumed, as in `HotKey`.
+            if Thread.isMainThread {
+                MainActor.assumeIsolated(apply)
+            } else {
+                Task { @MainActor in apply() }
+            }
+        }
+    }
+
+    static func text(for match: Match) -> String? {
+        switch match.kind {
+        case .app:
+            let quit = isRunning(match.path) ? " · ⌃↩ Quit" : ""
+            return "⌘↩ Reveal in Finder · ⌥↩ Copy path" + quit
+        case .file:
+            return "⌘↩ Reveal in Finder · ⌥↩ Copy path"
+        case .calc, .tool, .clipText, .clipImage, .header:
+            return nil
+        }
+    }
+
+    private static func isRunning(_ path: String) -> Bool {
+        running.contains(path) || running.contains(resolved(path))
+    }
+
+    /// The index and a running app can spell one bundle's path differently — measured, a
+    /// bundle indexed under `/private/tmp` reports its URL as `/tmp` — and
+    /// `/Applications/Safari.app` is itself a symlink into a cryptex. So a lookup compares
+    /// the resolved form as well as the literal one.
+    static func resolved(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    }
+}
+
 /// "2 min ago" for clip rows. Main-actor state because `RelativeDateTimeFormatter` is
 /// not `Sendable`, and building one per row per keystroke would be wasteful.
 @MainActor
@@ -194,6 +277,12 @@ private final class ResultRow: NSView {
     private let iconView = NSImageView()
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
+    private var plainSubtitle = ""
+
+    /// Stands in for the second line while set — the selected row's action keys.
+    var hint: String? {
+        didSet { subtitle.stringValue = hint ?? plainSubtitle }
+    }
 
     var isSelected = false {
         didSet {
@@ -267,25 +356,60 @@ private final class ResultRow: NSView {
             let time = ClipTime.describe(match.timestamp)
             if match.name == ImageLabel.placeholder {
                 title.stringValue = label
-                subtitle.stringValue = time
+                plainSubtitle = time
             } else {
                 title.stringValue = match.name
-                subtitle.stringValue = "\(label) · \(time)"
+                plainSubtitle = "\(label) · \(time)"
             }
         case .clipText:
             title.stringValue = match.name
-            subtitle.stringValue = ClipTime.describe(match.timestamp)
-        case .app, .file, .calc:
+            plainSubtitle = ClipTime.describe(match.timestamp)
+        case .tool where match.timestamp > 0:
             title.stringValue = match.name
-            subtitle.stringValue = match.subtitle
+            plainSubtitle = [LocalTime.describe(match.timestamp), match.detail]
+                .filter { !$0.isEmpty }.joined(separator: " · ")
+        case .app, .file, .calc, .tool, .header:
+            title.stringValue = match.name
+            plainSubtitle = match.subtitle
         }
+        hint = nil
         iconView.image =
             switch match.kind {
             case .calc: IconCache.calculator
+            case .tool: IconCache.tool
             case .clipText: IconCache.textClip
             case .clipImage: IconCache.thumbnail(forClip: match.id)
             case .app, .file: IconCache.icon(for: match.path)
+            case .header: nil
             }
+    }
+}
+
+/// A welcome-screen section title: small, bold and secondary, in title case — the sidebar
+/// section style macOS has used since Big Sur — so it reads as a label rather than a result.
+@MainActor
+private final class HeaderRow: NSView {
+    private let label = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            // Level with the row icons below it.
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
+
+    func show(_ title: String) {
+        label.stringValue = title
     }
 }
 
@@ -301,6 +425,9 @@ private final class ResultRow: NSView {
 @MainActor
 final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegate {
     static let rowHeight: CGFloat = 54
+    /// Half a row less half the spacing, so two headers stand in exactly one row's height.
+    /// The core relies on that to fit a welcome screen into `max_results` rows unscrolled.
+    static let headerHeight: CGFloat = 26
     static let iconSize: CGFloat = 36
     private static let spacing: CGFloat = 1
     private static let padding = NSEdgeInsets(top: 8, left: 0, bottom: 10, right: 0)
@@ -315,6 +442,7 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
     /// their constraints for every visible row on every re-tile. That construction was the
     /// entire cost of a keystroke that changed the list's height: 1.85ms median, 30ms peak.
     private var pool: [ResultRow] = []
+    private var headerPool: [HeaderRow] = []
 
     /// Rows shown before the list scrolls — `max_results` in config.toml.
     private let visibleRows: Int
@@ -367,14 +495,18 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
     required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
 
     var selectedMatch: Match? {
-        matches.indices.contains(selection) ? matches[selection] : nil
+        isSelectable(selection) ? matches[selection] : nil
+    }
+
+    private func isSelectable(_ index: Int) -> Bool {
+        matches.indices.contains(index) && matches[index].kind != .header
     }
 
     func update(_ matches: [Match]) {
         self.matches = matches
         // A new query is a new list; keeping the old index would land Enter on whatever
-        // happened to slide into that position.
-        selection = 0
+        // happened to slide into that position. The first real row, past any header.
+        selection = matches.firstIndex { $0.kind != .header } ?? 0
         table.reloadData()
         // And it starts at the top: staying scrolled down would hide the best match.
         contentView.scroll(to: NSPoint(x: 0, y: -Self.padding.top))
@@ -384,40 +516,70 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
     /// Moves the highlight by `offset`, clamped rather than wrapping — from the bottom of
     /// a fifty-row list, jumping back to the top reads as the list having reset.
     func moveSelection(by offset: Int) {
-        guard !matches.isEmpty else { return }
+        // Headers are stepped over, and a header at either end stops the move rather than
+        // taking the highlight.
+        var target = selection + offset
+        while matches.indices.contains(target), !isSelectable(target) {
+            target += offset.signum()
+        }
+        guard isSelectable(target), target != selection else { return }
         let previous = selection
-        selection = min(max(selection + offset, 0), matches.count - 1)
-        guard selection != previous else { return }
-        row(at: previous)?.isSelected = false
-        row(at: selection)?.isSelected = true
+        selection = target
+        highlight(from: previous)
         // What makes the arrow keys scroll: moving past the last visible row brings the
-        // next one into view, one row at a time.
+        // next one into view, one row at a time. Moving up onto a section's first row
+        // brings its title along, so the highlight never sits under a hidden header.
+        let above = selection - 1
+        if offset < 0, above >= 0, !isSelectable(above) {
+            table.scrollRowToVisible(above)
+        }
         table.scrollRowToVisible(selection)
     }
 
-    /// The height for the rows showing, capped at `visibleRows` — past that the list
-    /// scrolls instead of the panel growing down the screen.
+    /// The height of the rows showing, capped at `visibleRows` rows' worth — past that the
+    /// list scrolls instead of the panel growing down the screen. Summed rather than
+    /// multiplied, since a header is shorter than a row.
     var fittingHeight: CGFloat {
-        let shown = CGFloat(min(matches.count, visibleRows))
-        guard shown > 0 else { return 0 }
-        return shown * Self.rowHeight + (shown - 1) * Self.spacing + Self.padding.top
-            + Self.padding.bottom
+        guard !matches.isEmpty else { return 0 }
+        let content =
+            matches.reduce(0) { $0 + Self.height(of: $1) }
+            + CGFloat(matches.count - 1) * Self.spacing
+        let budget =
+            CGFloat(visibleRows) * Self.rowHeight + CGFloat(visibleRows - 1) * Self.spacing
+        return min(content, budget) + Self.padding.top + Self.padding.bottom
+    }
+
+    private static func height(of match: Match) -> CGFloat {
+        match.kind == .header ? headerHeight : rowHeight
     }
 
     /// The live row view, if it is on screen. Off-screen rows get their selection state
     /// when the table next asks for them, in `tableView(_:viewFor:row:)`.
-    private func row(at index: Int) -> ResultRow? {
+    private func row(at index: Int) -> NSView? {
         guard matches.indices.contains(index) else { return nil }
-        return table.view(atColumn: 0, row: index, makeIfNecessary: false) as? ResultRow
+        return table.view(atColumn: 0, row: index, makeIfNecessary: false)
     }
 
     @objc private func clicked() {
         let clicked = table.clickedRow
-        guard matches.indices.contains(clicked) else { return }
-        row(at: selection)?.isSelected = false
+        guard isSelectable(clicked) else { return }
+        let previous = selection
         selection = clicked
-        row(at: selection)?.isSelected = true
+        highlight(from: previous)
         onActivate?()
+    }
+
+    /// Moves the highlight and the action hint from `previous` to `selection`, on whichever
+    /// of the two rows are live; one scrolled off picks its state up in `viewFor`.
+    private func highlight(from previous: Int) {
+        if let old = row(at: previous) as? ResultRow {
+            old.isSelected = false
+            old.hint = nil
+        }
+        if let new = row(at: selection) as? ResultRow {
+            new.isSelected = true
+            new.hint = ActionHint.text(for: matches[selection])
+        }
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
@@ -427,18 +589,32 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
     func tableView(_ tableView: NSTableView, didRemove rowView: NSTableRowView, forRow row: Int) {
         // Bounded, though it never gets near it: only the rows on screen at once are ever
         // out of the pool.
-        if let cell = rowView.view(atColumn: 0) as? ResultRow, pool.count < 32 {
-            pool.append(cell)
+        switch rowView.view(atColumn: 0) {
+        case let cell as ResultRow where pool.count < 32: pool.append(cell)
+        case let header as HeaderRow where headerPool.count < 4: headerPool.append(header)
+        default: break
         }
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        matches.indices.contains(row) ? Self.height(of: matches[row]) : Self.rowHeight
     }
 
     func tableView(
         _ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int
     ) -> NSView? {
+        if matches.indices.contains(row), matches[row].kind == .header {
+            let header = headerPool.popLast() ?? HeaderRow(frame: .zero)
+            header.show(matches[row].name)
+            return header
+        }
         // Reused as rows leave the table, so only the visible handful ever exist.
         let view = pool.popLast() ?? ResultRow(frame: .zero)
         if matches.indices.contains(row) {
             view.show(matches[row])
+            if row == selection {
+                view.hint = ActionHint.text(for: matches[row])
+            }
         }
         view.isSelected = row == selection
         return view

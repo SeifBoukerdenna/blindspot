@@ -41,8 +41,11 @@ const READ_CAP: usize = 20_000;
 ///
 /// Returns `Some("")` for a bare prefix, so the caller can tell "wants files, not ready"
 /// apart from "not a file query at all".
+///
+/// Trimmed at both ends because `mdfind -name` matches the text literally, trailing space
+/// included — and the field turns a pasted line's final newline into exactly that.
 pub fn strip_prefix(query: &str) -> Option<&str> {
-    query.strip_prefix(PREFIX).map(str::trim_start)
+    query.strip_prefix(PREFIX).map(str::trim)
 }
 
 /// `$HOME`, if set.
@@ -161,7 +164,10 @@ fn lock(shared: &Arc<Mutex<Shared>>) -> std::sync::MutexGuard<'_, Shared> {
 fn run(shared: &Arc<Mutex<Shared>>, generation: u64, query: &str) {
     // `query` is an argument, never a shell string, so there is nothing to escape and
     // no injection to worry about — `Command` does not go through a shell.
+    // `-attr` adds each result's last-opened date to the same line, so recency costs no
+    // second process: of 233 matches for `desktop`, only 3 had ever been opened.
     let spawned = Command::new("mdfind")
+        .args(["-attr", LAST_USED])
         .arg("-name")
         .arg(query)
         .stdout(Stdio::piped())
@@ -195,13 +201,14 @@ fn run(shared: &Arc<Mutex<Shared>>, generation: u64, query: &str) {
     // the best `RESULT_CAP` survive, so the keystroke ranks good candidates rather than
     // whichever ones `mdfind` happened to print first.
     let home = home_dir();
+    let now = crate::relevance::unix_now();
     let mut scored: Vec<(crate::relevance::Key, AppEntry)> = Vec::new();
     for line in BufReader::new(stdout)
         .lines()
         .map_while(Result::ok)
         .take(READ_CAP)
     {
-        let Some(entry) = entry_for(PathBuf::from(line)) else {
+        let Some(entry) = entry_for(&line) else {
             continue;
         };
         let candidate = crate::relevance::Candidate {
@@ -209,7 +216,7 @@ fn run(shared: &Arc<Mutex<Shared>>, generation: u64, query: &str) {
             path: &entry.path,
             is_app: false,
             fuzzy: 0,
-            used: false,
+            used: crate::relevance::recency(entry.last_used, now),
         };
         let key = crate::relevance::key(&candidate, query, home.as_deref());
         scored.push((key, entry));
@@ -248,11 +255,25 @@ fn finish(shared: &Arc<Mutex<Shared>>, generation: u64, entries: Vec<AppEntry>) 
     guard.pending = false;
 }
 
-fn entry_for(path: PathBuf) -> Option<AppEntry> {
+const LAST_USED: &str = "kMDItemLastUsedDate";
+
+/// One `mdfind -attr kMDItemLastUsedDate` line: `path   kMDItemLastUsedDate = <date|(null)>`.
+/// Split from the right, so a path containing three spaces still parses; a line without
+/// the attribute is taken whole as a path.
+pub(crate) fn entry_for(line: &str) -> Option<AppEntry> {
+    let marker = format!("   {LAST_USED} = ");
+    let (path, last_used) = match line.rsplit_once(&marker) {
+        Some((path, value)) => (path, crate::civil::parse_spotlight(value)),
+        None => (line, None),
+    };
+    let path = PathBuf::from(path);
     // Lossy rather than skipping: a file whose name is not valid UTF-8 should still be
     // findable, even if one character renders as a replacement.
     let name = path.file_name()?.to_string_lossy().into_owned();
-    (!name.is_empty()).then(|| AppEntry::new(name, path))
+    (!name.is_empty()).then(|| AppEntry {
+        last_used,
+        ..AppEntry::new(name, path)
+    })
 }
 
 #[cfg(test)]
@@ -263,6 +284,7 @@ mod tests {
     fn only_a_prefixed_query_asks_for_files() {
         assert_eq!(strip_prefix("?report"), Some("report"));
         assert_eq!(strip_prefix("?  report"), Some("report"));
+        assert_eq!(strip_prefix("?report "), Some("report"), "a pasted newline, as a space");
         assert_eq!(strip_prefix("?"), Some(""));
         assert_eq!(strip_prefix("report"), None);
         assert_eq!(strip_prefix(""), None);
@@ -329,6 +351,18 @@ mod tests {
     }
 
     #[test]
+    fn a_last_used_date_rides_along_on_the_same_line() {
+        let dated = entry_for("/Users/x/Desktop   kMDItemLastUsedDate = 2026-09-10 22:55:11 +0000")
+            .expect("parses");
+        assert_eq!(dated.path, PathBuf::from("/Users/x/Desktop"));
+        assert_eq!(dated.name, "Desktop");
+        assert!(dated.last_used.is_some());
+        let never = entry_for("/Users/x/a b.log   kMDItemLastUsedDate = (null)").expect("parses");
+        assert_eq!(never.name, "a b.log");
+        assert_eq!(never.last_used, None);
+    }
+
+    #[test]
     fn home_entries_list_one_level_and_skip_dotfiles() {
         let dir = std::env::temp_dir().join(format!("blindspot-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -348,12 +382,12 @@ mod tests {
 
     #[test]
     fn entries_take_their_name_from_the_filename() {
-        let entry = entry_for(PathBuf::from("/Users/x/Documents/report q3.pdf")).expect("named");
+        let entry = entry_for("/Users/x/Documents/report q3.pdf").expect("named");
         assert_eq!(entry.name, "report q3.pdf");
         assert_eq!(
             entry.path,
             PathBuf::from("/Users/x/Documents/report q3.pdf")
         );
-        assert!(entry_for(PathBuf::from("/")).is_none());
+        assert!(entry_for("/").is_none());
     }
 }

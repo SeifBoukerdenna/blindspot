@@ -80,6 +80,13 @@ impl Frecency {
         boost_for(self.score(id, now))
     }
 
+    /// As [`Frecency::boost`], taking the larger of this history and `other` — Spotlight's
+    /// record of the same app. The larger, not the sum: a launch through blindspot is also
+    /// a launch macOS records, so adding them would count it twice.
+    pub fn boost_with(&self, id: u64, now: u64, other: f64) -> f64 {
+        boost_for(self.score(id, now).max(other))
+    }
+
     pub fn len(&self) -> usize {
         self.visits.len()
     }
@@ -87,6 +94,16 @@ impl Frecency {
     pub fn is_empty(&self) -> bool {
         self.visits.is_empty()
     }
+}
+
+/// A history of use dates collapsed to one score with the same half-life decay a recorded
+/// launch gets — so Spotlight's history and blindspot's own are measured in the same units.
+pub(crate) fn decayed_count(dates: &[u64], now: u64, half_life_days: f64) -> f64 {
+    let half_life_secs = half_life_days * SECS_PER_DAY;
+    dates
+        .iter()
+        .map(|&date| decay(1.0, elapsed(date, now), half_life_secs))
+        .sum()
 }
 
 /// Saturating, so a clock that jumped backwards reads as "no time passed" rather than a

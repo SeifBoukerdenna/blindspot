@@ -76,9 +76,9 @@ pub struct Key {
     /// than the tier itself, so the fields below can reorder *within* strong matches
     /// without ever letting a weak one through.
     strong: bool,
-    /// Launched or opened through blindspot before. An app you open daily outranks a
-    /// same-strength file you have never touched.
-    used: bool,
+    /// Launched through blindspot, opened recently anywhere, or never. An app you open daily
+    /// outranks a same-strength file you have never touched.
+    used: Usage,
     /// An app, or something directly inside your home folder. Above the exact tier on
     /// purpose: `?doc` put a stock-price file named `DOC.csv`, seven folders deep, ahead
     /// of `~/Documents`, because an exact name beat a prefix outright. Among strong
@@ -96,12 +96,39 @@ pub struct Key {
     fuzzy: u32,
 }
 
+/// How much a candidate has been used, worst to best.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Usage {
+    Never,
+    /// Opened in the last month according to Spotlight — from the Dock, Finder, anywhere.
+    Recent,
+    /// Launched through blindspot itself.
+    Launched,
+}
+
+/// How long ago counts as recently opened.
+const RECENT_SECS: u64 = 30 * 86_400;
+
+/// `Recent` if Spotlight saw it opened within the last month.
+pub fn recency(last_used: Option<u64>, now: u64) -> Usage {
+    match last_used {
+        Some(at) if now.saturating_sub(at) <= RECENT_SECS => Usage::Recent,
+        _ => Usage::Never,
+    }
+}
+
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 pub struct Candidate<'a> {
     pub name: &'a str,
     pub path: &'a Path,
     pub is_app: bool,
     pub fuzzy: u32,
-    pub used: bool,
+    pub used: Usage,
 }
 
 pub fn key(candidate: &Candidate<'_>, query: &str, home: Option<&Path>) -> Key {
@@ -219,7 +246,7 @@ mod tests {
                     path,
                     is_app,
                     fuzzy: 192,
-                    used,
+                    used: if used { Usage::Launched } else { Usage::Never },
                 };
                 (key(&c, query, Some(home)), name)
             })
@@ -354,7 +381,7 @@ mod tests {
                 path,
                 is_app: false,
                 fuzzy: 192,
-                used: false,
+                used: Usage::Never,
             };
             key(&c, "blindspot", Some(home))
         };
@@ -400,7 +427,7 @@ mod tests {
             path: Path::new(path),
             is_app: false,
             fuzzy: 1,
-            used: false,
+            used: Usage::Never,
         };
         let drive = key(&c("/Volumes/Backup/photos"), "photos", Some(home));
         let shared = key(&c("/Users/Shared/photos"), "photos", Some(home));
@@ -446,6 +473,29 @@ mod tests {
             ],
         );
         assert_eq!(got[0], "report.pdf");
+    }
+
+    #[test]
+    fn a_file_opened_this_week_beats_one_never_opened() {
+        let home = Path::new(HOME);
+        let c = |used| Candidate {
+            name: "notes.md",
+            path: Path::new("/Users/seif/a/notes.md"),
+            is_app: false,
+            fuzzy: 1,
+            used,
+        };
+        assert!(
+            key(&c(Usage::Recent), "notes", Some(home))
+                > key(&c(Usage::Never), "notes", Some(home))
+        );
+        assert!(
+            key(&c(Usage::Launched), "notes", Some(home))
+                > key(&c(Usage::Recent), "notes", Some(home))
+        );
+        assert_eq!(recency(Some(1_000), 1_000 + 29 * 86_400), Usage::Recent);
+        assert_eq!(recency(Some(1_000), 1_000 + 31 * 86_400), Usage::Never);
+        assert_eq!(recency(None, 1_000), Usage::Never);
     }
 
     #[test]

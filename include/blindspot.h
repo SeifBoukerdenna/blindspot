@@ -41,6 +41,18 @@
 #define BS_KIND_CLIP_IMAGE 4
 
 /**
+ * A [`BsResult`] from an SRE tool — an epoch, a unit conversion, an encoding. Like
+ * [`BS_KIND_CALC`], no path, and Enter copies `name`; `detail` says which form it is.
+ */
+#define BS_KIND_TOOL 5
+
+/**
+ * A [`BsResult`] that is a section title on the welcome screen — "Suggested", "Recent
+ * files". Not selectable; `name` is the title and everything else is empty.
+ */
+#define BS_KIND_HEADER 6
+
+/**
  * `part` for [`bs_clip_content`]: the full text, or the full PNG.
  */
 #define BS_CLIP_FULL 0
@@ -51,9 +63,29 @@
 #define BS_CLIP_THUMBNAIL 1
 
 /**
+ * Carbon modifier masks from `Events.h` — *not* `NSEvent.ModifierFlags`, which use different
+ * bits entirely. Verified by compiling against the SDK: `cmdKey` = 256, `shiftKey` = 512.
+ */
+#define CMD 256
+
+#define SHIFT 512
+
+#define OPTION 2048
+
+#define CONTROL 4096
+
+/**
+ * Spotlight's usage score at or above which an app counts as recently used: one use four
+ * weeks ago at the default 14-day half-life (`0.5^(28/14)`).
+ */
+#define RECENT_SCORE 0.25
+
+/**
  * Opaque to C. Swift only ever holds a `BsHandle *`.
  */
 typedef struct BsHandle BsHandle;
+
+typedef struct Hotkey Hotkey;
 
 /**
  * One ranked match.
@@ -88,6 +120,13 @@ typedef struct {
    */
   uint32_t width;
   uint32_t height;
+  /**
+   * A tool row's subtitle — "binary", "ISO 8601", "decoded". NULL for everything else.
+   * For an epoch, `timestamp` carries the instant too, because only Swift knows the
+   * local time zone to render it in.
+   */
+  const uint8_t *detail;
+  size_t detail_len;
 } BsResult;
 
 /**
@@ -142,6 +181,27 @@ typedef struct {
   size_t len;
 } BsBlob;
 
+/**
+ * Startup settings the shell needs from config.toml, read once at launch.
+ */
+typedef struct {
+  /**
+   * Carbon virtual key code, e.g. `kVK_Space`.
+   */
+  uint32_t hotkey_key_code;
+  /**
+   * Carbon modifier mask — `cmdKey`, `shiftKey` and friends, not `NSEvent` flags.
+   */
+  uint32_t hotkey_modifiers;
+  /**
+   * False if config.toml's hotkey did not parse and the default is in use.
+   */
+  bool hotkey_from_config;
+  bool launch_at_login;
+} BsSettings;
+
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -169,8 +229,11 @@ BsHandle *bs_init(const char *config_path);
 /**
  * Ranked matches for `query`, best first, at most `limit` of them.
  *
- * A NULL handle or a NULL query yields an empty result set rather than a crash. A
- * `limit` of zero yields no results; ask [`bs_max_results`] for the configured cap.
+ * An empty query is the welcome screen: suggested apps and recent files under
+ * [`BS_KIND_HEADER`] rows, with `pending` set while the recent list refreshes. A NULL
+ * query is treated as an empty one; a NULL handle yields an empty result set rather
+ * than a crash. A `limit` of zero yields no results; ask [`bs_max_results`] for the
+ * configured cap.
  *
  * # Safety
  *
@@ -259,6 +322,16 @@ BsBlob bs_clip_content(BsHandle *handle, uint64_t id, uint8_t part);
  * `blob` must be exactly what [`bs_clip_content`] returned, freed at most once.
  */
 void bs_free_blob(BsBlob blob);
+
+/**
+ * Settings read from config.toml at init. Plain values — nothing to free.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`] that has not been shut down.
+ * A NULL handle yields the defaults.
+ */
+BsSettings bs_settings(const BsHandle *handle);
 
 /**
  * Releases everything a [`bs_query`] result owns.

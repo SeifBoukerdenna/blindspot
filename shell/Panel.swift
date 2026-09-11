@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 
 /// The launcher window.
 ///
@@ -26,6 +27,15 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     private let field = NSTextField()
     private let results: ResultsView
 
+    /// The browse modes, each nothing more than the prefix that selects it — so typing `?`
+    /// and pressing ⌘2 are the same act, and the chips keep no state of their own.
+    private static let modes: [(prefix: String, symbol: String, name: String)] = [
+        ("", "square.grid.2x2", "Apps"),
+        ("?", "doc", "Files"),
+        (";", "clipboard", "Clipboard"),
+    ]
+    private var chips: [NSButton] = []
+
     /// Captured on show so dismissal can hand focus back. Getting this wrong is the
     /// single most annoying possible regression in daily use.
     private var previousApp: NSRunningApplication?
@@ -33,9 +43,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// The screen y-coordinate of the panel's top edge, held fixed while the list grows
     /// and shrinks underneath it. Without this the panel appears to jump as you type.
     private var topEdge: CGFloat = 0
-
-    /// The height last handed to `setFrame`, so an unchanged one can be skipped.
-    private var lastHeight: CGFloat = -1
+    private var leftEdge: CGFloat = 0
 
     /// A scroll view has no height of its own, so the list's is set explicitly — to its
     /// rows, capped at `max_results`, beyond which it scrolls.
@@ -98,6 +106,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
 
         buildContentView()
         results.onActivate = { [weak self] in self?.launchSelected() }
+        ActionHint.startTracking()
     }
 
     /// A borderless window has no title bar or resize bar, so AppKit's default answer
@@ -120,15 +129,38 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         field.drawsBackground = false
         field.focusRingType = .none
         field.lineBreakMode = .byTruncatingTail
+        // Pasted text keeps no newlines: a line copied from a terminal usually ends in one,
+        // and a query with a line break in it matches nothing and draws on two lines.
+        field.cell?.usesSingleLineMode = true
         field.delegate = self
         field.translatesAutoresizingMaskIntoConstraints = false
 
+        chips = Self.modes.enumerated().map { index, mode in
+            let chip = NSButton(
+                image: NSImage(systemSymbolName: mode.symbol, accessibilityDescription: mode.name)
+                    ?? NSImage(),
+                target: self, action: #selector(chipClicked(_:)))
+            chip.tag = index
+            chip.bezelStyle = .glass
+            chip.borderShape = .circle
+            chip.toolTip = "\(mode.name)  ⌘\(index + 1)"
+            // Clicking a chip must leave the caret in the field, or typing would stop.
+            chip.refusesFirstResponder = true
+            return chip
+        }
+        let chipBar = NSStackView(views: chips)
+        chipBar.spacing = 6
+        chipBar.translatesAutoresizingMaskIntoConstraints = false
+
         container.addSubview(field)
+        container.addSubview(chipBar)
         container.addSubview(results)
 
         NSLayoutConstraint.activate([
             field.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
-            field.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -20),
+            field.trailingAnchor.constraint(equalTo: chipBar.leadingAnchor, constant: -12),
+            chipBar.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
+            chipBar.centerYAnchor.constraint(equalTo: field.centerYAnchor),
             // The field takes its intrinsic text height and is centred in a
             // fixed-height band, rather than being stretched to fill it. An
             // `NSTextField` draws its text at the top of an oversized frame, so
@@ -191,7 +223,15 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // the *next* invocation, not this one.
         core.reindex()
 
-        positionOnActiveScreen()
+        placeOnActiveScreen()
+
+        // Emptied and laid out before ordering in, so the panel is placed and sized by a
+        // single `setFrame` and appears at its final height. Placing it at field height
+        // and growing it to the welcome screen after measured two resizes, 9.4ms of the
+        // show path. Clearing before `makeFirstResponder` still clears the live field
+        // editor: checked by typing, dismissing and re-showing.
+        field.stringValue = ""
+        refresh()
 
         // Order first, focus second, and set first responder on every single show.
         // `initialFirstResponder` fires only the first time a window is placed on
@@ -199,11 +239,6 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // later invocation would come up with a dead field.
         makeKeyAndOrderFront(nil)
         makeFirstResponder(field)
-
-        // After `makeFirstResponder`, so the live field editor is cleared too and not
-        // just the cell's backing value.
-        field.stringValue = ""
-        refresh()
     }
 
     /// Guards against re-entry: `orderOut` makes the panel resign key, which calls
@@ -259,21 +294,24 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         refresh()
     }
 
-    private func refresh() {
+    /// `poll` marks a re-query while an answer is still pending. An unchanged list is then
+    /// left alone rather than re-applied, which would snap the highlight back to the top
+    /// under a user who has already started pressing ↓.
+    private func refresh(poll: Bool = false) {
         let text = field.stringValue
-        // Nothing until the user types. An empty query returns the head of the index,
-        // which is the same eight alphabetically-first apps every single time — noise,
-        // not a starting point, and no real launcher shows it. It also means the panel
-        // opens as one field with no rows and no icons to render.
-        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
-            results.update([])
-            layoutForResults()
-            return
+        let mode = Self.mode(of: text)
+        for (index, chip) in chips.enumerated() {
+            chip.tintProminence = index == mode ? .primary : .none
         }
 
+        // An empty field is the welcome screen — suggested apps and recent files — which
+        // reverses M2's "nothing until you type". That was right while the only thing an
+        // empty query could return was the alphabetical head of the index.
         let (matches, pending) = core.query(text, limit: Self.resultLimit)
-        results.update(matches)
-        layoutForResults()
+        if !(poll && matches == results.matches) {
+            results.update(matches)
+            layoutForResults()
+        }
 
         // A file search is still running in Rust, so re-ask shortly. Polling rather than
         // a callback keeps the FFI at one entry point and keeps threads out of Swift; a
@@ -284,16 +322,100 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(60))
                 guard let self, self.isVisible, self.field.stringValue == text else { return }
-                self.refresh()
+                self.refresh(poll: true)
             }
         }
+    }
+
+    // MARK: - Actions
+
+    /// What Enter does, by modifier. Each arrives by a different route — measured with a
+    /// harness posting every combination to this panel's field: ↩ and ⇧↩ as
+    /// `insertNewline:`, ⌥↩ as `insertNewlineIgnoringFieldEditor:`, ⌃↩ as
+    /// `insertLineBreak:`, and ⌘↩ only to `performKeyEquivalent`, after which the field
+    /// editor sees a bare `noop:` that says nothing about which key it was.
+    private enum Action {
+        case open, reveal, copyPath, quit
+    }
+
+    private func perform(_ action: Action) {
+        guard let match = results.selectedMatch else { return }
+        let hasPath = match.kind == .app || match.kind == .file
+
+        switch action {
+        case .open:
+            launchSelected()
+        case .reveal where hasPath:
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: match.path)])
+            dismiss(restoringFocus: false)
+        case .copyPath where hasPath:
+            // Through `writeOwn`, so the path never lands in clipboard history.
+            watcher.writeOwn { $0.setString(match.path, forType: .string) }
+            dismiss(restoringFocus: true)
+        case .quit where match.kind == .app:
+            // Looked up afresh rather than trusting the hint's snapshot from show time.
+            let target = ActionHint.resolved(match.path)
+            let app = NSWorkspace.shared.runningApplications.first { app in
+                guard let path = app.bundleURL?.path else { return false }
+                return path == match.path || path == target
+            }
+            guard let app else {
+                NSSound.beep()
+                return
+            }
+            app.terminate()
+            dismiss(restoringFocus: true)
+        case .reveal, .copyPath, .quit:
+            // A clip or a calculated value has no file behind it and no process to quit.
+            NSSound.beep()
+        }
+    }
+
+    /// ⌘↩ and ⌘1–3, none of which reach `doCommandBy` in a usable form — see `Action`.
+    /// Matched by key code, so the mode keys sit on the number row whatever the layout.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.numericPad, .function, .capsLock])
+        guard flags == .command else { return super.performKeyEquivalent(with: event) }
+        switch Int(event.keyCode) {
+        case kVK_Return, kVK_ANSI_KeypadEnter:
+            perform(.reveal)
+        case kVK_ANSI_1: switchMode(to: 0)
+        case kVK_ANSI_2: switchMode(to: 1)
+        case kVK_ANSI_3: switchMode(to: 2)
+        default: return super.performKeyEquivalent(with: event)
+        }
+        return true
+    }
+
+    // MARK: - Browse modes
+
+    private static func mode(of text: String) -> Int {
+        modes.indices.dropFirst().first { text.hasPrefix(modes[$0].prefix) } ?? 0
+    }
+
+    /// Swaps the query's prefix and keeps what was typed after it, so switching mode
+    /// re-asks the same question of a different source.
+    private func switchMode(to index: Int) {
+        let text = field.stringValue
+        let typed = text.dropFirst(Self.modes[Self.mode(of: text)].prefix.count)
+            .drop { $0 == " " }
+        field.stringValue = Self.modes[index].prefix + typed
+        // Programmatic edits bypass `controlTextDidChange`, and leave the caret where it was.
+        field.currentEditor()?.selectedRange = NSRange(
+            location: (field.stringValue as NSString).length, length: 0)
+        refresh()
+    }
+
+    @objc private func chipClicked(_ sender: NSButton) {
+        switchMode(to: sender.tag)
     }
 
     private func launchSelected() {
         guard let match = results.selectedMatch else { return }
 
         switch match.kind {
-        case .calc:
+        case .calc, .tool:
             // Copy and hand focus back, so the answer can be pasted straight into
             // whatever the user was working in. No `activate`: a calculated row has no
             // stable id, and recording one would put junk in the frecency store.
@@ -348,12 +470,16 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             // Dismissed immediately rather than from the completion handler: the open is
             // asynchronous and the panel should not sit there while Launch Services works.
             dismiss(restoringFocus: false)
+
+        case .header:
+            // Unreachable: `selectedMatch` never returns a header.
+            break
         }
     }
 
-    /// Enter, Up and Down have to be intercepted before the field editor acts on them —
-    /// a newline is meaningless in a one-line search field, and the arrows should move
-    /// the selection rather than the caret.
+    /// Enter in all its forms, Up and Down have to be intercepted before the field editor
+    /// acts on them — a newline is meaningless in a one-line search field, and the arrows
+    /// should move the selection rather than the caret.
     func control(
         _ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector
     ) -> Bool {
@@ -365,7 +491,13 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             results.moveSelection(by: 1)
             return true
         case #selector(NSResponder.insertNewline(_:)):
-            launchSelected()
+            perform(.open)
+            return true
+        case #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+            perform(.copyPath)
+            return true
+        case #selector(NSResponder.insertLineBreak(_:)):
+            perform(.quit)
             return true
         case #selector(NSResponder.cancelOperation(_:)):
             // Belt and braces alongside the window's `cancelOperation` override. Esc
@@ -381,7 +513,8 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
 
     // MARK: - Geometry
 
-    private func positionOnActiveScreen() {
+    /// Picks where the panel goes; the layout that follows sets the frame.
+    private func placeOnActiveScreen() {
         // The screen under the pointer, not `NSScreen.main` — on a multi-monitor desk
         // the launcher should appear where you are looking.
         let mouse = NSEvent.mouseLocation
@@ -394,32 +527,18 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // A little above centre: the eye lands high on the screen, and the results list
         // then grows downward into empty space.
         topEdge = visible.maxY - visible.height * 0.22
-        setFrame(
-            NSRect(
-                x: visible.midX - Self.width / 2,
-                y: topEdge - Self.fieldHeight,
-                width: Self.width,
-                height: Self.fieldHeight
-            ),
-            display: false
-        )
-        // The frame was just set outright, possibly on a different screen, so the
-        // remembered height no longer describes what is on screen.
-        lastHeight = Self.fieldHeight
+        leftEdge = visible.midX - Self.width / 2
     }
 
-    /// Grows and shrinks downward, keeping the top edge where `positionOnActiveScreen`
-    /// put it.
+    /// Grows and shrinks downward, keeping the top edge where `placeOnActiveScreen` put it.
     private func layoutForResults() {
         resultsHeight.constant = results.fittingHeight
         let height = Self.fieldHeight + results.fittingHeight
+        let target = NSRect(x: leftEdge, y: topEdge - height, width: Self.width, height: height)
         // Measured: across a realistic typing burst the height changes on only 4 of 12
         // keystrokes, while `setFrame(display:)` costs ~0.7ms median and 2.7ms at p99.
-        guard height != lastHeight else { return }
-        lastHeight = height
-        setFrame(
-            NSRect(x: frame.origin.x, y: topEdge - height, width: Self.width, height: height),
-            display: true
-        )
+        guard target != frame else { return }
+        // Drawn now only if on screen; ordering in draws it anyway.
+        setFrame(target, display: isVisible)
     }
 }

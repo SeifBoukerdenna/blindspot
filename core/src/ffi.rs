@@ -45,6 +45,10 @@ pub struct BsHandle {
     /// calling on a second thread; the lock is uncontended in practice.
     ranker: Mutex<Ranker>,
     rescanning: Arc<AtomicBool>,
+    /// Spotlight's record of app use, refreshed alongside every rescan.
+    usage: Arc<crate::usage::UsageScores>,
+    /// Files opened in the last two weeks, for the welcome screen and a bare `?`.
+    recent: Arc<crate::recent::RecentFiles>,
     /// When the last rescan started. Seeded at init, which has already scanned.
     last_scan: Mutex<Option<Instant>>,
     frecency: Mutex<Frecency>,
@@ -72,6 +76,12 @@ pub const BS_KIND_CALC: u8 = 2;
 pub const BS_KIND_CLIP_TEXT: u8 = 3;
 /// A [`BsResult`] that is an image clip from clipboard history.
 pub const BS_KIND_CLIP_IMAGE: u8 = 4;
+/// A [`BsResult`] from an SRE tool — an epoch, a unit conversion, an encoding. Like
+/// [`BS_KIND_CALC`], no path, and Enter copies `name`; `detail` says which form it is.
+pub const BS_KIND_TOOL: u8 = 5;
+/// A [`BsResult`] that is a section title on the welcome screen — "Suggested", "Recent
+/// files". Not selectable; `name` is the title and everything else is empty.
+pub const BS_KIND_HEADER: u8 = 6;
 
 /// `part` for [`bs_clip_content`]: the full text, or the full PNG.
 pub const BS_CLIP_FULL: u8 = 0;
@@ -104,6 +114,11 @@ pub struct BsResult {
     /// attached displays to call a full-screen capture a screenshot.
     pub width: u32,
     pub height: u32,
+    /// A tool row's subtitle — "binary", "ISO 8601", "decoded". NULL for everything else.
+    /// For an epoch, `timestamp` carries the instant too, because only Swift knows the
+    /// local time zone to render it in.
+    pub detail: *const u8,
+    pub detail_len: usize,
 }
 
 /// A clip handed from Swift to Rust. Every pointer only has to live for the call:
@@ -124,6 +139,18 @@ pub struct BsClip {
     pub text_len: usize,
     pub width: u32,
     pub height: u32,
+}
+
+/// Startup settings the shell needs from config.toml, read once at launch.
+#[repr(C)]
+pub struct BsSettings {
+    /// Carbon virtual key code, e.g. `kVK_Space`.
+    pub hotkey_key_code: u32,
+    /// Carbon modifier mask — `cmdKey`, `shiftKey` and friends, not `NSEvent` flags.
+    pub hotkey_modifiers: u32,
+    /// False if config.toml's hotkey did not parse and the default is in use.
+    pub hotkey_from_config: bool,
+    pub launch_at_login: bool,
 }
 
 /// Bytes owned by Rust. Must be passed to [`bs_free_blob`].
@@ -187,8 +214,11 @@ pub unsafe extern "C" fn bs_init(config_path: *const c_char) -> *mut BsHandle {
 
 /// Ranked matches for `query`, best first, at most `limit` of them.
 ///
-/// A NULL handle or a NULL query yields an empty result set rather than a crash. A
-/// `limit` of zero yields no results; ask [`bs_max_results`] for the configured cap.
+/// An empty query is the welcome screen: suggested apps and recent files under
+/// [`BS_KIND_HEADER`] rows, with `pending` set while the recent list refreshes. A NULL
+/// query is treated as an empty one; a NULL handle yields an empty result set rather
+/// than a crash. A `limit` of zero yields no results; ask [`bs_max_results`] for the
+/// configured cap.
 ///
 /// # Safety
 ///
@@ -374,6 +404,37 @@ pub unsafe extern "C" fn bs_free_blob(blob: BsBlob) {
     }));
 }
 
+/// Settings read from config.toml at init. Plain values — nothing to free.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live pointer from [`bs_init`] that has not been shut down.
+/// A NULL handle yields the defaults.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_settings(handle: *const BsHandle) -> BsSettings {
+    let defaults = BsSettings {
+        hotkey_key_code: crate::hotkey::DEFAULT.key_code,
+        hotkey_modifiers: crate::hotkey::DEFAULT.modifiers,
+        hotkey_from_config: false,
+        launch_at_login: true,
+    };
+    if handle.is_null() {
+        return defaults;
+    }
+    // SAFETY: as `bs_query` — read-only and not outliving the call.
+    let handle = unsafe { &*handle };
+    catch_unwind(AssertUnwindSafe(|| {
+        let (hotkey, from_config) = handle.config.hotkey();
+        BsSettings {
+            hotkey_key_code: hotkey.key_code,
+            hotkey_modifiers: hotkey.modifiers,
+            hotkey_from_config: from_config,
+            launch_at_login: handle.config.launch_at_login,
+        }
+    }))
+    .unwrap_or(defaults)
+}
+
 /// Releases everything a [`bs_query`] result owns.
 ///
 /// # Safety
@@ -447,11 +508,18 @@ fn init(explicit: Option<String>) -> *mut BsHandle {
     };
     let frecency = Frecency::load(config.frecency.half_life_days, visits);
 
+    let usage = spawn_usage_refresh(config.frecency.half_life_days);
+    // Fetched now so the first panel show already has a list to paint.
+    let recent = Arc::new(crate::recent::RecentFiles::default());
+    recent.refresh();
+
     Box::into_raw(Box::new(BsHandle {
         config,
         index,
         ranker: Mutex::new(Ranker::new()),
         rescanning: Arc::new(AtomicBool::new(false)),
+        usage,
+        recent,
         last_scan: Mutex::new(Some(Instant::now())),
         frecency: Mutex::new(frecency),
         files: FileSearch::new(),
@@ -459,6 +527,18 @@ fn init(explicit: Option<String>) -> *mut BsHandle {
         clips: open_clips(),
         store,
     }))
+}
+
+/// Starts the first Spotlight usage fetch off the main thread and returns the store it will
+/// fill. Launch does not wait for it: the first few queries rank on blindspot's own history
+/// until it lands, about 84ms later.
+fn spawn_usage_refresh(half_life_days: f64) -> Arc<crate::usage::UsageScores> {
+    let usage = Arc::new(crate::usage::UsageScores::default());
+    let target = Arc::clone(&usage);
+    let _ = std::thread::Builder::new()
+        .name("blindspot-usage".to_owned())
+        .spawn(move || target.replace(crate::usage::fetch_scores(unix_now(), half_life_days)));
+    usage
 }
 
 /// Clipboard history on disk, falling back to this session only. Losing history at quit
@@ -520,31 +600,86 @@ impl BsHandle {
         }
         let snapshot = self.index.snapshot();
         let now = unix_now();
+        if query.trim().is_empty() {
+            return self.welcome(limit, &snapshot, now);
+        }
         match crate::files::strip_prefix(query) {
             Some(text) => self.file_query(text, limit, &snapshot, now),
             None => self.app_query(query, limit, &snapshot, now),
         }
     }
 
+    /// The empty query: what you are likely to want before typing anything — apps by use,
+    /// then files opened recently, each section under a header row.
+    ///
+    /// Sized to show whole. `max_results` rows fit before the list scrolls and the shell
+    /// draws two headers in one row's height, so the sections share `max_results - 1`
+    /// rows. Apps take the larger half, since they are opened far more often than any one
+    /// file, and either section gives its unused rows to the other.
+    fn welcome(&self, limit: usize, snapshot: &[AppEntry], now: u64) -> BsResults {
+        self.recent.refresh();
+        let recent = self.recent.snapshot();
+        let rows = self
+            .config
+            .max_results
+            .saturating_sub(1)
+            .min(limit.saturating_sub(2));
+
+        let usage = self.usage.snapshot();
+        let mut suggested: Vec<(f64, &AppEntry)> = self.with_frecency(|frecency| {
+            snapshot
+                .iter()
+                .map(|e| {
+                    let spotlight = usage.get(&e.id).copied().unwrap_or(0.0);
+                    (frecency.score(e.id, now).max(spotlight), e)
+                })
+                .filter(|(score, _)| *score > 0.0)
+                .collect()
+        });
+        suggested.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+
+        let apps = suggested.len().min(rows - recent.len().min(rows / 2));
+        let files = recent.len().min(rows - apps);
+
+        let mut items = Vec::with_capacity(apps + files + 2);
+        if apps > 0 {
+            items.push(BsResult::header("Suggested"));
+            items.extend(
+                suggested[..apps]
+                    .iter()
+                    .map(|(_, e)| BsResult::new(e, 0, BS_KIND_APP)),
+            );
+        }
+        if files > 0 {
+            items.push(BsResult::header("Recent files"));
+            items.extend(
+                recent[..files]
+                    .iter()
+                    .map(|e| BsResult::new(e, 0, BS_KIND_FILE)),
+            );
+        }
+        leak_results(items, self.recent.is_refreshing())
+    }
+
     /// A plain query: the calculator, then apps by fuzzy score and frecency — M3's ranking,
     /// unchanged. Files only ever appear behind `?`.
     fn app_query(&self, text: &str, limit: usize, snapshot: &[AppEntry], now: u64) -> BsResults {
-        // An expression is not a name, so the calculator is the most specific possible
-        // reading and takes the top row whenever it fires — and `evaluate` declines
-        // everything that is not complete arithmetic, a bare number included.
-        let calculated = crate::calc::evaluate(text);
-        let app_limit = limit.saturating_sub(usize::from(calculated.is_some()));
+        // A value is not a name, so a tool or the calculator is the most specific possible
+        // reading and takes the top rows whenever it fires — and both decline everything
+        // short of their exact shapes, a bare number and a plain word included.
+        let mut items = answers(text);
+        items.truncate(limit);
+        let app_limit = limit - items.len();
 
+        let usage = self.usage.snapshot();
         let apps = self.with_frecency(|frecency| {
             self.with_ranker(|ranker| {
-                ranker.rank_with(text, snapshot, app_limit, |id| frecency.boost(id, now))
+                ranker.rank_with(text, snapshot, app_limit, |id| {
+                    frecency.boost_with(id, now, usage.get(&id).copied().unwrap_or(0.0))
+                })
             })
         });
 
-        let mut items: Vec<BsResult> = Vec::new();
-        if let Some(value) = calculated {
-            items.push(BsResult::calculated(&crate::calc::format(value)));
-        }
         // `get` rather than indexing: a panic here would abort the process, which is too
         // high a price for an assumption about the ranker's indices.
         items.extend(apps.iter().filter_map(|r| {
@@ -562,10 +697,17 @@ impl BsHandle {
     /// `?documents` work at all — Spotlight never returns `~/Documents` or `~/Downloads` —
     /// and it answers on the keystroke, while `mdfind` fills in the depths ~100ms later.
     fn file_query(&self, text: &str, limit: usize, snapshot: &[AppEntry], now: u64) -> BsResults {
-        // A bare `?` has nothing to match yet, and ranking the empty string would return the
-        // alphabetical head of everything — the noise the empty state exists to suppress.
+        // A bare `?` is the Files browse mode: nothing to match yet, so the files you
+        // opened most recently, rather than the alphabetical head of everything.
         if text.is_empty() {
-            return BsResults::empty();
+            self.recent.refresh();
+            let recent = self.recent.snapshot();
+            let items = recent
+                .iter()
+                .take(limit)
+                .map(|e| BsResult::new(e, 0, BS_KIND_FILE))
+                .collect();
+            return leak_results(items, self.recent.is_refreshing());
         }
 
         // Idempotent, so calling it on every keystroke and every poll needs no bookkeeping.
@@ -584,10 +726,12 @@ impl BsHandle {
 
         // (key, is_app, index into its own list, score). Indices rather than borrows, so
         // the sort owns nothing that points into either list.
+        let usage = self.usage.snapshot();
         let mut ranked: Vec<(crate::relevance::Key, bool, usize, u32)> =
             self.with_frecency(|frecency| {
                 self.with_ranker(|ranker| {
-                    let boost = |id| frecency.boost(id, now);
+                    let boost =
+                        |id| frecency.boost_with(id, now, usage.get(&id).copied().unwrap_or(0.0));
                     let apps = ranker.rank_with(text, snapshot, usize::MAX, boost);
                     let files = ranker.rank_with(text, &pool, usize::MAX, boost);
                     let score = |list: &[AppEntry], is_app: bool, r: &crate::matching::Ranked| {
@@ -597,7 +741,19 @@ impl BsHandle {
                             path: &entry.path,
                             is_app,
                             fuzzy: r.score,
-                            used: frecency.score(entry.id, now) > 0.0,
+                            used: if frecency.score(entry.id, now) > 0.0 {
+                                crate::relevance::Usage::Launched
+                            } else if is_app {
+                                if usage.get(&entry.id).copied().unwrap_or(0.0)
+                                    >= crate::usage::RECENT_SCORE
+                                {
+                                    crate::relevance::Usage::Recent
+                                } else {
+                                    crate::relevance::Usage::Never
+                                }
+                            } else {
+                                crate::relevance::recency(entry.last_used, now)
+                            },
                         };
                         let key = crate::relevance::key(&candidate, text, home);
                         Some((key, is_app, r.index, r.score))
@@ -714,7 +870,9 @@ impl BsHandle {
 
         let guard = RescanGuard(Arc::clone(&self.rescanning));
         let index = Arc::clone(&self.index);
+        let usage = Arc::clone(&self.usage);
         let paths = self.config.resolved_app_paths();
+        let half_life = self.config.frecency.half_life_days;
 
         // Dropping the `JoinHandle` detaches the thread, which is what we want: nobody
         // joins a rescan. If the spawn itself failed the closure was dropped, taking
@@ -724,8 +882,22 @@ impl BsHandle {
             .spawn(move || {
                 let _guard = guard;
                 index.replace(apps::scan(&paths));
+                usage.replace(crate::usage::fetch_scores(unix_now(), half_life));
             });
     }
+}
+
+/// Tool rows if any tool recognises `text`, else the calculator's one row, else nothing.
+/// Never both: `0xff` is a tool's, `0xff + 1` is arithmetic.
+fn answers(text: &str) -> Vec<BsResult> {
+    let tools = crate::tools::evaluate(text);
+    if !tools.is_empty() {
+        return tools.iter().map(BsResult::tool).collect();
+    }
+    crate::calc::evaluate(text)
+        .map(|value| BsResult::calculated(&crate::calc::format(value)))
+        .into_iter()
+        .collect()
 }
 
 /// Clears the in-progress flag however the rescan ends, panic included, so one failed
@@ -755,6 +927,29 @@ impl BsResult {
             timestamp: 0,
             width: 0,
             height: 0,
+            detail: std::ptr::null(),
+            detail_len: 0,
+        }
+    }
+
+    /// A welcome-screen section title.
+    fn header(title: &str) -> Self {
+        Self {
+            kind: BS_KIND_HEADER,
+            score: 0,
+            ..Self::calculated(title)
+        }
+    }
+
+    /// A tool row: copied on Enter like a calculated one, with its form as the subtitle.
+    fn tool(row: &crate::tools::ToolRow) -> Self {
+        let (detail, detail_len) = leak_bytes(row.detail.as_bytes());
+        Self {
+            kind: BS_KIND_TOOL,
+            timestamp: row.timestamp,
+            detail,
+            detail_len,
+            ..Self::calculated(&row.value)
         }
     }
 
@@ -783,6 +978,8 @@ impl BsResult {
             timestamp: 0,
             width: 0,
             height: 0,
+            detail: std::ptr::null(),
+            detail_len: 0,
         }
     }
 }
@@ -841,11 +1038,13 @@ unsafe fn free_results(results: BsResults) {
         ))
     };
     for item in &items {
-        // SAFETY: both pairs came from `leak_bytes` in `BsResult::new`, and the boxed
-        // slice above owns them exclusively, so this is the only reclaim.
+        // SAFETY: every pair came from `leak_bytes` in a `BsResult` constructor, or is a
+        // NULL `detail` that `free_bytes` skips, and the boxed slice above owns them
+        // exclusively, so this is the only reclaim.
         unsafe {
             free_bytes(item.name, item.name_len);
             free_bytes(item.path, item.path_len);
+            free_bytes(item.detail, item.detail_len);
         }
     }
 }
@@ -902,6 +1101,8 @@ mod tests {
             index: Arc::new(index),
             ranker: Mutex::new(Ranker::new()),
             rescanning: Arc::new(AtomicBool::new(false)),
+            usage: Arc::new(crate::usage::UsageScores::default()),
+            recent: Arc::new(crate::recent::RecentFiles::with(Vec::new())),
             last_scan: Mutex::new(None),
             frecency: Mutex::new(Frecency::new(14.0)),
             files: FileSearch::new(),
@@ -1143,6 +1344,17 @@ mod tests {
     }
 
     #[test]
+    fn trailing_whitespace_changes_nothing() {
+        // What a pasted line leaves behind: the field turns its final newline into a space.
+        let h = handle(&["Safari", "Slack", "Stocks"]);
+        assert_eq!(query(h, "sa ", 8), query(h, "sa", 8));
+        assert_eq!(query(h, "12 * 34 ", 8), query(h, "12 * 34", 8));
+        assert_eq!(query(h, "@1757548800 ", 8), query(h, "@1757548800", 8));
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
     fn an_expression_answers_above_the_apps() {
         let h = handle(&["Safari", "Slack"]);
         let rows = query(h, "12 * 34", 8);
@@ -1153,6 +1365,156 @@ mod tests {
         let rows = query(h, "s", 8);
         assert!(rows.iter().all(|(name, _, _)| name != "408"));
 
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    /// A welcome screen's rows as (kind, name), for a handle whose recent files are `files`.
+    fn welcome(h: *mut BsHandle, files: &[&str]) -> (Vec<(u8, String)>, bool) {
+        let recent = files
+            .iter()
+            .map(|n| AppEntry::new((*n).to_owned(), PathBuf::from(format!("/Users/seif/{n}"))))
+            .collect();
+        // SAFETY: `h` is live and nothing else touches it during the swap.
+        unsafe { (*h).recent = Arc::new(crate::recent::RecentFiles::with(recent)) };
+        let c = CString::new("").expect("no interior NUL");
+        // SAFETY: `h` is live and `c` outlives the call.
+        let results = unsafe { bs_query(h, c.as_ptr(), 50) };
+        let rows = if results.items.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: `results` came straight from `bs_query`, and each name buffer is
+            // owned by it.
+            let items = unsafe { std::slice::from_raw_parts(results.items, results.len) };
+            items
+                .iter()
+                .map(|r| {
+                    // SAFETY: same, for the name buffer each result owns.
+                    let name = unsafe { std::slice::from_raw_parts(r.name, r.name_len) };
+                    (r.kind, String::from_utf8_lossy(name).into_owned())
+                })
+                .collect()
+        };
+        let pending = results.pending;
+        // SAFETY: exactly one free, of exactly what `bs_query` returned.
+        unsafe { bs_free_results(results) };
+        (rows, pending)
+    }
+
+    #[test]
+    fn the_welcome_screen_is_used_apps_then_recent_files() {
+        let h = handle(&["Safari", "Slack", "Stocks", "Xcode", "Zed"]);
+        for (name, times) in [("Zed", 3), ("Slack", 1)] {
+            let id = query(h, name, 8)[0].2;
+            for _ in 0..times {
+                // SAFETY: `h` is live.
+                unsafe { bs_activate(h, id) };
+            }
+        }
+        let (rows, pending) = welcome(h, &["resume.pdf", "Downloads"]);
+        assert_eq!(
+            rows,
+            [
+                (BS_KIND_HEADER, "Suggested".to_owned()),
+                (BS_KIND_APP, "Zed".to_owned()),
+                (BS_KIND_APP, "Slack".to_owned()),
+                (BS_KIND_HEADER, "Recent files".to_owned()),
+                (BS_KIND_FILE, "resume.pdf".to_owned()),
+                (BS_KIND_FILE, "Downloads".to_owned()),
+            ],
+            "most-used first; never-used apps are not suggestions"
+        );
+        assert!(!pending, "a fresh cache starts no fetch");
+
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn the_welcome_screen_fits_max_results_and_drops_empty_sections() {
+        let names: Vec<String> = (0..20).map(|i| format!("App{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let h = handle(&refs);
+        for name in &refs {
+            let id = query(h, name, 8)[0].2;
+            // SAFETY: `h` is live.
+            unsafe { bs_activate(h, id) };
+        }
+        let files: Vec<String> = (0..20).map(|i| format!("file{i}")).collect();
+        let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+
+        let (rows, _) = welcome(h, &file_refs);
+        let count = |kind| rows.iter().filter(|(k, _)| *k == kind).count();
+        // max_results is 8 by default: two headers in one row's height, then 4 + 3.
+        assert_eq!((count(BS_KIND_APP), count(BS_KIND_FILE)), (4, 3));
+
+        let (rows, _) = welcome(h, &["only.txt"]);
+        let count = |kind| rows.iter().filter(|(k, _)| *k == kind).count();
+        assert_eq!(
+            (count(BS_KIND_APP), count(BS_KIND_FILE)),
+            (6, 1),
+            "unused rows move over"
+        );
+
+        let (rows, _) = welcome(h, &[]);
+        assert!(
+            !rows.iter().any(|(_, name)| name == "Recent files"),
+            "no header over an empty section"
+        );
+
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn a_bare_prefix_browses_recent_files() {
+        let h = handle(&["Safari"]);
+        let (_, _) = welcome(h, &["a.txt", "b.txt"]);
+        let rows = query(h, "?", 8);
+        assert_eq!(
+            rows.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["a.txt", "b.txt"]
+        );
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn tool_rows_carry_their_kind_detail_and_instant() {
+        let h = handle(&["Safari"]);
+        let c = CString::new("@1757548800").expect("no interior NUL");
+        // SAFETY: `h` is live and `c` outlives the call.
+        let results = unsafe { bs_query(h, c.as_ptr(), 8) };
+        // SAFETY: `results` came straight from `bs_query`.
+        let items = unsafe { std::slice::from_raw_parts(results.items, results.len) };
+        let read = |ptr: *const u8, len: usize| {
+            // SAFETY: each pair is a live buffer owned by `results`, or NULL with len 0.
+            (!ptr.is_null())
+                .then(|| unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        assert_eq!(items.len(), 2, "two forms, and nothing else matches");
+        assert!(
+            items
+                .iter()
+                .all(|r| r.kind == BS_KIND_TOOL && r.path_len == 0)
+        );
+        assert_eq!(
+            read(items[0].name, items[0].name_len),
+            "2025-09-11 00:00:00 UTC"
+        );
+        assert_eq!(items[0].timestamp, 1_757_548_800);
+        assert_eq!(read(items[1].detail, items[1].detail_len), "ISO 8601");
+        // SAFETY: exactly one free, of exactly what `bs_query` returned.
+        unsafe { bs_free_results(results) };
+
+        let rows = query(h, "12 * 34", 8);
+        assert_eq!(
+            rows.len(),
+            1,
+            "arithmetic is one calculator row, not tool rows"
+        );
         // SAFETY: one shutdown, no calls after it.
         unsafe { bs_shutdown(h) };
     }
@@ -1269,7 +1631,10 @@ mod tests {
         let h = handle(&["Calendar", "Mail"]);
         // SAFETY: NULL is part of `bs_query`'s contract; `h` is live.
         let got = drain(unsafe { bs_query(h, std::ptr::null(), 8) });
-        assert_eq!(got.len(), 2, "empty query returns the head of the index");
+        // The welcome screen, which with nothing used and nothing recent has no rows —
+        // and in particular not the alphabetical head of the index.
+        assert_eq!(got, query(h, "", 8));
+        assert!(got.is_empty());
         // SAFETY: one shutdown, no calls after it.
         unsafe { bs_shutdown(h) };
     }
@@ -1306,6 +1671,23 @@ mod tests {
     }
 
     #[test]
+    fn settings_default_to_the_working_hotkey_and_login_on() {
+        // SAFETY: NULL is part of the contract.
+        let s = unsafe { bs_settings(std::ptr::null()) };
+        assert_eq!(
+            (s.hotkey_key_code, s.hotkey_modifiers),
+            (0x31, 0x100 | 0x200)
+        );
+        assert!(s.launch_at_login);
+        let h = handle(&[]);
+        // SAFETY: `h` is live.
+        let s = unsafe { bs_settings(h) };
+        assert!(s.hotkey_from_config, "the built-in default string parses");
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
     fn max_results_reports_the_config() {
         let h = handle(&[]);
         // SAFETY: `h` is live.
@@ -1329,6 +1711,8 @@ mod tests {
             index: Arc::new(index),
             ranker: Mutex::new(Ranker::new()),
             rescanning: Arc::new(AtomicBool::new(false)),
+            usage: Arc::new(crate::usage::UsageScores::default()),
+            recent: Arc::new(crate::recent::RecentFiles::with(Vec::new())),
             last_scan: Mutex::new(None),
             frecency: Mutex::new(Frecency::new(14.0)),
             files: FileSearch::new(),

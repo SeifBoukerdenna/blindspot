@@ -19,7 +19,8 @@ enum LatencyBench {
     static let budget = 0.016
 
     /// Prefixes of things actually installed, plus one that matches nothing, so the
-    /// figures cover both a full result list and an empty one.
+    /// figures cover both a full result list and an empty one. `""` is the welcome screen,
+    /// headers and all — what backspacing to an empty field renders.
     static let queries = ["", "s", "sa", "saf", "te", "term", "termi", "x", "co", "zzzz"]
     static let iterations = 300
 
@@ -68,7 +69,6 @@ enum LatencyBench {
         for query in queries { results.update(core.query(query, limit: resultLimit).matches) }
 
         var ffi: [Double] = [], update: [Double] = [], reframe: [Double] = [], total: [Double] = []
-        var lastHeight: CGFloat = -1
 
         for _ in 0..<iterations {
             for query in queries {
@@ -77,14 +77,13 @@ enum LatencyBench {
                 let t1 = DispatchTime.now().uptimeNanoseconds
                 results.update(matches)
                 let t2 = DispatchTime.now().uptimeNanoseconds
-                // Mirrors Panel.layoutForResults, unchanged-height guard included, so the
+                // Mirrors Panel.layoutForResults, unchanged-frame guard included, so the
                 // harness cannot flatter the app by skipping work the app does.
                 resultsHeight.constant = results.fittingHeight
-                let height = 58 + results.fittingHeight
-                if height != lastHeight {
-                    lastHeight = height
-                    panel.setFrame(
-                        NSRect(x: 0, y: 0, width: 640, height: height), display: true)
+                let height = 62 + results.fittingHeight
+                let target = NSRect(x: 0, y: 0, width: 640, height: height)
+                if target != panel.frame {
+                    panel.setFrame(target, display: true)
                 }
                 // Force the table to realise its visible rows inside the timed region, so
                 // the figure includes the work a real keystroke would trigger.

@@ -11,34 +11,23 @@ import Carbon.HIToolbox
 /// warning. It also requires no TCC grant, which is the entire point.
 @MainActor
 final class HotKey {
-    /// Cmd+Shift+Space, the development binding.
+    /// Carbon virtual key code and modifier mask, from config.toml via `bs_settings`.
     ///
-    /// Not Cmd+Space: Spotlight's binding lives in a system-owned plist that no program
-    /// may rebind, so unbinding it stays a manual step in System Settings.
-    ///
-    /// Not Ctrl+Space or Cmd+Option+Space either, which are the two the M1 plan floated.
-    /// Both are already spoken for by system symbolic hotkeys — Ctrl+Space switches
-    /// input source (verified enabled in this machine's `com.apple.symbolichotkeys`)
-    /// and Cmd+Option+Space opens Spotlight's file-search window, on by default. That
-    /// matters more than it looks: `RegisterEventHotKey` reports `noErr` for a
-    /// combination someone else already holds, so the symptom of picking one of those
-    /// is not an error at startup — it is a hotkey that silently never fires.
-    static let keyCode = UInt32(kVK_Space)
+    /// Carbon masks are *not* `NSEvent.ModifierFlags`: Carbon uses bits 8-12 (`cmdKey` =
+    /// 0x100), AppKit bits 16-23 (`.command` = 0x100000). They share no bit positions, so a raw
+    /// `NSEvent` value handed to Carbon is silently the wrong chord.
+    let keyCode: UInt32
+    let modifiers: UInt32
 
-    /// Carbon modifier masks, which are *not* `NSEvent.ModifierFlags`. Carbon uses bits
-    /// 8-12 (`cmdKey` = 0x100, `shiftKey` = 0x200); AppKit uses bits 16-23
-    /// (`.command` = 0x100000). The two share no bit positions, so a raw
-    /// `NSEvent.ModifierFlags` value handed to Carbon is silently the wrong chord.
-    static let modifiers = UInt32(cmdKey | shiftKey)
-
-    /// 'blnd'. Only has to be unique within this process.
     private static let identifier = EventHotKeyID(signature: 0x626C_6E64, id: 1)
 
     private let onPress: () -> Void
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
 
-    init(onPress: @escaping () -> Void) {
+    init(keyCode: UInt32, modifiers: UInt32, onPress: @escaping () -> Void) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
         self.onPress = onPress
     }
 
@@ -81,7 +70,7 @@ final class HotKey {
 
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(
-            Self.keyCode, Self.modifiers, Self.identifier,
+            keyCode, modifiers, Self.identifier,
             GetApplicationEventTarget(), 0, &ref)
 
         guard status == noErr, let ref else {

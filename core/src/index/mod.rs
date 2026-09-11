@@ -15,6 +15,9 @@ pub struct AppEntry {
     /// Display name, already resolved through the `CFBundleDisplayName` fallback chain.
     pub name: String,
     pub path: PathBuf,
+    /// When Spotlight last saw it opened, Unix seconds. Only file results carry it — it
+    /// arrives with the `mdfind` line that found them — and it feeds relevance.
+    pub last_used: Option<u64>,
 }
 
 impl AppEntry {
@@ -23,11 +26,12 @@ impl AppEntry {
             id: id_for_path(&path),
             name,
             path,
+            last_used: None,
         }
     }
 }
 
-fn id_for_path(path: &std::path::Path) -> u64 {
+pub(crate) fn id_for_path(path: &std::path::Path) -> u64 {
     fnv1a(&[path.as_os_str().as_bytes()])
 }
 

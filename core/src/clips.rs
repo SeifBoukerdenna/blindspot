@@ -384,6 +384,7 @@ fn entry(id: u64, name: String) -> AppEntry {
         id,
         name,
         path: PathBuf::new(),
+        last_used: None,
     }
 }
 

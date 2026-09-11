@@ -4,17 +4,22 @@
 //! unit-tested and benchmarked through the `rlib` target.
 
 pub mod calc;
+pub mod civil;
 pub mod clips;
 pub mod config;
 pub mod ffi;
 pub mod files;
 pub mod frecency;
+pub mod hotkey;
 pub mod index;
 // `match` is a keyword; the file is named `match.rs` to match the layout in CLAUDE.md.
 #[path = "match.rs"]
 pub mod matching;
+pub mod recent;
 pub mod relevance;
 pub mod store;
+pub mod tools;
+pub mod usage;
 
 pub use config::Config;
 pub use frecency::{Frecency, Visit};

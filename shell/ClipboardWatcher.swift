@@ -24,18 +24,22 @@ final class ClipboardWatcher {
     ]
 
     private let sink: ClipSink
+    /// The general pasteboard in the app. A parameter so a harness can drive the real
+    /// panel's copy actions against a private pasteboard, never the user's clipboard.
+    private let pasteboard: NSPasteboard
     private var lastSeen: Int
     /// The `changeCount` of blindspot's own most recent write, so it is not re-ingested.
     private var ownWrite: Int?
     private var task: Task<Void, Never>?
 
-    init(sink: ClipSink) {
+    init(sink: ClipSink, pasteboard: NSPasteboard = .general) {
         self.sink = sink
+        self.pasteboard = pasteboard
         // A baseline, not a read: whatever was copied before launch is ignored on purpose.
         // `changeCount` exposes no contents, so it stays clear of the access alert
         // `NSPasteboard.h` documents — an alert that, on macOS 26.4, did not fire even for
         // real content reads. See CLAUDE.md; a future macOS may start enforcing it.
-        lastSeen = NSPasteboard.general.changeCount
+        lastSeen = pasteboard.changeCount
     }
 
     func start() {
@@ -60,7 +64,6 @@ final class ClipboardWatcher {
     /// the watcher re-read it would duplicate images outright: an image goes back on the
     /// pasteboard as TIFF, re-encodes to different PNG bytes, and hashes to a new id.
     func writeOwn(_ body: (NSPasteboard) -> Void) {
-        let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         body(pasteboard)
         ownWrite = pasteboard.changeCount
@@ -73,7 +76,6 @@ final class ClipboardWatcher {
     }
 
     private func poll() {
-        let pasteboard = NSPasteboard.general
         let count = pasteboard.changeCount
         guard count != lastSeen else { return }
         lastSeen = count
