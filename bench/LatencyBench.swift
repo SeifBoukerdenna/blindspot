@@ -23,6 +23,10 @@ enum LatencyBench {
     static let queries = ["", "s", "sa", "saf", "te", "term", "termi", "x", "co", "zzzz"]
     static let iterations = 300
 
+    /// Mirrors `Panel.resultLimit`: the panel fetches this many and scrolls past
+    /// `max_results`, so the harness must render the same list or it measures a different app.
+    static let resultLimit = 50
+
     static func main() {
         NSApplication.shared.setActivationPolicy(.accessory)
 
@@ -41,7 +45,7 @@ enum LatencyBench {
         IconCache.warmNow(core.allPaths())
         let warmSeconds = elapsed(since: startedWarm)
 
-        let results = ResultsView(capacity: max(core.maxResults, 1))
+        let results = ResultsView(visibleRows: core.maxResults)
         let container = NSView()
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 640, height: 400),
@@ -54,10 +58,14 @@ enum LatencyBench {
             results.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             results.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
+        // A scroll view has no height of its own; the panel sets it per query, and so does
+        // this, or the table would render zero rows and the harness would time nothing.
+        let resultsHeight = results.heightAnchor.constraint(equalToConstant: 0)
+        resultsHeight.isActive = true
         panel.orderFrontRegardless()
 
         // Steady state is what a typing user experiences; first-touch view setup is not.
-        for query in queries { results.update(core.query(query, limit: core.maxResults).matches) }
+        for query in queries { results.update(core.query(query, limit: resultLimit).matches) }
 
         var ffi: [Double] = [], update: [Double] = [], reframe: [Double] = [], total: [Double] = []
         var lastHeight: CGFloat = -1
@@ -65,18 +73,22 @@ enum LatencyBench {
         for _ in 0..<iterations {
             for query in queries {
                 let t0 = DispatchTime.now().uptimeNanoseconds
-                let matches = core.query(query, limit: core.maxResults).matches
+                let matches = core.query(query, limit: resultLimit).matches
                 let t1 = DispatchTime.now().uptimeNanoseconds
                 results.update(matches)
                 let t2 = DispatchTime.now().uptimeNanoseconds
                 // Mirrors Panel.layoutForResults, unchanged-height guard included, so the
                 // harness cannot flatter the app by skipping work the app does.
+                resultsHeight.constant = results.fittingHeight
                 let height = 58 + results.fittingHeight
                 if height != lastHeight {
                     lastHeight = height
                     panel.setFrame(
                         NSRect(x: 0, y: 0, width: 640, height: height), display: true)
                 }
+                // Force the table to realise its visible rows inside the timed region, so
+                // the figure includes the work a real keystroke would trigger.
+                container.layoutSubtreeIfNeeded()
                 let t3 = DispatchTime.now().uptimeNanoseconds
 
                 ffi.append(seconds(t0, t1))

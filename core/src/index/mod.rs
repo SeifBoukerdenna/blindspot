@@ -27,15 +27,25 @@ impl AppEntry {
     }
 }
 
-/// FNV-1a. Chosen over `DefaultHasher` because that one's output is explicitly not
-/// stable across Rust releases, and these ids are written to the frecency store at M3.
 fn id_for_path(path: &std::path::Path) -> u64 {
+    fnv1a(&[path.as_os_str().as_bytes()])
+}
+
+/// FNV-1a over the concatenation of `parts`. Chosen over `DefaultHasher` because that
+/// one's output is explicitly not stable across Rust releases, and these ids are
+/// persisted — by the frecency store since M3 and by clipboard history since M5.
+///
+/// Takes several slices so callers can prefix a domain tag without allocating a joined
+/// buffer — which matters when the other part is a 25 MB screenshot.
+pub(crate) fn fnv1a(parts: &[&[u8]]) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;
-    for byte in path.as_os_str().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(PRIME);
+    for part in parts {
+        for byte in *part {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
     }
     hash
 }

@@ -21,6 +21,18 @@ use crate::frecency::Visit;
 /// `Value` trait for tuples of primitives, which spares us a serialisation format.
 const VISITS: TableDefinition<u64, (f64, u64)> = TableDefinition::new("visits");
 
+/// `~/.local/share/blindspot`, where every database blindspot keeps lives.
+///
+/// Not beside `config.toml`: config is hand-edited and belongs in `~/.config`, while
+/// these are opaque state the user never opens. Each concern gets its own file, so
+/// deleting clipboard history cannot cost the user their launch history.
+pub fn data_dir() -> Result<PathBuf, StoreError> {
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .ok_or(StoreError::NoHome)?;
+    Ok(PathBuf::from(home).join(".local/share/blindspot"))
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Open(Box<redb::DatabaseError>),
@@ -32,10 +44,10 @@ pub enum StoreError {
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Open(e) => write!(f, "could not open the frecency store: {e}"),
-            Self::Transaction(e) => write!(f, "frecency store transaction failed: {e}"),
-            Self::Io(e) => write!(f, "could not create the frecency store directory: {e}"),
-            Self::NoHome => write!(f, "$HOME is unset, so there is nowhere to keep frecency"),
+            Self::Open(e) => write!(f, "could not open a blindspot store: {e}"),
+            Self::Transaction(e) => write!(f, "store transaction failed: {e}"),
+            Self::Io(e) => write!(f, "could not create the store directory: {e}"),
+            Self::NoHome => write!(f, "$HOME is unset, so there is nowhere to keep state"),
         }
     }
 }
@@ -54,14 +66,8 @@ pub struct Store {
 
 impl Store {
     /// `~/.local/share/blindspot/frecency.redb`.
-    ///
-    /// Not beside `config.toml`: config is hand-edited and belongs in `~/.config`, while
-    /// this is opaque state the user never opens.
     pub fn default_path() -> Result<PathBuf, StoreError> {
-        let home = std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .ok_or(StoreError::NoHome)?;
-        Ok(PathBuf::from(home).join(".local/share/blindspot/frecency.redb"))
+        Ok(data_dir()?.join("frecency.redb"))
     }
 
     /// Opens, creating the file and its parent directory if needed.

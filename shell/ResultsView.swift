@@ -78,6 +78,45 @@ enum IconCache {
         }
     }
 
+    /// The calculator row's icon. A symbol, not a file icon, because a calculated result
+    /// has no path to look one up from.
+    static let calculator: NSImage? = {
+        let image = NSImage(
+            systemSymbolName: "equal.square", accessibilityDescription: "Calculated result")
+        image?.size = NSSize(width: ResultsView.iconSize, height: ResultsView.iconSize)
+        return image
+    }()
+
+    /// Where clip thumbnails come from. Set once at launch; left `nil` by the latency
+    /// harness, which never shows a clip.
+    static var clipThumbnails: ((UInt64) -> Data?)?
+    private static var clipCache: [UInt64: NSImage] = [:]
+
+    /// The icon for a text clip.
+    static let textClip: NSImage? = {
+        let image = NSImage(
+            systemSymbolName: "doc.on.clipboard", accessibilityDescription: "Copied text")
+        image?.size = NSSize(width: ResultsView.iconSize, height: ResultsView.iconSize)
+        return image
+    }()
+
+    /// An image clip's stored thumbnail, flattened like every app icon — the same
+    /// 1685µs-to-17µs saving on `NSImageView.image` applies to a PNG as to a workspace
+    /// icon. Falls back to the text-clip symbol if the thumbnail is missing.
+    static func thumbnail(forClip id: UInt64) -> NSImage? {
+        if let hit = clipCache[id] { return hit }
+        guard let data = clipThumbnails?(id), let image = NSImage(data: data) else {
+            return textClip
+        }
+        // Bounded, because clips come and go while this process lives for weeks and the
+        // cache would otherwise hold every thumbnail ever shown. History itself caps at
+        // 200 clips, so dropping everything past that costs a re-decode at worst.
+        if clipCache.count >= 256 { clipCache.removeAll(keepingCapacity: true) }
+        let flattened = flatten(image)
+        clipCache[id] = flattened
+        return flattened
+    }
+
     /// The largest backing scale across every attached display, not the current screen's.
     /// The panel follows the pointer between displays, so caching at the maximum means
     /// moving onto a Retina screen can never reveal a blurry icon. Being generous costs a
@@ -112,6 +151,43 @@ enum IconCache {
     }
 }
 
+/// "2 min ago" for clip rows. Main-actor state because `RelativeDateTimeFormatter` is
+/// not `Sendable`, and building one per row per keystroke would be wasteful.
+@MainActor
+private enum ClipTime {
+    private static let formatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
+
+    static func describe(_ timestamp: UInt64) -> String {
+        formatter.localizedString(
+            for: Date(timeIntervalSince1970: TimeInterval(timestamp)), relativeTo: Date())
+    }
+}
+
+/// What to call an image clip in its row.
+///
+/// "Screenshot" when its pixel size matches an attached display exactly — a reliable tell
+/// for a full-screen capture — and "Image" otherwise. Decided at render time because only
+/// the shell knows the displays, and they can change after the copy.
+@MainActor
+private enum ImageLabel {
+    /// The placeholder name Rust gives an image in which no text was recognised.
+    static let placeholder = "Image"
+
+    static func of(width: Int, height: Int) -> String {
+        let matchesDisplay = NSScreen.screens.contains { screen in
+            let points = screen.frame.size
+            let scale = screen.backingScaleFactor
+            return [points, CGSize(width: points.width * scale, height: points.height * scale)]
+                .contains { Int($0.width.rounded()) == width && Int($0.height.rounded()) == height }
+        }
+        return matchesDisplay ? "Screenshot" : "Image"
+    }
+}
+
 /// One fixed-height row: icon, name, and the folder it lives in.
 @MainActor
 private final class ResultRow: NSView {
@@ -143,11 +219,18 @@ private final class ResultRow: NSView {
 
         title.font = .systemFont(ofSize: 15)
         title.lineBreakMode = .byTruncatingTail
+        // Low horizontal compression resistance on both labels, so long text truncates
+        // instead of widening the window. A label's intrinsic width is its whole string,
+        // at the default priority of 750 — and the panel's width is not a required
+        // constraint — so a long clip made Auto Layout grow the panel to 1812pt, off the
+        // right edge of the screen. Truncation needs something willing to give way.
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         // Semantic colours, not literal black/grey, so the labels pick up vibrancy
         // against the glass instead of sitting flat on top of it.
         title.textColor = .labelColor
         subtitle.font = .systemFont(ofSize: 12)
         subtitle.lineBreakMode = .byTruncatingMiddle
+        subtitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         subtitle.textColor = .secondaryLabelColor
         iconView.imageScaling = .scaleProportionallyUpOrDown
 
@@ -162,7 +245,6 @@ private final class ResultRow: NSView {
         }
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: ResultsView.rowHeight),
             iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
             iconView.widthAnchor.constraint(equalToConstant: ResultsView.iconSize),
@@ -177,49 +259,108 @@ private final class ResultRow: NSView {
     required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
 
     func show(_ match: Match) {
-        title.stringValue = match.name
-        subtitle.stringValue = match.subtitle
-        iconView.image = IconCache.icon(for: match.path)
+        switch match.kind {
+        case .clipImage:
+            // Titled by the text found in it. With none, the label takes the title, so the
+            // row never shows a placeholder or a pair of pixel dimensions.
+            let label = ImageLabel.of(width: match.width, height: match.height)
+            let time = ClipTime.describe(match.timestamp)
+            if match.name == ImageLabel.placeholder {
+                title.stringValue = label
+                subtitle.stringValue = time
+            } else {
+                title.stringValue = match.name
+                subtitle.stringValue = "\(label) · \(time)"
+            }
+        case .clipText:
+            title.stringValue = match.name
+            subtitle.stringValue = ClipTime.describe(match.timestamp)
+        case .app, .file, .calc:
+            title.stringValue = match.name
+            subtitle.stringValue = match.subtitle
+        }
+        iconView.image =
+            switch match.kind {
+            case .calc: IconCache.calculator
+            case .clipText: IconCache.textClip
+            case .clipImage: IconCache.thumbnail(forClip: match.id)
+            case .app, .file: IconCache.icon(for: match.path)
+            }
     }
 }
 
-/// The results list: a stack of fixed-height rows.
+/// The results list: a scrolling table of fixed-height rows.
 ///
-/// Hand-drawn rather than an `NSTableView`, per the decision in CLAUDE.md's open
-/// questions. A table earns its complexity through reuse across thousands of rows;
-/// here there are at most `max_results` of them, all the same height, and the row views
-/// are allocated once at launch and refilled in place — so a table's cell-reuse
-/// machinery would be pure overhead on the keystroke path.
+/// An `NSTableView` since the list learned to scroll, reversing M1's hand-drawn stack —
+/// CLAUDE.md's open question, answered by measurement rather than taste. For eight rows the
+/// stack was right, and a table's reuse machinery would have been pure overhead. For a
+/// scrolling list of up to fifty it is the other way round: refilling fifty stacked rows on
+/// every keystroke measured 1.56ms median and peaked at 21ms, over a frame, where a table
+/// builds and fills only the rows actually on screen. It also brings the native scrolling a
+/// hand-rolled list would have to fake — momentum, rubber-banding, the overlay scroller.
 @MainActor
-final class ResultsView: NSStackView {
+final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegate {
     static let rowHeight: CGFloat = 54
     static let iconSize: CGFloat = 36
+    private static let spacing: CGFloat = 1
+    private static let padding = NSEdgeInsets(top: 8, left: 0, bottom: 10, right: 0)
+    private static let rowID = NSUserInterfaceItemIdentifier("result")
 
-    private var rows: [ResultRow] = []
+    private let table = NSTableView()
+
+    /// Row views the table has let go of, handed straight back out.
+    ///
+    /// Kept by hand because `makeView(withIdentifier:)` was not recycling: measured, 400
+    /// updates vended 2,950 distinct row views — a fresh icon, two labels, a stack view and
+    /// their constraints for every visible row on every re-tile. That construction was the
+    /// entire cost of a keystroke that changed the list's height: 1.85ms median, 30ms peak.
+    private var pool: [ResultRow] = []
+
+    /// Rows shown before the list scrolls — `max_results` in config.toml.
+    private let visibleRows: Int
+
     private(set) var matches: [Match] = []
 
-    /// Which row Enter will launch. Lives here rather than in Rust: it is keystroke-
-    /// driven UI state, and the shell owns keystrokes.
+    /// Which row Enter will launch. Lives here rather than in Rust: it is keystroke-driven
+    /// UI state, and the shell owns keystrokes.
     private(set) var selection = 0
 
-    init(capacity: Int) {
-        super.init(frame: .zero)
-        orientation = .vertical
-        alignment = .leading
-        distribution = .fill
-        spacing = 1
-        edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 10, right: 8)
-        translatesAutoresizingMaskIntoConstraints = false
+    /// Called when a row is clicked. A list you can scroll with a trackpad has to let you
+    /// act on what you scrolled to; clicking launches, as it does in Spotlight.
+    var onActivate: (() -> Void)?
 
-        // Built once, up front. Allocating views on the keystroke path is exactly the
-        // kind of thing that turns an instant launcher into a sluggish one.
-        for _ in 0..<max(capacity, 1) {
-            let row = ResultRow(frame: .zero)
-            row.isHidden = true
-            rows.append(row)
-            addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: widthAnchor, constant: -16).isActive = true
-        }
+    init(visibleRows: Int) {
+        self.visibleRows = max(visibleRows, 1)
+        super.init(frame: .zero)
+
+        let column = NSTableColumn(identifier: Self.rowID)
+        column.resizingMask = .autoresizingMask
+        table.addTableColumn(column)
+        table.headerView = nil
+        table.style = .plain
+        table.rowHeight = Self.rowHeight
+        table.intercellSpacing = NSSize(width: 0, height: Self.spacing)
+        table.backgroundColor = .clear
+        table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        // Selection is drawn by the row itself, in the same style as before the table.
+        table.selectionHighlightStyle = .none
+        // The search field keeps focus throughout. A table that took it on click would
+        // silently stop typing from reaching the query.
+        table.refusesFirstResponder = true
+        table.dataSource = self
+        table.delegate = self
+        table.target = self
+        table.action = #selector(clicked)
+
+        documentView = table
+        drawsBackground = false
+        borderType = .noBorder
+        hasVerticalScroller = true
+        autohidesScrollers = true
+        scrollerStyle = .overlay
+        automaticallyAdjustsContentInsets = false
+        contentInsets = Self.padding
+        translatesAutoresizingMaskIntoConstraints = false
     }
 
     @available(*, unavailable)
@@ -230,48 +371,76 @@ final class ResultsView: NSStackView {
     }
 
     func update(_ matches: [Match]) {
-        self.matches = Array(matches.prefix(rows.count))
-        // Collapse the padding when there is nothing to pad, so an empty result list
-        // takes zero height instead of the insets' worth and `fittingHeight` agrees
-        // with what the stack actually occupies.
-        edgeInsets =
-            self.matches.isEmpty
-            ? NSEdgeInsets()
-            : NSEdgeInsets(top: 8, left: 8, bottom: 10, right: 8)
+        self.matches = matches
         // A new query is a new list; keeping the old index would land Enter on whatever
         // happened to slide into that position.
         selection = 0
-        for (index, row) in rows.enumerated() {
-            if index < self.matches.count {
-                row.show(self.matches[index])
-                row.isHidden = false
-            } else {
-                row.isHidden = true
-            }
-        }
-        applySelection()
+        table.reloadData()
+        // And it starts at the top: staying scrolled down would hide the best match.
+        contentView.scroll(to: NSPoint(x: 0, y: -Self.padding.top))
+        reflectScrolledClipView(contentView)
     }
 
-    /// Moves the highlight by `offset`, clamped. Deliberately not wrapping: at eight
-    /// rows, wrapping from the bottom to the top reads as the list having jumped.
+    /// Moves the highlight by `offset`, clamped rather than wrapping — from the bottom of
+    /// a fifty-row list, jumping back to the top reads as the list having reset.
     func moveSelection(by offset: Int) {
         guard !matches.isEmpty else { return }
+        let previous = selection
         selection = min(max(selection + offset, 0), matches.count - 1)
-        applySelection()
+        guard selection != previous else { return }
+        row(at: previous)?.isSelected = false
+        row(at: selection)?.isSelected = true
+        // What makes the arrow keys scroll: moving past the last visible row brings the
+        // next one into view, one row at a time.
+        table.scrollRowToVisible(selection)
     }
 
-    private func applySelection() {
-        for (index, row) in rows.enumerated() {
-            row.isSelected = index == selection && index < matches.count
+    /// The height for the rows showing, capped at `visibleRows` — past that the list
+    /// scrolls instead of the panel growing down the screen.
+    var fittingHeight: CGFloat {
+        let shown = CGFloat(min(matches.count, visibleRows))
+        guard shown > 0 else { return 0 }
+        return shown * Self.rowHeight + (shown - 1) * Self.spacing + Self.padding.top
+            + Self.padding.bottom
+    }
+
+    /// The live row view, if it is on screen. Off-screen rows get their selection state
+    /// when the table next asks for them, in `tableView(_:viewFor:row:)`.
+    private func row(at index: Int) -> ResultRow? {
+        guard matches.indices.contains(index) else { return nil }
+        return table.view(atColumn: 0, row: index, makeIfNecessary: false) as? ResultRow
+    }
+
+    @objc private func clicked() {
+        let clicked = table.clickedRow
+        guard matches.indices.contains(clicked) else { return }
+        row(at: selection)?.isSelected = false
+        selection = clicked
+        row(at: selection)?.isSelected = true
+        onActivate?()
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        matches.count
+    }
+
+    func tableView(_ tableView: NSTableView, didRemove rowView: NSTableRowView, forRow row: Int) {
+        // Bounded, though it never gets near it: only the rows on screen at once are ever
+        // out of the pool.
+        if let cell = rowView.view(atColumn: 0) as? ResultRow, pool.count < 32 {
+            pool.append(cell)
         }
     }
 
-    /// The height this view wants for the number of rows currently showing, so the
-    /// panel can shrink to fit instead of leaving empty space under short result lists.
-    var fittingHeight: CGFloat {
-        let visible = CGFloat(matches.count)
-        guard visible > 0 else { return 0 }
-        return visible * Self.rowHeight + (visible - 1) * spacing + edgeInsets.top
-            + edgeInsets.bottom
+    func tableView(
+        _ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int
+    ) -> NSView? {
+        // Reused as rows leave the table, so only the visible handful ever exist.
+        let view = pool.popLast() ?? ResultRow(frame: .zero)
+        if matches.indices.contains(row) {
+            view.show(matches[row])
+        }
+        view.isSelected = row == selection
+        return view
     }
 }

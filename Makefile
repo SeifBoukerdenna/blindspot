@@ -36,7 +36,7 @@ ARCH       := arm64
 # rather than a closure that happens to work.
 SWIFTFLAGS := -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
               -import-objc-header $(HEADER) \
-              -framework AppKit -framework Carbon \
+              -framework AppKit -framework Carbon -framework Vision \
               -L $(CORE_DIR)/target/release -lblindspot_core
 
 .PHONY: all core header app sign run clean test bench bench-shell check
@@ -62,14 +62,23 @@ $(BINARY): $(SWIFT_SRC) $(CORE_LIB) $(HEADER) shell/Info.plist
 	sed -e 's/@BUNDLE_ID@/$(BUNDLE_ID)/g' -e 's/@VERSION@/$(VERSION)/g' \
 	    shell/Info.plist > $(CONTENTS)/Info.plist
 
-# Ad-hoc signature. Enough for personal use; notarization stays an open question per
-# CLAUDE.md and is only needed once the app is handed to someone else.
+# Developer ID, not ad-hoc, since clipboard history. An ad-hoc identity is the binary's
+# hash, which changes on every build. `NSPasteboard.h` documents a pasteboard-access
+# grant; if a future macOS enforces it and keys the grant to identity the way TCC does,
+# an ad-hoc build would lose it on every rebuild. Future-proofing, not a fix: on macOS
+# 26.4 no grant was ever requested. `make SIGN_ID=-` restores ad-hoc.
 #
-# No --deep: Apple deprecated it for signing, and there is nothing nested to sign —
-# one Mach-O and a plist. Signing is not conditional on the binary being newer,
-# because a re-sign is cheap and a stale signature is a confusing failure mode.
+# --timestamp=none because Developer ID signing otherwise contacts Apple's timestamp
+# server on every build: a network call CLAUDE.md rules out, and a build that fails
+# offline. A secure timestamp only matters for notarization, which this is not.
+#
+# No --deep: Apple deprecated it for signing, and there is nothing nested to sign. Not
+# conditional on the binary being newer, because a stale signature is a confusing way
+# to fail and a re-sign is cheap.
+SIGN_ID ?= Developer ID Application: seif boukerdenna (VZR89A8Z89)
+
 sign: app
-	codesign --force --sign - --identifier $(BUNDLE_ID) $(BUNDLE)
+	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID) $(BUNDLE)
 
 run: sign
 	@pkill -x blindspot 2>/dev/null || true

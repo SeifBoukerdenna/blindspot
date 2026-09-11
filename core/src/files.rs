@@ -8,7 +8,7 @@
 //! gets killed the moment its answer stops mattering.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -25,8 +25,17 @@ pub const PREFIX: char = '?';
 /// Deliberately low, since the prefix already means the user asked for this.
 const MIN_QUERY: usize = 2;
 
-/// Most paths taken from one run. `mdfind` will happily produce six figures of them.
-const RESULT_CAP: usize = 50;
+/// Candidates handed to the keystroke-path ranker, chosen as the best of everything read.
+///
+/// Chosen, not merely the first to arrive: `mdfind` returns paths in no useful order, so
+/// taking its first N made the real answer luck. With a first-50 cap `~/blindspot`
+/// (position 81 of 1,645) never reached the ranker; with first-500, `Blindspot.app` still
+/// lost its place to build artefacts. Selecting in the worker costs the keystroke nothing.
+const RESULT_CAP: usize = 500;
+
+/// Most lines read from one run. A safety valve for broad queries, not a relevance cut —
+/// the selection above is what decides relevance.
+const READ_CAP: usize = 20_000;
 
 /// The query text if this asked to be a file search, prefix removed.
 ///
@@ -34,6 +43,37 @@ const RESULT_CAP: usize = 50;
 /// apart from "not a file query at all".
 pub fn strip_prefix(query: &str) -> Option<&str> {
     query.strip_prefix(PREFIX).map(str::trim_start)
+}
+
+/// `$HOME`, if set.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The entries directly inside `home`, found by listing it — not by asking Spotlight.
+///
+/// This exists because Spotlight never returns `~/Documents` or `~/Downloads`, even
+/// though `mdls` shows both indexed. Results from folders macOS privacy-protects are
+/// filtered out for a caller without access, and listing `~` itself is not protected. So
+/// this finds your top-level folders instantly, on the keystroke, while `mdfind` catches
+/// up with everything deeper.
+///
+/// One level only, and never a `stat`: descending into `~/Documents` would read a
+/// protected folder and raise a permission prompt, which nothing here is worth.
+pub fn home_entries(home: &Path) -> Vec<AppEntry> {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Dotfiles are configuration, not something you open by name.
+            (!name.starts_with('.')).then(|| AppEntry::new(name, entry.path()))
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -151,17 +191,46 @@ fn run(shared: &Arc<Mutex<Shared>>, generation: u64, query: &str) {
     }
 
     // Read without the lock held: this is the slow part, and a poll must never block on it.
-    let mut entries = Vec::with_capacity(RESULT_CAP);
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-        if entries.len() >= RESULT_CAP {
-            break;
-        }
-        if let Some(entry) = entry_for(PathBuf::from(line)) {
-            entries.push(entry);
+    // Every line is scored cheaply — place and match quality, no fuzzy matching — and only
+    // the best `RESULT_CAP` survive, so the keystroke ranks good candidates rather than
+    // whichever ones `mdfind` happened to print first.
+    let home = home_dir();
+    let mut scored: Vec<(crate::relevance::Key, AppEntry)> = Vec::new();
+    for line in BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+        .take(READ_CAP)
+    {
+        let Some(entry) = entry_for(PathBuf::from(line)) else {
+            continue;
+        };
+        let candidate = crate::relevance::Candidate {
+            name: &entry.name,
+            path: &entry.path,
+            is_app: false,
+            fuzzy: 0,
+            used: false,
+        };
+        let key = crate::relevance::key(&candidate, query, home.as_deref());
+        scored.push((key, entry));
+        // Bounded memory on a broad query: trim back whenever the pile grows well past
+        // what will be kept.
+        if scored.len() >= RESULT_CAP * 4 {
+            keep_best(&mut scored);
         }
     }
+    keep_best(&mut scored);
 
-    finish(shared, generation, entries);
+    finish(
+        shared,
+        generation,
+        scored.into_iter().map(|(_, e)| e).collect(),
+    );
+}
+
+fn keep_best(scored: &mut Vec<(crate::relevance::Key, AppEntry)>) {
+    scored.sort_unstable_by_key(|(key, _)| std::cmp::Reverse(*key));
+    scored.truncate(RESULT_CAP);
 }
 
 fn finish(shared: &Arc<Mutex<Shared>>, generation: u64, entries: Vec<AppEntry>) {
@@ -257,6 +326,24 @@ mod tests {
         let first = lock(&search.shared).generation;
         search.search("blindspot-stable-xyzzy");
         assert_eq!(lock(&search.shared).generation, first, "idempotent");
+    }
+
+    #[test]
+    fn home_entries_list_one_level_and_skip_dotfiles() {
+        let dir = std::env::temp_dir().join(format!("blindspot-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Documents/deep")).expect("mkdir");
+        std::fs::write(dir.join("notes.md"), b"x").expect("write");
+        std::fs::write(dir.join(".zshrc"), b"x").expect("write");
+
+        let mut names: Vec<String> = home_entries(&dir).into_iter().map(|e| e.name).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["Documents", "notes.md"],
+            "one level, no dotfiles, no descent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -8,6 +8,11 @@ import AppKit
 @MainActor
 final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     private static let width: CGFloat = 640
+
+    /// Results fetched per query. `max_results` rows show at once; the rest scroll. Fifty
+    /// because nobody scrolls further through a launcher, and the table only renders what
+    /// is visible, so fetching more than fits costs nothing on the keystroke path.
+    private static let resultLimit = 50
     private static let fieldHeight: CGFloat = 62
 
     /// Tahoe roughly doubled the system window corner radius; the old 12 read as a
@@ -17,6 +22,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     private static let cornerRadius: CGFloat = 20
 
     private let core: Core
+    private let watcher: ClipboardWatcher
     private let field = NSTextField()
     private let results: ResultsView
 
@@ -31,9 +37,14 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// The height last handed to `setFrame`, so an unchanged one can be skipped.
     private var lastHeight: CGFloat = -1
 
-    init(core: Core) {
+    /// A scroll view has no height of its own, so the list's is set explicitly — to its
+    /// rows, capped at `max_results`, beyond which it scrolls.
+    private lazy var resultsHeight = results.heightAnchor.constraint(equalToConstant: 0)
+
+    init(core: Core, watcher: ClipboardWatcher) {
         self.core = core
-        self.results = ResultsView(capacity: max(core.maxResults, 1))
+        self.watcher = watcher
+        self.results = ResultsView(visibleRows: core.maxResults)
 
         super.init(
             contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.fieldHeight),
@@ -86,6 +97,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         animationBehavior = .none
 
         buildContentView()
+        results.onActivate = { [weak self] in self?.launchSelected() }
     }
 
     /// A borderless window has no title bar or resize bar, so AppKit's default answer
@@ -131,20 +143,30 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             // spacing and material continuity, never a divider.
             results.topAnchor.constraint(
                 equalTo: container.topAnchor, constant: Self.fieldHeight),
-            results.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            results.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            results.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
+            results.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            resultsHeight,
         ])
 
         // Liquid Glass, the macOS 26 native panel material. Replaces an
         // `NSVisualEffectView` with `.hudWindow`, which was semantically wrong — that
         // material is for heads-up overlays like the volume indicator, not a search
-        // surface. It also clips its own corners *and* the window shadow, which spares
-        // us the `maskImage` dance a visual effect view needs to stop the shadow
-        // haloing square past rounded corners.
+        // surface.
         let glass = NSGlassEffectView()
         glass.cornerRadius = Self.cornerRadius
         glass.style = .regular
         glass.contentView = container
+
+        // `cornerRadius` above rounds the glass material but not the window's alpha, so
+        // the system shadow — and the one-pixel rim macOS draws with it — still traced
+        // the rectangular frame, leaving a square outline showing past every rounded
+        // corner. Contrary to what this code first assumed, `NSGlassEffectView` does not
+        // clip the shadow. A/B'd on window captures: `invalidateShadow()` changed
+        // nothing; a rounded, masking layer is what makes the rim follow the curve.
+        glass.wantsLayer = true
+        glass.layer?.cornerRadius = Self.cornerRadius
+        glass.layer?.cornerCurve = .continuous
+        glass.layer?.masksToBounds = true
 
         contentView = glass
     }
@@ -249,7 +271,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             return
         }
 
-        let (matches, pending) = core.query(text, limit: core.maxResults)
+        let (matches, pending) = core.query(text, limit: Self.resultLimit)
         results.update(matches)
         layoutForResults()
 
@@ -270,38 +292,63 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     private func launchSelected() {
         guard let match = results.selectedMatch else { return }
 
-        // A no-op in the core today; the call site exists so M3's frecency work is a
-        // pure-Rust change.
-        core.activate(match.id)
-
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
-        // Reuse a running copy rather than starting a second one.
-        configuration.createsNewApplicationInstance = false
-
-        let path = match.path
-        let url = URL(fileURLWithPath: path)
         switch match.kind {
-        case .app:
-            NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
-                // Runs off the main thread, so nothing here may touch AppKit.
-                if let error {
-                    NSLog("blindspot: could not launch %@: %@", path, error.localizedDescription)
+        case .calc:
+            // Copy and hand focus back, so the answer can be pasted straight into
+            // whatever the user was working in. No `activate`: a calculated row has no
+            // stable id, and recording one would put junk in the frecency store.
+            watcher.writeOwn { $0.setString(match.name, forType: .string) }
+            dismiss(restoringFocus: true)
+
+        case .clipText, .clipImage:
+            // Back onto the pasteboard, then focus returns so ⌘V pastes it. Not pasted
+            // automatically: synthesising ⌘V needs Accessibility permission, a prompt
+            // blindspot has so far never had to show.
+            if let data = core.clipContent(match.id, part: .full) {
+                watcher.writeOwn { pasteboard in
+                    if match.kind == .clipText {
+                        pasteboard.setString(String(decoding: data, as: UTF8.self), forType: .string)
+                    } else if let image = NSImage(data: data) {
+                        // `writeObjects` offers several representations, not just PNG,
+                        // so apps that only accept TIFF still take the paste.
+                        pasteboard.writeObjects([image])
+                    }
                 }
+                core.activate(match.id)
             }
-        case .file:
-            // Hands the file to whichever application owns it, rather than treating the
-            // path as a bundle to launch.
-            NSWorkspace.shared.open(url, configuration: configuration) { _, error in
+            dismiss(restoringFocus: true)
+
+        case .app, .file:
+            core.activate(match.id)
+
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            // Reuse a running copy rather than starting a second one.
+            configuration.createsNewApplicationInstance = false
+
+            let path = match.path
+            let url = URL(fileURLWithPath: path)
+            // Runs off the main thread, so nothing in here may touch AppKit.
+            let report: @Sendable (NSRunningApplication?, (any Error)?) -> Void = { _, error in
                 if let error {
                     NSLog("blindspot: could not open %@: %@", path, error.localizedDescription)
                 }
             }
-        }
 
-        // Dismissed immediately rather than from the completion handler: the open is
-        // asynchronous and the panel should not sit there while Launch Services works.
-        dismiss(restoringFocus: false)
+            if match.kind == .app {
+                NSWorkspace.shared.openApplication(
+                    at: url, configuration: configuration, completionHandler: report)
+            } else {
+                // Hands the file to whichever application owns it, rather than treating
+                // the path as a bundle to launch.
+                NSWorkspace.shared.open(
+                    url, configuration: configuration, completionHandler: report)
+            }
+
+            // Dismissed immediately rather than from the completion handler: the open is
+            // asynchronous and the panel should not sit there while Launch Services works.
+            dismiss(restoringFocus: false)
+        }
     }
 
     /// Enter, Up and Down have to be intercepted before the field editor acts on them —
@@ -364,6 +411,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// Grows and shrinks downward, keeping the top edge where `positionOnActiveScreen`
     /// put it.
     private func layoutForResults() {
+        resultsHeight.constant = results.fittingHeight
         let height = Self.fieldHeight + results.fittingHeight
         // Measured: across a realistic typing burst the height changes on only 4 of 12
         // keystrokes, while `setFrame(display:)` costs ~0.7ms median and 2.7ms at p99.

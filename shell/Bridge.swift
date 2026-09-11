@@ -5,6 +5,13 @@ import Foundation
 enum MatchKind {
     case app
     case file
+    /// A calculated answer. Has no path — there is nothing on disk — and Enter copies it.
+    case calc
+    /// Clipboard history. No path either; Enter puts the content back on the pasteboard.
+    case clipText
+    case clipImage
+
+    var isClip: Bool { self == .clipText || self == .clipImage }
 }
 
 struct Match: Identifiable, Equatable {
@@ -15,6 +22,11 @@ struct Match: Identifiable, Equatable {
     /// travels in the result struct rather than being re-derived from `id`.
     let path: String
     let score: UInt32
+    /// Unix seconds a clip was last copied; zero for everything else.
+    let timestamp: UInt64
+    /// Pixel size of an image clip; zero for everything else.
+    let width: Int
+    let height: Int
 
     /// The containing folder, shown as the row's second line.
     ///
@@ -23,8 +35,17 @@ struct Match: Identifiable, Equatable {
     /// line: it is what tells two same-named bundles apart, and what reveals that the
     /// Xcode you are about to launch is the one in `~/Applications`.
     var subtitle: String {
-        let parent = (path as NSString).deletingLastPathComponent
-        return (parent as NSString).abbreviatingWithTildeInPath
+        switch kind {
+        case .calc:
+            return "Press ↩ to copy"
+        case .clipText, .clipImage:
+            // Relative time, which `ResultRow` renders because the formatter is main-actor
+            // state and this is a plain value type.
+            return ""
+        case .app, .file:
+            let parent = (path as NSString).deletingLastPathComponent
+            return (parent as NSString).abbreviatingWithTildeInPath
+        }
     }
 }
 
@@ -33,6 +54,9 @@ struct Match: Identifiable, Equatable {
 @MainActor
 final class Core {
     private let handle: OpaquePointer
+
+    /// The one entry point safe to call off the main thread. See `ClipSink`.
+    nonisolated let clipSink: ClipSink
 
     /// Fails only if the core could not initialise at all. A malformed config is not a
     /// failure — Rust falls back to defaults and logs, because a typo in a TOML file
@@ -46,6 +70,7 @@ final class Core {
             }
         guard let created else { return nil }
         handle = created
+        clipSink = ClipSink(handle: created)
     }
 
     /// `isolated` so this runs on the main actor: `handle` is an `OpaquePointer` and
@@ -88,6 +113,15 @@ final class Core {
         bs_reindex(handle)
     }
 
+    /// A clip's full content or its thumbnail, copied out of Rust-owned memory.
+    func clipContent(_ id: UInt64, part: ClipPart) -> Data? {
+        let blob = bs_clip_content(handle, id, part.rawValue)
+        // `defer` so the Rust allocation is released on every path, including `nil`.
+        defer { bs_free_blob(blob) }
+        guard let data = blob.data, blob.len > 0 else { return nil }
+        return Data(bytes: data, count: blob.len)
+    }
+
     /// Every indexed bundle path, for warming caches off the keystroke path.
     ///
     /// An empty query is documented in `ffi.rs` to return the head of the index in order,
@@ -103,9 +137,12 @@ final class Core {
             Match(
                 id: result.id,
                 name: string(result.name, result.name_len),
-                kind: result.kind == UInt8(BS_KIND_FILE) ? .file : .app,
+                kind: kind(result.kind),
                 path: string(result.path, result.path_len),
-                score: result.score
+                score: result.score,
+                timestamp: result.timestamp,
+                width: Int(result.width),
+                height: Int(result.height)
             )
         }
     }
@@ -113,8 +150,59 @@ final class Core {
     /// The core hands over pointer + length rather than a NUL-terminated string,
     /// because a macOS path is bytes. Decoding is lossy in principle; in practice APFS
     /// requires filenames to be valid UTF-8, so the replacement path is unreachable.
+    private static func kind(_ raw: UInt8) -> MatchKind {
+        switch raw {
+        case UInt8(BS_KIND_FILE): return .file
+        case UInt8(BS_KIND_CALC): return .calc
+        case UInt8(BS_KIND_CLIP_TEXT): return .clipText
+        case UInt8(BS_KIND_CLIP_IMAGE): return .clipImage
+        default: return .app
+        }
+    }
+
     private static func string(_ bytes: UnsafePointer<UInt8>?, _ count: Int) -> String {
         guard let bytes, count > 0 else { return "" }
         return String(decoding: UnsafeBufferPointer(start: bytes, count: count), as: UTF8.self)
+    }
+}
+
+enum ClipPart: UInt8 {
+    case full = 0
+    case thumbnail = 1
+}
+
+/// Hands clips to Rust from any thread.
+///
+/// The only part of `Core` callable off the main actor, and deliberately narrow: recording
+/// a clip is where the slow work lives — a redb fsync behind a multi-megabyte screenshot —
+/// so it must not run on the thread that answers the hotkey. `@unchecked` because the
+/// pointer is only ever passed to `bs_clip_add`, which Rust documents as thread-safe: it
+/// locks brief in-memory sections and does its disk write outside them.
+struct ClipSink: @unchecked Sendable {
+    fileprivate let handle: OpaquePointer
+
+    func add(
+        image: Bool, content: Data, thumbnail: Data = Data(), text: Data = Data(),
+        width: Int = 0, height: Int = 0
+    ) {
+        let kind = UInt8(image ? BS_KIND_CLIP_IMAGE : BS_KIND_CLIP_TEXT)
+        // Nested so every buffer is alive for the whole call; Rust copies what it keeps.
+        content.withUnsafeBytes { body in
+            thumbnail.withUnsafeBytes { thumb in
+                text.withUnsafeBytes { words in
+                    var clip = BsClip(
+                        kind: kind,
+                        content: body.bindMemory(to: UInt8.self).baseAddress,
+                        content_len: body.count,
+                        thumbnail: thumb.bindMemory(to: UInt8.self).baseAddress,
+                        thumbnail_len: thumb.count,
+                        text: words.bindMemory(to: UInt8.self).baseAddress,
+                        text_len: words.count,
+                        width: UInt32(clamping: width),
+                        height: UInt32(clamping: height))
+                    bs_clip_add(handle, &clip)
+                }
+            }
+        }
     }
 }

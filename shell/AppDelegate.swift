@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var core: Core?
     private var panel: Panel?
     private var hotKey: HotKey?
+    private var watcher: ClipboardWatcher?
 
     static func main() {
         let app = NSApplication.shared
@@ -52,9 +53,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         self.core = core
 
+        let watcher = ClipboardWatcher(sink: core.clipSink)
+        self.watcher = watcher
+        IconCache.clipThumbnails = { [weak core] id in core?.clipContent(id, part: .thumbnail) }
+
         // Built here, once, and never on the hotkey path. The initial scan already
         // happened inside `Core()`, so the first invocation has a populated index.
-        let panel = Panel(core: core)
+        let panel = Panel(core: core, watcher: watcher)
         self.panel = panel
 
         let hotKey = HotKey { [weak panel] in panel?.toggle() }
@@ -77,16 +82,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             IconCache.prewarm(core.allPaths())
         }
+
+        // Last, once the hotkey is live. Watching reads no contents until the user next
+        // copies something, so if a future macOS enforces the documented pasteboard alert,
+        // it would appear then rather than at login.
+        watcher.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Dropped in dependency order so `Core.deinit` runs `bs_shutdown` while there is
-        // still a process to run it in. Not strictly required — exiting would reclaim
-        // everything anyway — but it keeps a `leaks` run over the query path honest.
+        watcher?.stop()
+        // `core` is deliberately *not* released. Its deinit runs `bs_shutdown`, which frees
+        // the handle, while a detached task may still be encoding a screenshot it is about
+        // to hand to `bs_clip_add` — a use-after-free with nothing to order the two. The
+        // process is exiting and the kernel reclaims everything; the FFI tests already
+        // prove `bs_shutdown` frees correctly, which is what the explicit teardown was for.
         panel?.close()
-        panel = nil
         hotKey = nil
-        core = nil
     }
 
     private func die(_ message: String, _ detail: String) {

@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::clips::{ClipKind, Clips, NewClip, Part};
 use crate::config::Config;
 use crate::files::FileSearch;
 use crate::frecency::Frecency;
@@ -48,6 +49,13 @@ pub struct BsHandle {
     last_scan: Mutex<Option<Instant>>,
     frecency: Mutex<Frecency>,
     files: FileSearch,
+    /// Whose top-level folders `?` lists directly. Held rather than read from `$HOME` on
+    /// each query so tests can point it somewhere controlled — otherwise their results
+    /// depend on whatever is in the home folder of whoever runs them.
+    home: Option<PathBuf>,
+    /// `None` only if even an in-memory store could not be created. Clipboard history is
+    /// then unavailable, and everything else carries on.
+    clips: Option<Clips>,
     /// `None` if the store could not be opened. Frecency then works for the session and
     /// is forgotten at exit, which is a far better failure than refusing to launch.
     store: Option<Arc<Store>>,
@@ -57,6 +65,18 @@ pub struct BsHandle {
 pub const BS_KIND_APP: u8 = 0;
 /// A [`BsResult`] that is a file found through Spotlight.
 pub const BS_KIND_FILE: u8 = 1;
+/// A [`BsResult`] that is a calculator answer. Its `path` is empty — there is nothing to
+/// open — and `name` is the formatted result, which Swift copies on Enter.
+pub const BS_KIND_CALC: u8 = 2;
+/// A [`BsResult`] that is a text clip from clipboard history.
+pub const BS_KIND_CLIP_TEXT: u8 = 3;
+/// A [`BsResult`] that is an image clip from clipboard history.
+pub const BS_KIND_CLIP_IMAGE: u8 = 4;
+
+/// `part` for [`bs_clip_content`]: the full text, or the full PNG.
+pub const BS_CLIP_FULL: u8 = 0;
+/// `part` for [`bs_clip_content`]: the row thumbnail. Empty for text clips.
+pub const BS_CLIP_THUMBNAIL: u8 = 1;
 
 /// One ranked match.
 ///
@@ -75,9 +95,42 @@ pub struct BsResult {
     pub path: *const u8,
     pub path_len: usize,
     pub score: u32,
-    /// [`BS_KIND_APP`] or [`BS_KIND_FILE`]. Swift needs it to choose between launching
-    /// an application and opening a document in whatever owns it.
+    /// One of the `BS_KIND_*` constants. Swift needs it to decide what Enter does.
     pub kind: u8,
+    /// Unix seconds a clip was last copied, so Swift can show "2 min ago" with its own
+    /// localized formatter. Zero for anything that is not a clip.
+    pub timestamp: u64,
+    /// Pixel size of an image clip, zero otherwise. Swift compares it against the
+    /// attached displays to call a full-screen capture a screenshot.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A clip handed from Swift to Rust. Every pointer only has to live for the call:
+/// [`bs_clip_add`] copies whatever it keeps before returning.
+#[repr(C)]
+pub struct BsClip {
+    /// [`BS_KIND_CLIP_TEXT`] or [`BS_KIND_CLIP_IMAGE`].
+    pub kind: u8,
+    /// UTF-8 text, or PNG bytes.
+    pub content: *const u8,
+    pub content_len: usize,
+    /// A small PNG for the row. May be NULL for text.
+    pub thumbnail: *const u8,
+    pub thumbnail_len: usize,
+    /// For images, UTF-8 text recognised in the image, which becomes its name and makes it
+    /// searchable. May be NULL. Ignored for text clips.
+    pub text: *const u8,
+    pub text_len: usize,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Bytes owned by Rust. Must be passed to [`bs_free_blob`].
+#[repr(C)]
+pub struct BsBlob {
+    pub data: *const u8,
+    pub len: usize,
 }
 
 /// A pointer and a length, so one query is one struct rather than a Swift-side array
@@ -230,6 +283,97 @@ pub unsafe extern "C" fn bs_max_results(handle: *const BsHandle) -> usize {
     catch_unwind(AssertUnwindSafe(|| handle.config.max_results)).unwrap_or(0)
 }
 
+/// Records a clip copied by the user.
+///
+/// Swift has already refused anything carrying a privacy marker; this applies the size
+/// caps, dedups against history, evicts what no longer fits, and persists. Safe to call
+/// off the main thread — only brief in-memory sections are locked, never the disk write.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live pointer from [`bs_init`]. `clip` must be NULL or point
+/// to a valid [`BsClip`] whose `content` and `thumbnail` are each NULL or valid for their
+/// stated lengths, for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_clip_add(handle: *mut BsHandle, clip: *const BsClip) {
+    if handle.is_null() || clip.is_null() {
+        return;
+    }
+    // SAFETY: per the contract above, both pointers are live for this call. The byte
+    // slices are built by `slice_or_empty`, which never hands `from_raw_parts` a NULL.
+    let (handle, clip) = unsafe { (&*handle, &*clip) };
+    let content = unsafe { slice_or_empty(clip.content, clip.content_len) };
+    let thumbnail = unsafe { slice_or_empty(clip.thumbnail, clip.thumbnail_len) };
+    let text = unsafe { slice_or_empty(clip.text, clip.text_len) };
+
+    let kind = match clip.kind {
+        BS_KIND_CLIP_TEXT => ClipKind::Text,
+        BS_KIND_CLIP_IMAGE => ClipKind::Image,
+        _ => return,
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(clips) = &handle.clips {
+            clips.add(
+                NewClip {
+                    kind,
+                    content,
+                    thumbnail,
+                    text,
+                    width: clip.width,
+                    height: clip.height,
+                },
+                unix_now(),
+            );
+        }
+    }));
+}
+
+/// The full bytes of a clip, or its thumbnail. Empty if `id` is not a clip.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live pointer from [`bs_init`]. The returned [`BsBlob`] must
+/// be passed to [`bs_free_blob`] exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_clip_content(handle: *mut BsHandle, id: u64, part: u8) -> BsBlob {
+    let empty = BsBlob {
+        data: std::ptr::null(),
+        len: 0,
+    };
+    if handle.is_null() {
+        return empty;
+    }
+    // SAFETY: as `bs_query` — a live handle, borrowed only for this call.
+    let handle = unsafe { &*handle };
+    let part = if part == BS_CLIP_THUMBNAIL {
+        Part::Thumbnail
+    } else {
+        Part::Full
+    };
+    catch_unwind(AssertUnwindSafe(|| {
+        let bytes = handle.clips.as_ref()?.content(id, part)?;
+        let (data, len) = leak_bytes(&bytes);
+        Some(BsBlob { data, len })
+    }))
+    .ok()
+    .flatten()
+    .unwrap_or(empty)
+}
+
+/// Releases a [`BsBlob`].
+///
+/// # Safety
+///
+/// `blob` must be exactly what [`bs_clip_content`] returned, freed at most once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_free_blob(blob: BsBlob) {
+    // SAFETY: the contract guarantees the pair came from `leak_bytes` in
+    // `bs_clip_content` and has not been freed; `free_bytes` ignores NULL.
+    let _ = catch_unwind(AssertUnwindSafe(move || unsafe {
+        free_bytes(blob.data, blob.len)
+    }));
+}
+
 /// Releases everything a [`bs_query`] result owns.
 ///
 /// # Safety
@@ -311,8 +455,22 @@ fn init(explicit: Option<String>) -> *mut BsHandle {
         last_scan: Mutex::new(Some(Instant::now())),
         frecency: Mutex::new(frecency),
         files: FileSearch::new(),
+        home: crate::files::home_dir(),
+        clips: open_clips(),
         store,
     }))
+}
+
+/// Clipboard history on disk, falling back to this session only. Losing history at quit
+/// is a far better failure than refusing to start.
+fn open_clips() -> Option<Clips> {
+    match Clips::default_path().and_then(|path| Clips::open(&path)) {
+        Ok(clips) => Some(clips),
+        Err(e) => {
+            eprintln!("blindspot: {e}; clipboard history will not persist");
+            Clips::in_memory().ok()
+        }
+    }
 }
 
 /// Seconds since the Unix epoch, or 0 if the clock is before it. Frecency arithmetic
@@ -355,65 +513,153 @@ impl BsHandle {
     }
 
     fn query(&self, query: &str, limit: usize) -> BsResults {
+        // Clipboard history is its own mode, not mixed into app results: clipboard contents
+        // appearing among launcher results would be noise, and a privacy leak on screen.
+        if let Some(rest) = query.strip_prefix(crate::clips::PREFIX) {
+            return self.clip_query(rest.trim_start(), limit);
+        }
         let snapshot = self.index.snapshot();
         let now = unix_now();
-
-        let file_query = crate::files::strip_prefix(query);
-        let text = file_query.unwrap_or(query);
-
-        // A bare `?` has nothing to match yet. Falling through would rank the empty
-        // string against the app index and return its alphabetical head — exactly the
-        // noise the empty state exists to suppress.
-        if file_query.is_some() && text.is_empty() {
-            return BsResults::empty();
+        match crate::files::strip_prefix(query) {
+            Some(text) => self.file_query(text, limit, &snapshot, now),
+            None => self.app_query(query, limit, &snapshot, now),
         }
+    }
 
-        // Kicked and read in one breath: `search` is idempotent, so calling it on every
-        // keystroke and every poll needs no bookkeeping here.
-        let (hits, pending) = match file_query {
-            Some(text) => {
-                self.files.search(text);
-                self.files.results(text)
-            }
-            None => (Vec::new(), false),
-        };
+    /// A plain query: the calculator, then apps by fuzzy score and frecency — M3's ranking,
+    /// unchanged. Files only ever appear behind `?`.
+    fn app_query(&self, text: &str, limit: usize, snapshot: &[AppEntry], now: u64) -> BsResults {
+        // An expression is not a name, so the calculator is the most specific possible
+        // reading and takes the top row whenever it fires — and `evaluate` declines
+        // everything that is not complete arithmetic, a bare number included.
+        let calculated = crate::calc::evaluate(text);
+        let app_limit = limit.saturating_sub(usize::from(calculated.is_some()));
 
-        let (apps, files) = self.with_frecency(|frecency| {
+        let apps = self.with_frecency(|frecency| {
             self.with_ranker(|ranker| {
-                let apps = ranker.rank_with(text, &snapshot, limit, |id| frecency.boost(id, now));
-                // Apps first, files fill what is left. `mdfind` returns paths in no
-                // useful order, so ranking their basenames is real value for free — and
-                // it picks up frecency through the same boost.
-                let remaining = limit.saturating_sub(apps.len());
-                let files = if remaining > 0 && !hits.is_empty() {
-                    ranker.rank_with(text, &hits, remaining, |id| frecency.boost(id, now))
-                } else {
-                    Vec::new()
-                };
-                (apps, files)
+                ranker.rank_with(text, snapshot, app_limit, |id| frecency.boost(id, now))
             })
         });
 
+        let mut items: Vec<BsResult> = Vec::new();
+        if let Some(value) = calculated {
+            items.push(BsResult::calculated(&crate::calc::format(value)));
+        }
         // `get` rather than indexing: a panic here would abort the process, which is too
         // high a price for an assumption about the ranker's indices.
-        let mut items: Vec<BsResult> = apps
+        items.extend(apps.iter().filter_map(|r| {
+            snapshot
+                .get(r.index)
+                .map(|e| BsResult::new(e, r.score, BS_KIND_APP))
+        }));
+        leak_results(items, false)
+    }
+
+    /// A `?` query: apps and files in one list, ordered by [`crate::relevance::Key`].
+    ///
+    /// Candidates come from three places, merged and deduplicated by path: the app index,
+    /// your home folder listed directly, and `mdfind`. The direct listing is what makes
+    /// `?documents` work at all — Spotlight never returns `~/Documents` or `~/Downloads` —
+    /// and it answers on the keystroke, while `mdfind` fills in the depths ~100ms later.
+    fn file_query(&self, text: &str, limit: usize, snapshot: &[AppEntry], now: u64) -> BsResults {
+        // A bare `?` has nothing to match yet, and ranking the empty string would return the
+        // alphabetical head of everything — the noise the empty state exists to suppress.
+        if text.is_empty() {
+            return BsResults::empty();
+        }
+
+        // Idempotent, so calling it on every keystroke and every poll needs no bookkeeping.
+        self.files.search(text);
+        let (hits, pending) = self.files.results(text);
+
+        let home = self.home.as_deref();
+        let mut seen = std::collections::HashSet::new();
+        let pool: Vec<AppEntry> = home
+            .map(crate::files::home_entries)
+            .unwrap_or_default()
+            .into_iter()
+            .chain(hits)
+            .filter(|entry| seen.insert(entry.path.clone()))
+            .collect();
+
+        // (key, is_app, index into its own list, score). Indices rather than borrows, so
+        // the sort owns nothing that points into either list.
+        let mut ranked: Vec<(crate::relevance::Key, bool, usize, u32)> =
+            self.with_frecency(|frecency| {
+                self.with_ranker(|ranker| {
+                    let boost = |id| frecency.boost(id, now);
+                    let apps = ranker.rank_with(text, snapshot, usize::MAX, boost);
+                    let files = ranker.rank_with(text, &pool, usize::MAX, boost);
+                    let score = |list: &[AppEntry], is_app: bool, r: &crate::matching::Ranked| {
+                        let entry = list.get(r.index)?;
+                        let candidate = crate::relevance::Candidate {
+                            name: &entry.name,
+                            path: &entry.path,
+                            is_app,
+                            fuzzy: r.score,
+                            used: frecency.score(entry.id, now) > 0.0,
+                        };
+                        let key = crate::relevance::key(&candidate, text, home);
+                        Some((key, is_app, r.index, r.score))
+                    };
+                    apps.iter()
+                        .filter_map(|r| score(snapshot, true, r))
+                        .chain(files.iter().filter_map(|r| score(&pool, false, r)))
+                        .collect()
+                })
+            });
+
+        ranked.sort_by_key(|r| std::cmp::Reverse(r.0));
+        ranked.truncate(limit);
+
+        let items: Vec<BsResult> = ranked
             .iter()
-            .filter_map(|r| {
-                snapshot
-                    .get(r.index)
-                    .map(|e| BsResult::new(e, r.score, BS_KIND_APP))
+            .filter_map(|&(_, is_app, index, score)| {
+                if is_app {
+                    snapshot
+                        .get(index)
+                        .map(|e| BsResult::new(e, score, BS_KIND_APP))
+                } else {
+                    pool.get(index)
+                        .map(|e| BsResult::new(e, score, BS_KIND_FILE))
+                }
             })
             .collect();
-        items.extend(files.iter().filter_map(|r| {
-            hits.get(r.index)
-                .map(|e| BsResult::new(e, r.score, BS_KIND_FILE))
-        }));
-
         leak_results(items, pending)
+    }
+
+    /// Ranked by recency, not frecency: clips are stored newest first and the ranker
+    /// breaks ties by index, so a bare `;` lists the latest copies and a fuzzy tie
+    /// favours the more recent one.
+    fn clip_query(&self, text: &str, limit: usize) -> BsResults {
+        let Some(clips) = &self.clips else {
+            return BsResults::empty();
+        };
+        let items = clips.with_entries(|entries, info| {
+            let ranked = self.with_ranker(|ranker| ranker.rank(text, entries, limit));
+            ranked
+                .iter()
+                .filter_map(|r| {
+                    let entry = entries.get(r.index)?;
+                    let clip = info.get(&entry.id)?;
+                    let kind = match clip.kind {
+                        ClipKind::Text => BS_KIND_CLIP_TEXT,
+                        ClipKind::Image => BS_KIND_CLIP_IMAGE,
+                    };
+                    Some(BsResult::clip(entry, r.score, kind, clip))
+                })
+                .collect::<Vec<_>>()
+        });
+        leak_results(items, false)
     }
 
     fn record_activation(&self, result_id: u64) {
         let now = unix_now();
+        // A reused clip goes back to the top of history and nowhere else. Recording it in
+        // frecency would persist a content hash as if it were an app, for no benefit.
+        if self.clips.as_ref().is_some_and(|c| c.touch(result_id, now)) {
+            return;
+        }
         let visit = self.with_frecency(|frecency| frecency.record(result_id, now));
 
         let Some(store) = self.store.clone() else {
@@ -493,6 +739,34 @@ impl Drop for RescanGuard {
 }
 
 impl BsResult {
+    /// A calculator row. No path, because there is nothing on disk to open, and a score
+    /// of `u32::MAX` so it can never be sorted under a text match.
+    fn calculated(text: &str) -> Self {
+        let (name, name_len) = leak_bytes(text.as_bytes());
+        let (path, path_len) = leak_bytes(&[]);
+        Self {
+            id: 0,
+            name,
+            name_len,
+            path,
+            path_len,
+            score: u32::MAX,
+            kind: BS_KIND_CALC,
+            timestamp: 0,
+            width: 0,
+            height: 0,
+        }
+    }
+
+    fn clip(entry: &AppEntry, score: u32, kind: u8, info: &crate::clips::ClipInfo) -> Self {
+        Self {
+            timestamp: info.created,
+            width: info.width,
+            height: info.height,
+            ..Self::new(entry, score, kind)
+        }
+    }
+
     fn new(entry: &AppEntry, score: u32, kind: u8) -> Self {
         let (name, name_len) = leak_bytes(entry.name.as_bytes());
         // A macOS path is bytes, not a `String`. Going through `as_bytes` rather than
@@ -506,6 +780,9 @@ impl BsResult {
             path_len,
             score,
             kind,
+            timestamp: 0,
+            width: 0,
+            height: 0,
         }
     }
 }
@@ -575,6 +852,19 @@ unsafe fn free_results(results: BsResults) {
 
 /// # Safety
 ///
+/// `ptr` must be NULL, or valid for reads of `len` bytes for the lifetime `'a`.
+unsafe fn slice_or_empty<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        // `from_raw_parts` is undefined for a NULL pointer even at length zero, so an
+        // empty buffer from Swift must never reach it.
+        return &[];
+    }
+    // SAFETY: non-NULL and, per the contract, valid for `len` bytes.
+    unsafe { std::slice::from_raw_parts(ptr, len) }
+}
+
+/// # Safety
+///
 /// `ptr` must be NULL or a valid NUL-terminated C string alive for this call.
 unsafe fn cstr_to_string(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
@@ -615,6 +905,8 @@ mod tests {
             last_scan: Mutex::new(None),
             frecency: Mutex::new(Frecency::new(14.0)),
             files: FileSearch::new(),
+            home: None,
+            clips: Clips::in_memory().ok(),
             store: None,
         }))
     }
@@ -742,6 +1034,143 @@ mod tests {
         unsafe { bs_shutdown(h) };
     }
 
+    fn add_text_clip(h: *mut BsHandle, text: &str) {
+        let clip = BsClip {
+            kind: BS_KIND_CLIP_TEXT,
+            content: text.as_ptr(),
+            content_len: text.len(),
+            thumbnail: std::ptr::null(),
+            thumbnail_len: 0,
+            text: std::ptr::null(),
+            text_len: 0,
+            width: 0,
+            height: 0,
+        };
+        // SAFETY: `h` is live, and `clip` plus the buffer it points at outlive the call.
+        unsafe { bs_clip_add(h, &clip) };
+    }
+
+    #[test]
+    fn a_clip_round_trips_from_add_to_query_to_content() {
+        let h = handle(&["Safari"]);
+        add_text_clip(h, "kubectl get pods -A");
+
+        let rows = query(h, ";kube", 8);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "kubectl get pods -A");
+        let id = rows[0].2;
+
+        // SAFETY: `h` is live; the blob is freed exactly once below.
+        let blob = unsafe { bs_clip_content(h, id, BS_CLIP_FULL) };
+        assert!(!blob.data.is_null());
+        // SAFETY: the blob came straight from `bs_clip_content`.
+        let bytes = unsafe { std::slice::from_raw_parts(blob.data, blob.len) };
+        assert_eq!(bytes, b"kubectl get pods -A");
+        // SAFETY: one free, of exactly what `bs_clip_content` returned.
+        unsafe { bs_free_blob(blob) };
+
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn a_bare_clip_prefix_lists_newest_first_and_never_apps() {
+        let h = handle(&["Safari", "Slack"]);
+        add_text_clip(h, "first copy");
+        add_text_clip(h, "second copy");
+        let names: Vec<String> = query(h, ";", 8).into_iter().map(|(n, _, _)| n).collect();
+        assert_eq!(
+            names,
+            ["second copy", "first copy"],
+            "apps must not leak in"
+        );
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn reusing_a_clip_bumps_it_and_records_no_frecency() {
+        let h = handle(&["Safari"]);
+        add_text_clip(h, "older");
+        add_text_clip(h, "newer");
+        let older = query(h, ";older", 8)[0].2;
+
+        // SAFETY: `h` is live.
+        unsafe { bs_activate(h, older) };
+        let names: Vec<String> = query(h, ";", 8).into_iter().map(|(n, _, _)| n).collect();
+        assert_eq!(names, ["older", "newer"], "reuse moves it to the top");
+
+        // SAFETY: `h` is live.
+        let recorded = unsafe { (*h).with_frecency(|f| f.score(older, unix_now())) };
+        assert_eq!(
+            recorded, 0.0,
+            "a content hash must never be recorded as an app"
+        );
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn clip_entry_points_survive_null_and_nonsense() {
+        let h = handle(&["Safari"]);
+        // SAFETY: NULL and unknown ids are all part of the contracts.
+        unsafe {
+            bs_clip_add(std::ptr::null_mut(), std::ptr::null());
+            bs_clip_add(h, std::ptr::null());
+            let blob = bs_clip_content(h, 0xDEAD_BEEF, BS_CLIP_FULL);
+            assert!(blob.data.is_null() && blob.len == 0);
+            bs_free_blob(blob);
+            let blob = bs_clip_content(std::ptr::null_mut(), 1, BS_CLIP_FULL);
+            bs_free_blob(blob);
+        }
+        // An unknown kind is refused rather than stored as something it is not.
+        let bogus = BsClip {
+            kind: 99,
+            content: b"x".as_ptr(),
+            content_len: 1,
+            thumbnail: std::ptr::null(),
+            thumbnail_len: 0,
+            text: std::ptr::null(),
+            text_len: 0,
+            width: 0,
+            height: 0,
+        };
+        // SAFETY: `h` is live and `bogus` outlives the call.
+        unsafe { bs_clip_add(h, &bogus) };
+        assert!(query(h, ";", 8).is_empty());
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn an_expression_answers_above_the_apps() {
+        let h = handle(&["Safari", "Slack"]);
+        let rows = query(h, "12 * 34", 8);
+        assert_eq!(rows[0].0, "408", "the answer takes the top row");
+        assert_eq!(rows[0].1, "", "a calculator row has no path to open");
+
+        // A plain name must never be hijacked by the calculator.
+        let rows = query(h, "s", 8);
+        assert!(rows.iter().all(|(name, _, _)| name != "408"));
+
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn an_answer_costs_one_row_not_the_whole_list() {
+        let h = handle(&["Safari", "Slack", "Stocks", "System Settings"]);
+        let rows = query(h, "2+2", 3);
+        assert_eq!(
+            rows.len(),
+            1,
+            "nothing else matches '2+2', so just the answer"
+        );
+        assert_eq!(rows[0].0, "4");
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
     #[test]
     fn a_query_without_the_prefix_never_starts_a_file_search() {
         // The whole promise of the explicit-prefix decision: no `mdfind` behind your back.
@@ -761,6 +1190,34 @@ mod tests {
     }
 
     #[test]
+    fn question_desktop_puts_the_folder_first_and_finds_what_spotlight_hides() {
+        let home = std::env::temp_dir().join(format!("blindspot-fq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for dir in ["Desktop", "Documents", "Downloads", "blindspot"] {
+            std::fs::create_dir_all(home.join(dir)).expect("mkdir");
+        }
+        let h = handle(&["Podman Desktop", "Safari"]);
+        // SAFETY: `h` is live and nothing else touches it during the test.
+        unsafe { (*h).home = Some(home.clone()) };
+
+        // The first call returns before `mdfind` finishes, so this is the direct listing
+        // plus the app index alone — deterministic, and the path that must answer instantly.
+        let names = |q: &str| -> Vec<String> { query(h, q, 8).into_iter().map(|r| r.0).collect() };
+        assert_eq!(names("?desktop")[..2], ["Desktop", "Podman Desktop"]);
+        assert_eq!(
+            names("?documents")[0],
+            "Documents",
+            "Spotlight never returns this one"
+        );
+        assert_eq!(names("?downloads")[0], "Downloads", "nor this one");
+        assert_eq!(names("?blindspot")[0], "blindspot");
+
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_bare_prefix_returns_nothing_rather_than_the_app_index() {
         let h = handle(&["Safari", "Slack", "Stocks"]);
         assert!(query(h, "?", 8).is_empty());
@@ -772,12 +1229,13 @@ mod tests {
     #[test]
     fn a_prefixed_query_still_ranks_apps() {
         let h = handle(&["Safari", "Slack"]);
-        // `?s` sits under the spawn floor, so this proves apps rank against the stripped
-        // query without the test depending on the filesystem or spawning anything.
+        // `?s` sits under the spawn floor and the handle has no home folder, so this sees
+        // the app index alone. Both prefix-match equally, and the shorter name wins the
+        // tie: it carries less unrelated text around the match.
         let names: Vec<String> = query(h, "?s", 8).into_iter().map(|(n, _, _)| n).collect();
         assert_eq!(
             names,
-            ["Safari", "Slack"],
+            ["Slack", "Safari"],
             "apps rank against the stripped query"
         );
         // SAFETY: one shutdown, no calls after it.
@@ -874,6 +1332,8 @@ mod tests {
             last_scan: Mutex::new(None),
             frecency: Mutex::new(Frecency::new(14.0)),
             files: FileSearch::new(),
+            home: None,
+            clips: Clips::in_memory().ok(),
             store: None,
         }));
 

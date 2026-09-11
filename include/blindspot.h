@@ -10,6 +10,11 @@
 #include <stdlib.h>
 
 /**
+ * A query beginning with this searches clipboard history instead of the app index.
+ */
+#define PREFIX ';'
+
+/**
  * A [`BsResult`] that is an application bundle.
  */
 #define BS_KIND_APP 0
@@ -20,11 +25,30 @@
 #define BS_KIND_FILE 1
 
 /**
- * A query beginning with this searches the filesystem instead of only the app index.
- *
- * Explicit rather than automatic, so no subprocess ever runs unless it was asked for.
+ * A [`BsResult`] that is a calculator answer. Its `path` is empty — there is nothing to
+ * open — and `name` is the formatted result, which Swift copies on Enter.
  */
-#define PREFIX '?'
+#define BS_KIND_CALC 2
+
+/**
+ * A [`BsResult`] that is a text clip from clipboard history.
+ */
+#define BS_KIND_CLIP_TEXT 3
+
+/**
+ * A [`BsResult`] that is an image clip from clipboard history.
+ */
+#define BS_KIND_CLIP_IMAGE 4
+
+/**
+ * `part` for [`bs_clip_content`]: the full text, or the full PNG.
+ */
+#define BS_CLIP_FULL 0
+
+/**
+ * `part` for [`bs_clip_content`]: the row thumbnail. Empty for text clips.
+ */
+#define BS_CLIP_THUMBNAIL 1
 
 /**
  * Opaque to C. Swift only ever holds a `BsHandle *`.
@@ -50,10 +74,20 @@ typedef struct {
   size_t path_len;
   uint32_t score;
   /**
-   * [`BS_KIND_APP`] or [`BS_KIND_FILE`]. Swift needs it to choose between launching
-   * an application and opening a document in whatever owns it.
+   * One of the `BS_KIND_*` constants. Swift needs it to decide what Enter does.
    */
   uint8_t kind;
+  /**
+   * Unix seconds a clip was last copied, so Swift can show "2 min ago" with its own
+   * localized formatter. Zero for anything that is not a clip.
+   */
+  uint64_t timestamp;
+  /**
+   * Pixel size of an image clip, zero otherwise. Swift compares it against the
+   * attached displays to call a full-screen capture a screenshot.
+   */
+  uint32_t width;
+  uint32_t height;
 } BsResult;
 
 /**
@@ -70,6 +104,43 @@ typedef struct {
    */
   bool pending;
 } BsResults;
+
+/**
+ * A clip handed from Swift to Rust. Every pointer only has to live for the call:
+ * [`bs_clip_add`] copies whatever it keeps before returning.
+ */
+typedef struct {
+  /**
+   * [`BS_KIND_CLIP_TEXT`] or [`BS_KIND_CLIP_IMAGE`].
+   */
+  uint8_t kind;
+  /**
+   * UTF-8 text, or PNG bytes.
+   */
+  const uint8_t *content;
+  size_t content_len;
+  /**
+   * A small PNG for the row. May be NULL for text.
+   */
+  const uint8_t *thumbnail;
+  size_t thumbnail_len;
+  /**
+   * For images, UTF-8 text recognised in the image, which becomes its name and makes it
+   * searchable. May be NULL. Ignored for text clips.
+   */
+  const uint8_t *text;
+  size_t text_len;
+  uint32_t width;
+  uint32_t height;
+} BsClip;
+
+/**
+ * Bytes owned by Rust. Must be passed to [`bs_free_blob`].
+ */
+typedef struct {
+  const uint8_t *data;
+  size_t len;
+} BsBlob;
 
 #ifdef __cplusplus
 extern "C" {
@@ -154,6 +225,40 @@ void bs_reindex(BsHandle *handle);
  * `handle` must be NULL or a live pointer from [`bs_init`] that has not been shut down.
  */
 size_t bs_max_results(const BsHandle *handle);
+
+/**
+ * Records a clip copied by the user.
+ *
+ * Swift has already refused anything carrying a privacy marker; this applies the size
+ * caps, dedups against history, evicts what no longer fits, and persists. Safe to call
+ * off the main thread — only brief in-memory sections are locked, never the disk write.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`]. `clip` must be NULL or point
+ * to a valid [`BsClip`] whose `content` and `thumbnail` are each NULL or valid for their
+ * stated lengths, for the duration of this call.
+ */
+void bs_clip_add(BsHandle *handle, const BsClip *clip);
+
+/**
+ * The full bytes of a clip, or its thumbnail. Empty if `id` is not a clip.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`]. The returned [`BsBlob`] must
+ * be passed to [`bs_free_blob`] exactly once.
+ */
+BsBlob bs_clip_content(BsHandle *handle, uint64_t id, uint8_t part);
+
+/**
+ * Releases a [`BsBlob`].
+ *
+ * # Safety
+ *
+ * `blob` must be exactly what [`bs_clip_content`] returned, freed at most once.
+ */
+void bs_free_blob(BsBlob blob);
 
 /**
  * Releases everything a [`bs_query`] result owns.
