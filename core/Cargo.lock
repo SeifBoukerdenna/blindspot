@@ -53,6 +53,7 @@ dependencies = [
  "plist",
  "redb",
  "serde",
+ "serde_json",
  "toml",
 ]
 

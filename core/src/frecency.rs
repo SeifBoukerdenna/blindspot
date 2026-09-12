@@ -50,6 +50,15 @@ impl Frecency {
         }
     }
 
+    /// Changes the decay curve without touching the history.
+    ///
+    /// Visits are stored raw and decayed at read time, so a new half-life is a one-field
+    /// recompute rather than a rebuild — which is what lets the settings window make this
+    /// one live.
+    pub fn set_half_life(&mut self, half_life_days: f64) {
+        self.half_life_secs = half_life_days * SECS_PER_DAY;
+    }
+
     /// Rehydrates from whatever the store held.
     pub fn load(half_life_days: f64, visits: impl IntoIterator<Item = (u64, Visit)>) -> Self {
         Self {

@@ -21,8 +21,9 @@ use crate::store::{StoreError, data_dir};
 /// A query beginning with this searches clipboard history instead of the app index.
 pub const PREFIX: char = ';';
 
-/// Most clips kept. Oldest go first.
-const MAX_CLIPS: usize = 200;
+/// Most clips kept by default. Oldest go first. Settable — see [`Clips::keep`] — unlike
+/// the byte caps below, which are a disk-safety invariant rather than a preference.
+pub const DEFAULT_KEEP: usize = 200;
 
 /// Most stored bytes across every clip, content and thumbnail together.
 ///
@@ -108,13 +109,26 @@ pub struct ClipInfo {
     bytes: u64,
 }
 
-#[derive(Default)]
 struct State {
     /// Most recent first. `Ranker` breaks ties by index, so this ordering is what makes
     /// a bare `;` return newest first and an equal fuzzy score favour the recent clip.
     entries: Vec<AppEntry>,
     info: HashMap<u64, ClipInfo>,
     total_bytes: u64,
+    /// How many to keep. Held here rather than beside the database so changing it takes
+    /// the same lock the eviction it drives does.
+    keep: usize,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            info: HashMap::new(),
+            total_bytes: 0,
+            keep: DEFAULT_KEEP,
+        }
+    }
 }
 
 impl State {
@@ -146,7 +160,7 @@ impl State {
     fn evict(&mut self) -> Vec<u64> {
         let mut gone = Vec::new();
         while self.entries.len() > 1
-            && (self.entries.len() > MAX_CLIPS || self.total_bytes > MAX_TOTAL_BYTES)
+            && (self.entries.len() > self.keep || self.total_bytes > MAX_TOTAL_BYTES)
         {
             let Some(entry) = self.entries.pop() else {
                 break;
@@ -271,6 +285,45 @@ impl Clips {
             eprintln!("blindspot: could not evict old clips: {e}");
         }
         Some(id)
+    }
+
+    /// Changes how many clips are kept, dropping the oldest at once if the cap fell.
+    ///
+    /// Live rather than at-open so the settings window can lower it and have history
+    /// actually shrink — a cap that only applied to the next copy would look broken.
+    pub fn keep(&self, count: usize) {
+        let evicted = {
+            let mut state = lock(&self.state);
+            state.keep = count.max(1);
+            state.evict()
+        };
+        if let Err(e) = self.delete(&evicted) {
+            eprintln!("blindspot: could not evict old clips: {e}");
+        }
+    }
+
+    /// How many clips are held and what they take on disk, for the settings window.
+    pub fn stats(&self) -> (usize, u64) {
+        let state = lock(&self.state);
+        (state.entries.len(), state.total_bytes)
+    }
+
+    /// Forgets everything, returning how many went. Its own file, so this cannot touch
+    /// launch history — see [`Clips::default_path`].
+    pub fn clear(&self) -> usize {
+        let ids: Vec<u64> = {
+            let mut state = lock(&self.state);
+            let ids = state.entries.iter().map(|e| e.id).collect();
+            *state = State {
+                keep: state.keep,
+                ..State::default()
+            };
+            ids
+        };
+        if let Err(e) = self.delete(&ids) {
+            eprintln!("blindspot: could not clear clipboard history: {e}");
+        }
+        ids.len()
     }
 
     /// Moves a clip to the top, as when it is pasted again. False if it is not a clip —
@@ -570,13 +623,46 @@ mod tests {
     }
 
     #[test]
+    fn lowering_the_cap_drops_the_oldest_at_once() {
+        let clips = fresh();
+        for n in 1..=10u64 {
+            clips.add(text(&format!("clip {n}")), n);
+        }
+        assert_eq!(clips.stats().0, 10);
+
+        clips.keep(4);
+        let kept = names(&clips);
+        assert_eq!(kept.len(), 4, "the cap applies now, not on the next copy");
+        assert_eq!(kept[0], "clip 10", "newest first");
+        assert_eq!(kept[3], "clip 7", "and the oldest went");
+
+        // Raising it again cannot bring back what was deleted, and must not evict either.
+        clips.keep(200);
+        assert_eq!(clips.stats().0, 4);
+    }
+
+    #[test]
+    fn clearing_forgets_everything_and_says_how_many() {
+        let clips = fresh();
+        for n in 1..=5u64 {
+            clips.add(text(&format!("clip {n}")), n);
+        }
+        assert_eq!(clips.clear(), 5);
+        assert!(names(&clips).is_empty());
+        assert_eq!(clips.stats(), (0, 0));
+        // And it still records afterwards.
+        clips.add(text("after"), 99);
+        assert_eq!(names(&clips), ["after"]);
+    }
+
+    #[test]
     fn the_count_cap_evicts_the_oldest_and_deletes_its_rows() {
         let clips = fresh();
         let first = clips.add(text("clip 0"), 0).expect("stored");
-        for n in 1..=MAX_CLIPS {
+        for n in 1..=DEFAULT_KEEP {
             clips.add(text(&format!("clip {n}")), n as u64);
         }
-        assert_eq!(names(&clips).len(), MAX_CLIPS);
+        assert_eq!(names(&clips).len(), DEFAULT_KEEP);
         assert!(
             !names(&clips).contains(&"clip 0".to_owned()),
             "oldest evicted"

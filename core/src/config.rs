@@ -29,10 +29,97 @@ pub struct Config {
     pub app_paths: Vec<String>,
     /// The global hotkey, e.g. `"cmd+shift+space"`. See [`crate::hotkey::parse`].
     pub hotkey: String,
+    /// A second hotkey that opens straight into the agent, as if `>` had been typed. Empty
+    /// means only the one hotkey.
+    pub agent_hotkey: String,
     /// Register blindspot as a login item. On by default: a launcher that is not running
     /// after a reboot is not a launcher.
     pub launch_at_login: bool,
     pub frecency: Frecency,
+    pub agent: Agent,
+    pub clips: Clips,
+}
+
+/// Clipboard history (M5).
+///
+/// Only what is a preference. The per-item and total byte ceilings in `clips.rs` stay
+/// constants: their comments describe a disk-safety invariant — eviction runs until both
+/// limits hold — and a 10 GB cap is a bug rather than a choice.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Clips {
+    /// Off stops the poller entirely, so nothing is recorded and nothing is kept.
+    pub enabled: bool,
+    /// How many clips to keep. The oldest go first.
+    pub keep: usize,
+    /// Whether to record images at all. Off means text only.
+    pub images: bool,
+    /// Whether to read the text in an image, on-device, so a screenshot is searchable by
+    /// what it says. Costs a Vision pass per image copied.
+    pub ocr: bool,
+}
+
+impl Default for Clips {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep: crate::clips::DEFAULT_KEEP,
+            images: true,
+            ocr: true,
+        }
+    }
+}
+
+/// The local agent (M6). Off with `enabled = false`, which stops blindspot from opening a
+/// socket at all.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Agent {
+    pub enabled: bool,
+    /// An Ollama model name. The default was chosen by measurement — see CLAUDE.md; the
+    /// smaller `qwen3.5:0.8b-mlx` is about three times faster and measurably sloppier.
+    pub model: String,
+    /// The model for questions, which want reasoning more than speed. Empty means "use
+    /// `model` for everything". Which one is asked is decided by whether the request names a
+    /// folder; the model itself still decides whether to answer or propose commands.
+    pub question_model: String,
+    /// Host and port, loopback only. A non-loopback host is refused at load: this feature is
+    /// local by design, not by configuration.
+    pub host: String,
+    /// How long Ollama keeps the model in memory. Long, because a cold load costs seconds.
+    pub keep_alive: String,
+    /// The cap on one command's run time.
+    pub timeout_secs: u64,
+    /// Directories commands may touch. Anything outside is refused.
+    pub roots: Vec<String>,
+}
+
+impl Default for Agent {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: "qwen3.5:4b-mlx".to_owned(),
+            question_model: "qwen3.8:27b-mlx".to_owned(),
+            host: "127.0.0.1:11434".to_owned(),
+            keep_alive: "30m".to_owned(),
+            timeout_secs: 120,
+            roots: vec!["~".to_owned()],
+        }
+    }
+}
+
+impl Agent {
+    /// The directories commands may touch, `~` expanded.
+    pub fn expanded_roots(&self) -> Vec<PathBuf> {
+        self.roots.iter().filter_map(|r| expand_tilde(r)).collect()
+    }
+
+    /// Whether the configured host is loopback. Checked rather than trusted: "no network" is
+    /// the promise, and a typo in config.toml must not quietly send your requests elsewhere.
+    pub fn is_loopback(&self) -> bool {
+        let host = self.host.rsplit_once(':').map_or(&*self.host, |(h, _)| h);
+        matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    }
 }
 
 /// Read at M1 so the config schema is stable, but not consulted until M3.
@@ -58,8 +145,11 @@ impl Default for Config {
             // ⌘⇧Space, not ⌘Space: see `hotkey::DEFAULT` for why the obvious default would
             // register cleanly and then never fire.
             hotkey: "cmd+shift+space".to_owned(),
+            agent_hotkey: String::new(),
             launch_at_login: true,
             frecency: Frecency::default(),
+            agent: Agent::default(),
+            clips: Clips::default(),
         }
     }
 }
@@ -94,6 +184,23 @@ impl Config {
             Ok(text) => toml::from_str(&text).map_err(ConfigError::Parse),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(ConfigError::Read(e)),
+        }
+    }
+
+    /// The agent hotkey, if one is configured and parses. An unparseable one is dropped with a
+    /// line on stderr rather than falling back: a second hotkey nobody asked for is worse than
+    /// none, and the first hotkey still opens the agent with `>`.
+    pub fn agent_hotkey(&self) -> Option<crate::hotkey::Hotkey> {
+        let spec = self.agent_hotkey.trim();
+        if spec.is_empty() {
+            return None;
+        }
+        match crate::hotkey::parse(spec) {
+            Ok(hotkey) => Some(hotkey),
+            Err(e) => {
+                eprintln!("blindspot: agent_hotkey {spec:?}: {e}; ignoring it");
+                None
+            }
         }
     }
 

@@ -162,6 +162,33 @@ pub fn parse(spec: &str) -> Result<Hotkey, HotkeyError> {
     })
 }
 
+/// The inverse of [`parse`], in the spelling config.toml uses.
+///
+/// Exists so the settings window's recorder never has to know the chord vocabulary: Swift
+/// turns an `NSEvent` into a Carbon code and mask — which is genuinely shell-side work,
+/// since the two modifier encodings share no bits — and this turns that back into the one
+/// canonical string. A second place that knew these names is a second place for the two to
+/// drift, which `every_chord_survives_a_round_trip` is what holds shut.
+///
+/// `None` for a key code that is not in [`KEYS`]: a key blindspot cannot name is one it
+/// could not write into config.toml either.
+pub fn format(hotkey: Hotkey) -> Option<String> {
+    let key = KEYS
+        .iter()
+        .find(|(_, code)| *code == hotkey.key_code)
+        .map(|(name, _)| *name)?;
+    // Cmd first, so the canonical spelling of the default reads the way CLAUDE.md writes
+    // it. The order is fixed rather than as-typed: two spellings of one chord would make
+    // "is this value the same as the file's" a string comparison that lies.
+    let mut parts: Vec<&str> = [(CMD, "cmd"), (CONTROL, "ctrl"), (OPTION, "opt"), (SHIFT, "shift")]
+        .iter()
+        .filter(|(mask, _)| hotkey.modifiers & mask != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    parts.push(key);
+    Some(parts.join("+"))
+}
+
 fn modifier(name: &str) -> Option<u32> {
     match name {
         "cmd" | "command" | "⌘" => Some(CMD),
@@ -175,6 +202,53 @@ fn modifier(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_chord_survives_a_round_trip() {
+        // The recorder's whole safety depends on this: Swift sends a code and a mask, the
+        // core spells it, and parsing that spelling must give back what was sent.
+        for &(_, key_code) in KEYS {
+            for bits in 0..16u32 {
+                let modifiers = [CMD, SHIFT, OPTION, CONTROL]
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, _)| bits & (1 << at) != 0)
+                    .map(|(_, mask)| mask)
+                    .sum::<u32>();
+                // A chord with no real modifier is not a hotkey, and `parse` says so.
+                if modifiers & (CMD | CONTROL | OPTION) == 0 {
+                    continue;
+                }
+                let hotkey = Hotkey {
+                    key_code,
+                    modifiers,
+                };
+                let spelled = format(hotkey).expect("every key in KEYS has a name");
+                assert_eq!(
+                    parse(&spelled),
+                    Ok(hotkey),
+                    "{spelled:?} did not parse back to what spelled it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_spells_the_way_the_docs_write_it() {
+        assert_eq!(format(DEFAULT).as_deref(), Some("cmd+shift+space"));
+    }
+
+    #[test]
+    fn a_key_with_no_name_cannot_be_spelled() {
+        // 0x7F is not in `KEYS`, so there is no config.toml value that would round-trip.
+        assert_eq!(
+            format(Hotkey {
+                key_code: 0x7F,
+                modifiers: CMD
+            }),
+            None
+        );
+    }
 
     #[test]
     fn the_default_parses_to_itself() {

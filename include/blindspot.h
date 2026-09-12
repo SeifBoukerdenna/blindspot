@@ -10,9 +10,18 @@
 #include <stdlib.h>
 
 /**
- * A query beginning with this searches clipboard history instead of the app index.
+ * A query beginning with this asks the local model instead of searching.
+ *
+ * Explicit, like the other modes: no keystroke ever reaches a model by accident, and the
+ * model is only contacted when Enter is pressed on the prompt row.
  */
-#define PREFIX ';'
+#define PREFIX '>'
+
+/**
+ * Most clips kept by default. Oldest go first. Settable — see [`Clips::keep`] — unlike
+ * the byte caps below, which are a disk-safety invariant rather than a preference.
+ */
+#define DEFAULT_KEEP 200
 
 /**
  * A [`BsResult`] that is an application bundle.
@@ -47,6 +56,55 @@
 #define BS_KIND_TOOL 5
 
 /**
+ * A [`BsResult`] that is the agent's "ask the model" row. Enter submits the request.
+ */
+#define BS_KIND_AGENT_PROMPT 7
+
+/**
+ * A [`BsResult`] that is a command the agent proposes. Enter runs the whole plan.
+ */
+#define BS_KIND_AGENT_STEP 8
+
+/**
+ * A [`BsResult`] that is a command blindspot refuses to run, or an error. `detail` says why.
+ */
+#define BS_KIND_AGENT_BLOCKED 9
+
+/**
+ * A [`BsResult`] that is a command that ran and succeeded; `detail` is its last output line.
+ */
+#define BS_KIND_AGENT_OK 10
+
+/**
+ * A [`BsResult`] that is a command that ran and failed.
+ */
+#define BS_KIND_AGENT_FAILED 11
+
+/**
+ * A [`BsResult`] that is prose: the model answered a question. `name` is the whole answer,
+ * which the shell wraps over as many lines as it needs. Enter copies it.
+ */
+#define BS_KIND_AGENT_ANSWER 12
+
+/**
+ * A [`BsResult`] that is the command running right now. Enter leaves it running — a server
+ * never exits, and waiting for it to is not a useful answer — and Esc stops it.
+ */
+#define BS_KIND_AGENT_RUNNING 14
+
+/**
+ * A [`BsResult`] that is a past request from the agent's history. Enter puts it back in the
+ * field, ready to ask again; `detail` says what became of it.
+ */
+#define BS_KIND_AGENT_PAST 15
+
+/**
+ * A [`BsResult`] that is one model in the picker. Enter on it makes it the model to ask, and
+ * `id` is its index for [`bs_agent_choose`].
+ */
+#define BS_KIND_AGENT_MODEL 13
+
+/**
  * A [`BsResult`] that is a section title on the welcome screen — "Suggested", "Recent
  * files". Not selectable; `name` is the title and everything else is empty.
  */
@@ -63,6 +121,56 @@
 #define BS_CLIP_THUMBNAIL 1
 
 /**
+ * A [`BsSetting`] holding `true` or `false`.
+ */
+#define BS_SETTING_FLAG 0
+
+/**
+ * A whole number, bounded by `min` and `max`.
+ */
+#define BS_SETTING_COUNT 1
+
+/**
+ * A real number, bounded by `min` and `max`.
+ */
+#define BS_SETTING_NUMBER 2
+
+/**
+ * Free text.
+ */
+#define BS_SETTING_TEXT 3
+
+/**
+ * A hotkey chord, validated by the same parser config.toml is read with.
+ */
+#define BS_SETTING_CHORD 4
+
+/**
+ * A list of folders, NUL-separated in `value`.
+ */
+#define BS_SETTING_PATHS 5
+
+/**
+ * A diagnostic. Never settable.
+ */
+#define BS_SETTING_READONLY 6
+
+/**
+ * Nothing set this; it is the built-in.
+ */
+#define BS_SOURCE_DEFAULT 0
+
+/**
+ * The user's hand-edited config.toml.
+ */
+#define BS_SOURCE_CONFIG 1
+
+/**
+ * The settings window.
+ */
+#define BS_SOURCE_OVERRIDE 2
+
+/**
  * Carbon modifier masks from `Events.h` — *not* `NSEvent.ModifierFlags`, which use different
  * bits entirely. Verified by compiling against the SDK: `cmdKey` = 256, `shiftKey` = 512.
  */
@@ -73,6 +181,13 @@
 #define OPTION 2048
 
 #define CONTROL 4096
+
+/**
+ * A path list crosses the FFI NUL-separated: a macOS path may contain any byte except
+ * `/` and NUL, so NUL is the only separator that cannot appear inside a member. The
+ * boundary already passes pointer + length rather than C strings for the same reason.
+ */
+#define LIST_SEPARATOR '\u{0}'
 
 /**
  * Spotlight's usage score at or above which an app counts as recently used: one use four
@@ -127,6 +242,16 @@ typedef struct {
    */
   const uint8_t *detail;
   size_t detail_len;
+  /**
+   * Which characters of `name` the query matched, as offsets into its `char`s —
+   * Unicode scalars, not bytes and not UTF-16 units. The shell sets them in the accent,
+   * which is the only thing colour does in a results list besides mark the selection.
+   *
+   * NULL for every row nothing was typed at: a calculated value, an agent row, a
+   * section title, and every row of a browse mode with an empty query.
+   */
+  const uint32_t *highlights;
+  size_t highlights_len;
 } BsResult;
 
 /**
@@ -182,7 +307,12 @@ typedef struct {
 } BsBlob;
 
 /**
- * Startup settings the shell needs from config.toml, read once at launch.
+ * What the shell needs from the config the moment it starts: the two hotkeys to register
+ * and whether to be a login item.
+ *
+ * Named for when it is read, not for what it holds — [`bs_settings_list`] is the settings
+ * surface, and two entry points called `bs_settings` with opposite lifetimes would be a
+ * trap. A plain value struct: nothing here to free.
  */
 typedef struct {
   /**
@@ -197,8 +327,93 @@ typedef struct {
    * False if config.toml's hotkey did not parse and the default is in use.
    */
   bool hotkey_from_config;
+  /**
+   * A second hotkey that opens straight into the agent. Zero when none is configured —
+   * key code 0 is `kVK_ANSI_A`, which is never a hotkey on its own.
+   */
+  uint32_t agent_hotkey_key_code;
+  uint32_t agent_hotkey_modifiers;
   bool launch_at_login;
-} BsSettings;
+  /**
+   * Whether to poll the pasteboard at all. Off means nothing is recorded.
+   */
+  bool clips_enabled;
+  /**
+   * Whether to record image clips. Off means text only.
+   */
+  bool clips_images;
+  /**
+   * Whether to read the text in an image. Only the shell can: Vision is AppKit-side.
+   */
+  bool clips_ocr;
+} BsStartup;
+
+/**
+ * One row of the settings window: what it is, what it holds, and where that came from.
+ *
+ * Read-only diagnostics ride this same struct rather than earning their own — a
+ * diagnostic is a setting with [`BS_SETTING_READONLY`] for a kind — so the shell has one
+ * row renderer and this module one free function.
+ */
+typedef struct {
+  /**
+   * The dotted key, e.g. `agent.model`. Stable, and what every setter takes.
+   */
+  const uint8_t *key;
+  size_t key_len;
+  /**
+   * The page this belongs on, as its name — "General", "Agent". A string rather than a
+   * tag because the shell draws it; a numbering both sides had to agree on would be a
+   * constant table for nothing.
+   */
+  const uint8_t *section;
+  size_t section_len;
+  const uint8_t *label;
+  size_t label_len;
+  /**
+   * One line, drawn under the control.
+   */
+  const uint8_t *help;
+  size_t help_len;
+  /**
+   * The value in force. Scalars are in their canonical text form — `true`, `8`,
+   * `cmd+shift+space`; a [`BS_SETTING_PATHS`] value is its members separated by NUL,
+   * which is the one byte a POSIX pathname cannot contain.
+   */
+  const uint8_t *value;
+  size_t value_len;
+  /**
+   * What this would be with the override removed — which is what resetting restores,
+   * and not necessarily the built-in default.
+   */
+  const uint8_t *fallback;
+  size_t fallback_len;
+  /**
+   * One of the `BS_SETTING_*` constants.
+   */
+  uint8_t kind;
+  /**
+   * One of the `BS_SOURCE_*` constants.
+   */
+  uint8_t source;
+  /**
+   * False means the change needs a restart, which the row says.
+   */
+  bool live;
+  /**
+   * What a stepper clamps to. Both zero for a kind that has no bounds.
+   */
+  double min;
+  double max;
+} BsSetting;
+
+/**
+ * A pointer and a length, as [`BsResults`] is. Must be passed to [`bs_free_settings`].
+ */
+typedef struct {
+  BsSetting *items;
+  size_t len;
+} BsSettingList;
 
 
 
@@ -242,6 +457,67 @@ BsHandle *bs_init(const char *config_path);
  * The returned [`BsResults`] must be passed to [`bs_free_results`] exactly once.
  */
 BsResults bs_query(BsHandle *handle, const char *query, size_t limit);
+
+/**
+ * Asks the local model what to do about `request`, on a background thread.
+ *
+ * Returns immediately. The answer arrives through [`bs_query`] on the same `>` request, whose
+ * `pending` flag stays true until the model is done.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`]. `request` must be NULL or a valid
+ * NUL-terminated C string alive for the call.
+ */
+void bs_agent_submit(BsHandle *handle, const char *request);
+
+/**
+ * Runs the commands the agent proposed, in order, on a background thread.
+ *
+ * Does nothing unless a plan is waiting and every command in it passed the refusal rules.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`].
+ */
+void bs_agent_run(BsHandle *handle);
+
+/**
+ * Stops whatever the agent is doing: a generation mid-stream, or a running command.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`].
+ */
+void bs_agent_cancel(BsHandle *handle);
+
+/**
+ * Offers the models Ollama has installed, as rows the shell shows in place of the results.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`].
+ */
+void bs_agent_models(BsHandle *handle);
+
+/**
+ * Picks the model at row `index` from the list [`bs_agent_models`] produced. Index 0 is
+ * "Automatic", which restores the configured defaults. Remembered across restarts.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`].
+ */
+void bs_agent_choose(BsHandle *handle, size_t index);
+
+/**
+ * Stops waiting on the command in flight and leaves it running.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`].
+ */
+void bs_agent_detach(BsHandle *handle);
 
 /**
  * Records that the user launched `result_id`.
@@ -315,6 +591,48 @@ void bs_clip_add(BsHandle *handle, const BsClip *clip);
 BsBlob bs_clip_content(BsHandle *handle, uint64_t id, uint8_t part);
 
 /**
+ * Forgets every clip, returning how many went.
+ *
+ * Its own entry point rather than a settings row: "clear history now" has no value, no
+ * default and nowhere for a provenance to come from. Clipboard history is its own file,
+ * so this cannot touch launch history.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`] that has not been shut down.
+ */
+uint32_t bs_clips_clear(BsHandle *handle);
+
+/**
+ * Asks, on a thread, whether the agent's host answers.
+ *
+ * Returns immediately; the answer shows up in the next [`bs_settings_list`], exactly as
+ * the model picker's list does. Deliberately not a synchronous getter: with Ollama
+ * stopped, opening the settings window would then hang for a connect timeout.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`] that has not been shut down.
+ */
+void bs_diagnostics_refresh(BsHandle *handle);
+
+/**
+ * Spells a Carbon key code and modifier mask the way config.toml writes it.
+ *
+ * The settings window's recorder turns an `NSEvent` into a code and a mask — genuinely
+ * shell-side work, since Carbon and AppKit modifier bits share no positions — and this
+ * turns that back into the one canonical string. The chord vocabulary therefore lives in
+ * exactly one place, and `hotkey::format`'s round-trip test is what keeps it honest.
+ *
+ * An empty blob means the key has no name blindspot could write into a config file.
+ *
+ * # Safety
+ *
+ * The returned [`BsBlob`] must be passed to [`bs_free_blob`] exactly once.
+ */
+BsBlob bs_hotkey_format(uint32_t key_code, uint32_t modifiers);
+
+/**
  * Releases a [`BsBlob`].
  *
  * # Safety
@@ -324,14 +642,62 @@ BsBlob bs_clip_content(BsHandle *handle, uint64_t id, uint8_t part);
 void bs_free_blob(BsBlob blob);
 
 /**
- * Settings read from config.toml at init. Plain values — nothing to free.
+ * The two hotkeys and the login-item flag, read from the config in force.
  *
  * # Safety
  *
  * `handle` must be NULL or a live pointer from [`bs_init`] that has not been shut down.
  * A NULL handle yields the defaults.
  */
-BsSettings bs_settings(const BsHandle *handle);
+BsStartup bs_startup(const BsHandle *handle);
+
+/**
+ * Every settable knob and every diagnostic, in the order the window draws them.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`] that has not been shut down.
+ * The returned [`BsSettingList`] must be passed to [`bs_free_settings`] exactly once.
+ */
+BsSettingList bs_settings_list(const BsHandle *handle);
+
+/**
+ * Releases everything a [`bs_settings_list`] result owns.
+ *
+ * # Safety
+ *
+ * `list` must be exactly what [`bs_settings_list`] returned, not modified since, and
+ * freed at most once.
+ */
+void bs_free_settings(BsSettingList list);
+
+/**
+ * Records `key` as set to `value` and applies it.
+ *
+ * Returns the reason it was refused, or an empty blob on success — so the window can say
+ * *why* a chord or a host was rejected, which a boolean could not. The value is written
+ * to the overrides file; **config.toml is never touched**.
+ *
+ * `value` is pointer + length rather than a C string because a [`BS_SETTING_PATHS`] value
+ * separates its members with NUL.
+ *
+ * # Safety
+ *
+ * `handle` must be NULL or a live pointer from [`bs_init`]. `key` must be NULL or a valid
+ * NUL-terminated C string alive for the call, and `value` NULL or valid for `value_len`
+ * bytes. The returned [`BsBlob`] must be passed to [`bs_free_blob`] exactly once.
+ */
+BsBlob bs_setting_set(BsHandle *handle, const char *key, const uint8_t *value, size_t value_len);
+
+/**
+ * Forgets whatever the window set for `key`, so it falls back to config.toml and then to
+ * the built-in default. Returns a refusal the same way [`bs_setting_set`] does.
+ *
+ * # Safety
+ *
+ * As [`bs_setting_set`].
+ */
+BsBlob bs_setting_reset(BsHandle *handle, const char *key);
 
 /**
  * Releases everything a [`bs_query`] result owns.

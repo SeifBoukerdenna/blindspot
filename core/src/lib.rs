@@ -3,10 +3,12 @@
 //! The C ABI lives in [`ffi`]; everything else is a normal Rust API so it can be
 //! unit-tested and benchmarked through the `rlib` target.
 
+pub mod agent;
 pub mod calc;
 pub mod civil;
 pub mod clips;
 pub mod config;
+pub mod exec;
 pub mod ffi;
 pub mod files;
 pub mod frecency;
@@ -17,6 +19,7 @@ pub mod index;
 pub mod matching;
 pub mod recent;
 pub mod relevance;
+pub mod settings;
 pub mod store;
 pub mod tools;
 pub mod usage;

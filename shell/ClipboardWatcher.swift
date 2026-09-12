@@ -31,6 +31,11 @@ final class ClipboardWatcher {
     /// The `changeCount` of blindspot's own most recent write, so it is not re-ingested.
     private var ownWrite: Int?
     private var task: Task<Void, Never>?
+    /// Whether to record images at all, and whether to read the text in one. Both are
+    /// settings, and both are read here rather than in Rust because the pasteboard and
+    /// Vision are AppKit's.
+    var recordsImages = true
+    var readsImageText = true
 
     init(sink: ClipSink, pasteboard: NSPasteboard = .general) {
         self.sink = sink
@@ -89,11 +94,15 @@ final class ClipboardWatcher {
         let sink = self.sink
         // Image data wins when both are present: copying an image in a browser also puts
         // its URL on the pasteboard as text, and the image is what the user meant.
-        if let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
+        let image = recordsImages
+            ? pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff)
+            : nil
+        if let data = image {
             // Encoding a 5K screenshot takes long enough that doing it here would stall the
             // hotkey, so it happens off the main actor, and so does the write to Rust.
+            let reading = readsImageText
             Task.detached(priority: .utility) {
-                guard let clip = ImageClip.encode(data) else { return }
+                guard let clip = ImageClip.encode(data, readingText: reading) else { return }
                 sink.add(
                     image: true, content: clip.png, thumbnail: clip.thumbnail,
                     text: Data(clip.text.utf8), width: clip.width, height: clip.height)
@@ -121,7 +130,9 @@ enum ImageClip {
     /// 96pt at 2x. Stored per clip so a result row never decodes a full screenshot.
     static let thumbnailPixels = 192
 
-    static func encode(_ data: Data) -> Encoded? {
+    /// `readingText` off skips the Vision pass — about 99ms on a full-screen capture —
+    /// and the clip is then named by its size rather than by what it says.
+    static func encode(_ data: Data, readingText: Bool = true) -> Encoded? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
             let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else { return nil }
@@ -140,7 +151,8 @@ enum ImageClip {
             .flatMap(pngData) ?? Data()
 
         return Encoded(
-            png: png, thumbnail: thumbnail, text: recognizeText(image),
+            png: png, thumbnail: thumbnail,
+            text: readingText ? recognizeText(image) : "",
             width: image.width, height: image.height)
     }
 

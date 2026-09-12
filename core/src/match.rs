@@ -108,6 +108,36 @@ impl Ranker {
         candidates.truncate(limit);
         candidates.clone()
     }
+
+    /// Which characters of `name` the query matched, as offsets into its `char`s.
+    ///
+    /// Deliberately not folded into [`Ranker::rank_with`]: `Pattern::indices` re-runs the
+    /// match keeping the position matrix it normally throws away, which costs more than
+    /// scoring does. Only the rows that are actually shown need it — fifty at most,
+    /// against every entry in the index.
+    ///
+    /// Offsets are `char` positions, not byte offsets: that is what nucleo works in, and
+    /// converting here would mean converting back on the other side of the FFI.
+    pub fn highlights(&mut self, query: &str, name: &str) -> Vec<u32> {
+        if query.trim().is_empty() {
+            return Vec::new();
+        }
+        self.pattern.reparse(query, CASE, NORMALIZE);
+        let Self {
+            matcher,
+            pattern,
+            buf,
+            ..
+        } = self;
+        let mut found = Vec::new();
+        pattern.indices(Utf32Str::new(name, buf), matcher, &mut found);
+        // nucleo appends each atom's indices without sorting or deduplicating them —
+        // documented, and deliberate, so a caller can tell which atom matched what.
+        // Highlighting does not care, and has to undo it.
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +210,29 @@ mod tests {
         let got = Ranker::new().rank("", &apps, 2);
         assert_eq!(ranked_names(&apps, &got), ["Calendar", "Mail"]);
         assert_eq!(Ranker::new().rank("   ", &apps, 2).len(), 2);
+    }
+
+    #[test]
+    fn highlights_are_the_characters_the_query_matched() {
+        let mut ranker = Ranker::new();
+        assert_eq!(ranker.highlights("sla", "Slack"), [0, 1, 2]);
+        // A subsequence, not a prefix: "actmon" lands on both words.
+        assert_eq!(
+            ranker.highlights("actmon", "Activity Monitor"),
+            [0, 1, 2, 9, 10, 11]
+        );
+        // Nothing typed, and nothing matched, both yield nothing to draw.
+        assert!(ranker.highlights("", "Slack").is_empty());
+        assert!(ranker.highlights("   ", "Slack").is_empty());
+        assert!(ranker.highlights("zzz", "Slack").is_empty());
+    }
+
+    #[test]
+    fn highlights_are_char_offsets_not_byte_offsets() {
+        // Four bytes before "Code", one char. A byte offset would point into the middle
+        // of the emoji and the shell would draw the accent in the wrong place.
+        let mut ranker = Ranker::new();
+        assert_eq!(ranker.highlights("c", "\u{1f600}Code"), [1]);
     }
 
     #[test]

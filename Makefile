@@ -99,7 +99,7 @@ bench:
 bench-shell: $(CORE_LIB) $(HEADER)
 	@mkdir -p $(BUILD)
 	swiftc $(SWIFTFLAGS) -o $(BUILD)/latency-bench \
-	    $(BENCH_SRC) shell/Bridge.swift shell/ResultsView.swift
+	    $(BENCH_SRC) shell/Bridge.swift shell/ResultsView.swift shell/Theme.swift
 	@$(BUILD)/latency-bench
 
 clean:

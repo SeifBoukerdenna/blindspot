@@ -14,6 +14,33 @@ enum MatchKind {
     case clipImage
     /// A welcome-screen section title. Never selected, never acted on.
     case header
+    /// The agent's "ask the local model" row. Enter submits the request.
+    case agentPrompt
+    /// A command the agent proposes. Enter runs the plan it belongs to.
+    case agentStep
+    /// A command blindspot refuses to run, or an error from the agent.
+    case agentBlocked
+    /// A command that ran and succeeded, or failed.
+    case agentOk
+    case agentFailed
+    /// Prose: the model answered a question. Wraps over as many lines as it needs.
+    case agentAnswer
+    /// One model in the picker.
+    case agentModel
+    /// The command running right now: Enter leaves it running, Esc stops it.
+    case agentRunning
+    /// A past request from the agent's history.
+    case agentPast
+
+    /// Rows that came out of the agent, which Enter treats differently from a search result.
+    var isAgent: Bool {
+        switch self {
+        case .agentPrompt, .agentStep, .agentBlocked, .agentOk, .agentFailed, .agentAnswer,
+            .agentModel, .agentRunning, .agentPast:
+            true
+        default: false
+        }
+    }
 
     var isClip: Bool { self == .clipText || self == .clipImage }
 }
@@ -33,6 +60,9 @@ struct Match: Identifiable, Equatable {
     let height: Int
     /// A tool row's form — "binary", "ISO 8601". Empty for everything else.
     let detail: String
+    /// Which characters of `name` the query matched, as Unicode scalar offsets. Empty
+    /// for every row nothing was typed at.
+    let highlights: [Int]
 
     /// The containing folder, shown as the row's second line.
     ///
@@ -48,7 +78,13 @@ struct Match: Identifiable, Equatable {
             // An epoch's local time is rendered by `ResultRow`, which owns the formatter.
             return detail
         case .header:
-            return ""
+            // Empty for the welcome screen's sections; the agent's say where it will run.
+            return detail
+        case .agentPrompt, .agentStep, .agentBlocked, .agentOk, .agentFailed, .agentAnswer,
+            .agentModel, .agentRunning, .agentPast:
+            // The core writes these: the reason, the model's why, the last line of output, or
+            // a model's size.
+            return detail
         case .clipText, .clipImage:
             // Relative time, which `ResultRow` renders because the formatter is main-actor
             // state and this is a plain value type.
@@ -57,6 +93,72 @@ struct Match: Identifiable, Equatable {
             let parent = (path as NSString).deletingLastPathComponent
             return (parent as NSString).abbreviatingWithTildeInPath
         }
+    }
+}
+
+/// One row of the settings window, as the core describes it.
+///
+/// Everything the window needs to draw and validate a knob comes from here — including
+/// where the value came from and whether changing it needs a restart — so the shell holds
+/// no schema of its own.
+struct Setting: Identifiable, Equatable {
+    enum Kind {
+        case flag, count, number, text, chord, paths, readonly
+
+        init(_ raw: UInt8) {
+            switch raw {
+            case UInt8(BS_SETTING_COUNT): self = .count
+            case UInt8(BS_SETTING_NUMBER): self = .number
+            case UInt8(BS_SETTING_TEXT): self = .text
+            case UInt8(BS_SETTING_CHORD): self = .chord
+            case UInt8(BS_SETTING_PATHS): self = .paths
+            case UInt8(BS_SETTING_READONLY): self = .readonly
+            default: self = .flag
+            }
+        }
+    }
+
+    /// Which of the three places the value in force came from. The row says so, because
+    /// "is this mine or the file's" is the question a layered config raises.
+    enum Source {
+        case builtIn, configFile, window
+
+        init(_ raw: UInt8) {
+            switch raw {
+            case UInt8(BS_SOURCE_CONFIG): self = .configFile
+            case UInt8(BS_SOURCE_OVERRIDE): self = .window
+            default: self = .builtIn
+            }
+        }
+    }
+
+    let key: String
+    let section: String
+    let label: String
+    let help: String
+    /// Scalars in their canonical text form. A `.paths` value is NUL-separated — see
+    /// `items` — because NUL is the one byte a pathname cannot contain.
+    let value: String
+    /// What this would be with the window's value removed, which is what resetting
+    /// restores and is not always the built-in default.
+    let fallback: String
+    let kind: Kind
+    let source: Source
+    /// False means the change needs a restart, which the row says.
+    let live: Bool
+    let min: Double
+    let max: Double
+
+    var id: String { key }
+
+    /// A `.paths` value as its members.
+    var items: [String] {
+        value.isEmpty ? [] : value.components(separatedBy: "\0")
+    }
+
+    /// The inverse, for handing an edited list back to the core.
+    static func joined(_ items: [String]) -> String {
+        items.joined(separator: "\0")
     }
 }
 
@@ -119,9 +221,115 @@ final class Core {
         bs_activate(handle, id)
     }
 
-    /// Hotkey and login-item settings from config.toml.
-    var settings: BsSettings {
-        bs_settings(handle)
+    /// Asks the local model about `request`. Returns at once: the answer arrives through the
+    /// next `query`, whose `pending` stays true until the model has finished.
+    func agentSubmit(_ request: String) {
+        request.withCString { bs_agent_submit(handle, $0) }
+    }
+
+    /// Runs the commands the agent proposed. Does nothing unless a plan is waiting and every
+    /// command in it passed the core's refusal rules.
+    func agentRun() {
+        bs_agent_run(handle)
+    }
+
+    /// Offers the models Ollama has installed, as rows in place of the results.
+    func agentModels() {
+        bs_agent_models(handle)
+    }
+
+    /// Picks the model at `index` from that list; 0 is "Automatic". Remembered across restarts.
+    func agentChoose(_ index: Int) {
+        bs_agent_choose(handle, index)
+    }
+
+    /// Stops a generation, or kills a running command.
+    func agentCancel() {
+        bs_agent_cancel(handle)
+    }
+
+    /// Stops waiting on the command in flight and leaves it running — for a server, which
+    /// would otherwise be killed when the step times out.
+    func agentDetach() {
+        bs_agent_detach(handle)
+    }
+
+    /// The two hotkeys and the login-item flag, read at launch.
+    var startup: BsStartup {
+        bs_startup(handle)
+    }
+
+    /// Forgets every clip, returning how many went. Clipboard history is its own file, so
+    /// this cannot touch launch history.
+    @discardableResult
+    func clearClips() -> Int {
+        Int(bs_clips_clear(handle))
+    }
+
+    /// Asks, on a thread inside Rust, whether the agent's host answers. The answer shows
+    /// up in the next `settings()`.
+    func refreshDiagnostics() {
+        bs_diagnostics_refresh(handle)
+    }
+
+    /// Spells a Carbon chord the way config.toml writes it, or nil for a key that has no
+    /// name. The recorder sends the result straight back through `set`, so the window never
+    /// has to know the vocabulary.
+    func formatHotkey(keyCode: UInt32, modifiers: UInt32) -> String? {
+        Self.message(bs_hotkey_format(keyCode, modifiers))
+    }
+
+    /// Every settable knob and every diagnostic, in the order the window draws them.
+    ///
+    /// Not on the keystroke path — this is called when the settings window opens — so it
+    /// copies each row out rather than borrowing Rust's memory for the view's lifetime.
+    func settings() -> [Setting] {
+        let list = bs_settings_list(handle)
+        // `defer` so the Rust allocation is released on every path.
+        defer { bs_free_settings(list) }
+        guard let items = list.items, list.len > 0 else { return [] }
+        return UnsafeBufferPointer(start: items, count: list.len).map { row in
+            Setting(
+                key: Self.string(row.key, row.key_len),
+                section: Self.string(row.section, row.section_len),
+                label: Self.string(row.label, row.label_len),
+                help: Self.string(row.help, row.help_len),
+                value: Self.string(row.value, row.value_len),
+                fallback: Self.string(row.fallback, row.fallback_len),
+                kind: Setting.Kind(row.kind),
+                source: Setting.Source(row.source),
+                live: row.live,
+                min: row.min,
+                max: row.max
+            )
+        }
+    }
+
+    /// Sets `key`, returning why it was refused — or nil if it took.
+    ///
+    /// A string rather than a boolean because the window has to be able to say *which*
+    /// part of a chord or a host it did not like, and every one of those parsers lives in
+    /// Rust so the window cannot drift from what config.toml is read with.
+    func set(_ key: String, to value: String) -> String? {
+        let bytes = Array(value.utf8)
+        return key.withCString { name in
+            bytes.withUnsafeBufferPointer { buffer in
+                // An empty value has a nil base address, which the core reads as empty.
+                Self.message(bs_setting_set(handle, name, buffer.baseAddress, buffer.count))
+            }
+        }
+    }
+
+    /// Forgets what the window set for `key`, back to config.toml and then the built-in.
+    func reset(_ key: String) -> String? {
+        key.withCString { Self.message(bs_setting_reset(handle, $0)) }
+    }
+
+    /// A refusal from the core, or nil for "it worked".
+    private static func message(_ blob: BsBlob) -> String? {
+        defer { bs_free_blob(blob) }
+        guard let data = blob.data, blob.len > 0 else { return nil }
+        return String(decoding: UnsafeBufferPointer(start: data, count: blob.len), as: UTF8.self)
     }
 
     /// Returns immediately; the walk happens on a thread inside Rust.
@@ -159,7 +367,8 @@ final class Core {
                 timestamp: result.timestamp,
                 width: Int(result.width),
                 height: Int(result.height),
-                detail: string(result.detail, result.detail_len)
+                detail: string(result.detail, result.detail_len),
+                highlights: offsets(result.highlights, result.highlights_len)
             )
         }
     }
@@ -173,10 +382,27 @@ final class Core {
         case UInt8(BS_KIND_CALC): return .calc
         case UInt8(BS_KIND_TOOL): return .tool
         case UInt8(BS_KIND_HEADER): return .header
+        case UInt8(BS_KIND_AGENT_PROMPT): return .agentPrompt
+        case UInt8(BS_KIND_AGENT_STEP): return .agentStep
+        case UInt8(BS_KIND_AGENT_BLOCKED): return .agentBlocked
+        case UInt8(BS_KIND_AGENT_OK): return .agentOk
+        case UInt8(BS_KIND_AGENT_FAILED): return .agentFailed
+        case UInt8(BS_KIND_AGENT_ANSWER): return .agentAnswer
+        case UInt8(BS_KIND_AGENT_MODEL): return .agentModel
+        case UInt8(BS_KIND_AGENT_RUNNING): return .agentRunning
+        case UInt8(BS_KIND_AGENT_PAST): return .agentPast
         case UInt8(BS_KIND_CLIP_TEXT): return .clipText
         case UInt8(BS_KIND_CLIP_IMAGE): return .clipImage
         default: return .app
         }
+    }
+
+    /// Scalar offsets, as the core counts them. Left as offsets rather than converted to
+    /// UTF-16 here: only the handful of rows actually on screen are ever drawn, and this
+    /// runs for all fifty on every keystroke.
+    private static func offsets(_ values: UnsafePointer<UInt32>?, _ count: Int) -> [Int] {
+        guard let values, count > 0 else { return [] }
+        return UnsafeBufferPointer(start: values, count: count).map(Int.init)
     }
 
     private static func string(_ bytes: UnsafePointer<UInt8>?, _ count: Int) -> String {

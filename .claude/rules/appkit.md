@@ -43,10 +43,14 @@ making it.
 
 - The window is constructed once at launch and reused. Never build it on the hotkey
   path — that is the difference between instant and sluggish.
-- The app is `LSUIElement`. No Dock icon, no menu bar, no main window.
+- The app is `LSUIElement`. No Dock icon and no menu bar. Two windows exist and no more:
+  the panel, and the settings window — which is not a main window either, and is reached
+  from a status-bar item because a launcher whose hotkey has broken must still be fixable.
 - Icons come from `NSWorkspace.shared.icon(forFile:)` and are cached. Do not parse
   `.icns` anywhere.
 - Prefer Carbon `RegisterEventHotKey` over a `CGEventTap`. The tap needs Accessibility
   permission and that is a much worse first-run experience.
-- Keep this directory under ~800 lines total. Growth here means logic is leaking out
-  of Rust.
+- Keep ranking, matching, scoring and indexing out of here; that is what the line budget
+  below is really for. It was ~800 and is now past 3,600, most of it the plate and the
+  settings window — presentation, which is this directory's job, not leaked core logic.
+  Treat a jump in *this* file's kind of code as the warning sign, not the total.

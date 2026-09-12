@@ -1,6 +1,113 @@
 import AppKit
 import Carbon.HIToolbox
 
+/// The mode tabs, flush left along the top of the plate.
+///
+/// In the panel it is a picture of the query's prefix and nothing else: the prefix in the
+/// field is the state, and clicking a tab types it. The settings window reuses it for its
+/// sections, which is the whole reason the two read as one application. Not an `NSSegmentedControl`, which brings a
+/// bezel, the system accent and a selection style — three of the things this design
+/// exists to take out.
+@MainActor
+final class TabBar: NSView {
+    private let titles: [String]
+    private let tabs: [NSTextField]
+    private let status = NSTextField(labelWithString: "")
+    /// Positioned by hand in `layout()`: it has to sit under whichever tab is current,
+    /// and constraints that move between four anchors are more machinery than a frame.
+    private let underline = PlateView(fill: Theme.accent)
+    /// Readable from outside so the settings window can re-select the page it was on
+    /// after a reload.
+    private(set) var selected = 0
+
+    var onSelect: ((Int) -> Void)?
+
+    init(titles: [String]) {
+        self.titles = titles
+        self.tabs = titles.map { _ in NSTextField(labelWithString: "") }
+        super.init(frame: .zero)
+
+        wantsLayer = true
+        layer?.backgroundColor = Theme.ground.cgColor
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let row = NSStackView(views: tabs)
+        row.spacing = 24
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        status.alignment = .right
+        status.lineBreakMode = .byTruncatingHead
+        status.translatesAutoresizingMaskIntoConstraints = false
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let edge = PlateView(fill: Theme.hairline)
+        underline.translatesAutoresizingMaskIntoConstraints = true
+
+        for view in [row, status, edge, underline] as [NSView] { addSubview(view) }
+
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Theme.gutter),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+            status.leadingAnchor.constraint(
+                greaterThanOrEqualTo: row.trailingAnchor, constant: 16),
+            status.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Theme.gutter),
+            status.centerYAnchor.constraint(equalTo: centerYAnchor),
+            edge.leadingAnchor.constraint(equalTo: leadingAnchor),
+            edge.trailingAnchor.constraint(equalTo: trailingAnchor),
+            edge.bottomAnchor.constraint(equalTo: bottomAnchor),
+            edge.heightAnchor.constraint(equalToConstant: 1),
+            heightAnchor.constraint(equalToConstant: Theme.tabBarHeight),
+        ])
+        select(0)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
+
+    func select(_ index: Int) {
+        selected = index
+        for (at, tab) in tabs.enumerated() {
+            tab.attributedStringValue = Theme.label(
+                titles[at], size: 10, tracking: 0.15,
+                color: at == index ? Theme.ink : Theme.faint,
+                weight: at == index ? .semibold : .regular)
+        }
+        // The underline is placed from the selected label's frame, so the labels have to
+        // have one. On a bar built moments ago they do not, and the underline lands at
+        // zero — which is exactly what a rebuilt settings window showed.
+        layoutSubtreeIfNeeded()
+        needsLayout = true
+    }
+
+    /// What this mode can say about itself, at the right of the bar. Empty is a
+    /// perfectly good answer and most modes give it.
+    func show(status text: String) {
+        status.attributedStringValue = Theme.label(
+            text, size: 9.5, tracking: 0.14, color: Theme.faint)
+    }
+
+    override func layout() {
+        super.layout()
+        guard tabs.indices.contains(selected) else { return }
+        let tab = tabs[selected].frame
+        // y = 0 is the bottom in an unflipped view, which is where this belongs — over
+        // the hairline, which was added first and so draws under it.
+        underline.frame = NSRect(x: tab.minX, y: 0, width: tab.width, height: 2)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        // Generous horizontally: the labels are ten points of type in a thirty-point
+        // band, and hitting one exactly is not a thing anyone should have to do.
+        guard
+            let index = tabs.firstIndex(where: {
+                point.x >= $0.frame.minX - 8 && point.x <= $0.frame.maxX + 8
+            })
+        else { return }
+        onSelect?(index)
+    }
+}
+
 /// The launcher window.
 ///
 /// Built once in `applicationDidFinishLaunching` and reused for the life of the
@@ -8,33 +115,58 @@ import Carbon.HIToolbox
 /// sluggish, and it is also what makes the first-responder handling below necessary.
 @MainActor
 final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
-    private static let width: CGFloat = 640
-
     /// Results fetched per query. `max_results` rows show at once; the rest scroll. Fifty
     /// because nobody scrolls further through a launcher, and the table only renders what
     /// is visible, so fetching more than fits costs nothing on the keystroke path.
     private static let resultLimit = 50
-    private static let fieldHeight: CGFloat = 62
 
-    /// Tahoe roughly doubled the system window corner radius; the old 12 read as a
-    /// pre-Tahoe panel sitting next to modern ones. Apple publishes no exact value and
-    /// `NSViewCornerConfiguration.containerConcentric` — the API that would answer this
-    /// properly — is macOS 27+, so this stays a hardcoded number for now.
-    private static let cornerRadius: CGFloat = 20
+    /// Everything above the results: the mode tabs, the query, and the rule under it.
+    /// The panel grows and shrinks below this; this height never changes.
+    private static let chromeHeight =
+        Theme.tabBarHeight + Theme.fieldHeight + Theme.ruleHeight
+
+    /// The query, and the mode's character in front of it. Mono for the prefix because
+    /// `?` and `>` are things you type at a shell, and a point smaller because mono
+    /// capitals set larger than the grotesk beside them at the same size.
+    private static let queryFont = Theme.text(24, .medium)
+    private static let prefixFont = Theme.mono(21, .medium)
+
+    /// How the panel arrives and leaves. Short: a launcher that takes a quarter of a second to
+    /// appear is a launcher you stop trusting.
+    private static let openDuration: CFTimeInterval = 0.12
+    private static let closeDuration: CFTimeInterval = 0.09
+    /// It grows into place from slightly small. Scale rather than a slide, so it reads as the
+    /// panel coming forward rather than sliding in from somewhere it does not live.
+    private static let openScale: CGFloat = 0.97
+
+    /// The drawing is dead square. Six points instead, so the plate does not fight the
+    /// rounded corner of every other window on a Tahoe screen — the one place this
+    /// departs from the canvas, and deliberately.
+    private static let cornerRadius: CGFloat = 6
 
     private let core: Core
     private let watcher: ClipboardWatcher
     private let field = NSTextField()
+    /// The prompt, drawn after the mode's character rather than by `placeholderString`:
+    /// a placeholder only shows on an empty field, and in three of the four modes the
+    /// field always holds at least its prefix.
+    private let ghost = NSTextField(labelWithString: "")
     private let results: ResultsView
 
     /// The browse modes, each nothing more than the prefix that selects it — so typing `?`
-    /// and pressing ⌘2 are the same act, and the chips keep no state of their own.
-    private static let modes: [(prefix: String, symbol: String, name: String)] = [
-        ("", "square.grid.2x2", "Apps"),
-        ("?", "doc", "Files"),
-        (";", "clipboard", "Clipboard"),
+    /// and pressing ⌘2 are the same act, and the tabs keep no state of their own.
+    private static let modes: [(prefix: String, tab: String, prompt: String)] = [
+        ("", "APPS", "Search"),
+        ("?", "FILES", "Find a file"),
+        (";", "CLIPS", "Search what you copied"),
+        (">", "AGENT", "Ask, or say what to do and where"),
     ]
-    private var chips: [NSButton] = []
+    private let tabBar = TabBar(titles: modes.map(\.tab))
+
+    /// How far the prompt sits from the field's left edge: past the mode's character,
+    /// where the caret is.
+    private lazy var ghostOffset = ghost.leadingAnchor.constraint(
+        equalTo: field.leadingAnchor, constant: 0)
 
     /// Captured on show so dismissal can hand focus back. Getting this wrong is the
     /// single most annoying possible regression in daily use.
@@ -55,7 +187,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         self.results = ResultsView(visibleRows: core.maxResults)
 
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.fieldHeight),
+            contentRect: NSRect(x: 0, y: 0, width: Theme.panelWidth, height: Self.chromeHeight),
             // `.nonactivatingPanel` so showing the panel does not deactivate whatever
             // the user was working in. `.borderless` because there is no title bar —
             // which is exactly why `canBecomeKey` has to be overridden below.
@@ -98,6 +230,14 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // panel like a desktop icon instead.
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
 
+        // Pinned to the palette rather than to the system. Every system-drawn part of the
+        // panel — the field editor's selection, the overlay scroller, a symbol image —
+        // resolves against the window's appearance, so a dark plate under a light-mode
+        // window gets a light selection band and a black scroller. Pinned rather than
+        // followed: the palette is one fixed set of values, and half of it tracking the
+        // system would be worse than none of it.
+        appearance = NSAppearance(named: Theme.isDark ? .darkAqua : .aqua)
+
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
@@ -118,12 +258,16 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     override var canBecomeMain: Bool { false }
 
     private func buildContentView() {
-        let container = NSView()
+        // The plate. Opaque and layer-backed rather than `NSGlassEffectView`: this design
+        // is a printed surface, and a material that samples the desktop behind it would
+        // put a different colour under every hairline. Autoresizing left on, because a
+        // window sizes its content view with `frame`, not with constraints.
+        let container = PlateView(
+            fill: Theme.surface, radius: Self.cornerRadius, border: Theme.border)
+        container.translatesAutoresizingMaskIntoConstraints = true
 
-        field.placeholderString = "Search"
-        // Regular, not light. Large light-weight system text is a Big Sur-era look and
-        // reads as dated next to current system search fields.
-        field.font = .systemFont(ofSize: 26, weight: .regular)
+        field.font = Self.queryFont
+        field.textColor = Theme.ink
         field.isBezeled = false
         field.isBordered = false
         field.drawsBackground = false
@@ -135,72 +279,100 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         field.delegate = self
         field.translatesAutoresizingMaskIntoConstraints = false
 
-        chips = Self.modes.enumerated().map { index, mode in
-            let chip = NSButton(
-                image: NSImage(systemSymbolName: mode.symbol, accessibilityDescription: mode.name)
-                    ?? NSImage(),
-                target: self, action: #selector(chipClicked(_:)))
-            chip.tag = index
-            chip.bezelStyle = .glass
-            chip.borderShape = .circle
-            chip.toolTip = "\(mode.name)  ⌘\(index + 1)"
-            // Clicking a chip must leave the caret in the field, or typing would stop.
-            chip.refusesFirstResponder = true
-            return chip
-        }
-        let chipBar = NSStackView(views: chips)
-        chipBar.spacing = 6
-        chipBar.translatesAutoresizingMaskIntoConstraints = false
+        ghost.font = Self.queryFont
+        ghost.textColor = Theme.faint
+        ghost.lineBreakMode = .byTruncatingTail
+        ghost.translatesAutoresizingMaskIntoConstraints = false
 
-        container.addSubview(field)
-        container.addSubview(chipBar)
-        container.addSubview(results)
+        tabBar.onSelect = { [weak self] index in self?.switchMode(to: index) }
+
+        // The one heavy line in the design, and the only thing separating the query from
+        // its results. Reversing M5's note that a divider here is "the strongest 'not a
+        // Mac app' tell" — which it was, next to Liquid Glass. This panel is not trying
+        // to look like a system search surface any more, and the rule is what makes the
+        // masthead and the list read as two parts of one plate.
+        let rule = PlateView(fill: Theme.rule)
+
+        for view in [tabBar, field, ghost, rule, results] as [NSView] {
+            container.addSubview(view)
+        }
 
         NSLayoutConstraint.activate([
-            field.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
-            field.trailingAnchor.constraint(equalTo: chipBar.leadingAnchor, constant: -12),
-            chipBar.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -16),
-            chipBar.centerYAnchor.constraint(equalTo: field.centerYAnchor),
+            tabBar.topAnchor.constraint(equalTo: container.topAnchor),
+            tabBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            tabBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+
+            field.leadingAnchor.constraint(
+                equalTo: container.leadingAnchor, constant: Theme.gutter),
+            field.trailingAnchor.constraint(
+                equalTo: container.trailingAnchor, constant: -Theme.gutter),
             // The field takes its intrinsic text height and is centred in a
             // fixed-height band, rather than being stretched to fill it. An
             // `NSTextField` draws its text at the top of an oversized frame, so
             // constraining the height directly left the query hugging the ceiling with
             // a band of dead space under it.
             field.centerYAnchor.constraint(
-                equalTo: container.topAnchor, constant: Self.fieldHeight / 2),
+                equalTo: container.topAnchor,
+                constant: Theme.tabBarHeight + Theme.fieldHeight / 2),
 
-            // No separator between field and results. A ruled line is the single
-            // strongest "not a Mac app" tell here — system search surfaces (Spotlight,
-            // Safari's Smart Search, Finder) separate the query from its results with
-            // spacing and material continuity, never a divider.
-            results.topAnchor.constraint(
-                equalTo: container.topAnchor, constant: Self.fieldHeight),
-            results.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 8),
-            results.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+            ghostOffset,
+            ghost.centerYAnchor.constraint(equalTo: field.centerYAnchor),
+            ghost.trailingAnchor.constraint(lessThanOrEqualTo: field.trailingAnchor),
+
+            rule.topAnchor.constraint(
+                equalTo: container.topAnchor,
+                constant: Theme.tabBarHeight + Theme.fieldHeight),
+            rule.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            rule.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            rule.heightAnchor.constraint(equalToConstant: Theme.ruleHeight),
+
+            // Full bleed. A row carries its own twenty points of padding, which puts its
+            // icon under the caret, and the hairline between two rows runs to both edges
+            // of the plate rather than stopping short of them.
+            results.topAnchor.constraint(equalTo: rule.bottomAnchor),
+            results.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            results.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             resultsHeight,
         ])
 
-        // Liquid Glass, the macOS 26 native panel material. Replaces an
-        // `NSVisualEffectView` with `.hudWindow`, which was semantically wrong — that
-        // material is for heads-up overlays like the volume indicator, not a search
-        // surface.
-        let glass = NSGlassEffectView()
-        glass.cornerRadius = Self.cornerRadius
-        glass.style = .regular
-        glass.contentView = container
+        contentView = container
+    }
 
-        // `cornerRadius` above rounds the glass material but not the window's alpha, so
-        // the system shadow — and the one-pixel rim macOS draws with it — still traced
-        // the rectangular frame, leaving a square outline showing past every rounded
-        // corner. Contrary to what this code first assumed, `NSGlassEffectView` does not
-        // clip the shadow. A/B'd on window captures: `invalidateShadow()` changed
-        // nothing; a rounded, masking layer is what makes the rim follow the curve.
-        glass.wantsLayer = true
-        glass.layer?.cornerRadius = Self.cornerRadius
-        glass.layer?.cornerCurve = .continuous
-        glass.layer?.masksToBounds = true
+    /// Colours the mode's character in the field, and keeps the caret on the accent.
+    ///
+    /// Attributes only — the string is never touched — so this cannot re-enter
+    /// `controlTextDidChange`. Reapplied on every change because typing resets the field
+    /// editor's attributes to the field's own, and the field's own are for the query.
+    private func styleQuery() {
+        guard let editor = field.currentEditor() as? NSTextView else { return }
+        editor.insertionPointColor = Theme.accent
+        guard let storage = editor.textStorage else { return }
+        let length = (field.stringValue as NSString).length
+        storage.beginEditing()
+        storage.addAttributes(
+            [.font: Self.queryFont, .foregroundColor: Theme.ink],
+            range: NSRange(location: 0, length: length))
+        if length > 0, !Self.modes[Self.mode(of: field.stringValue)].prefix.isEmpty {
+            storage.addAttributes(
+                [.font: Self.prefixFont, .foregroundColor: Theme.accent],
+                range: NSRange(location: 0, length: 1))
+        }
+        storage.endEditing()
+    }
 
-        contentView = glass
+    /// Places and fills the prompt: shown only while nothing has been typed past the
+    /// mode's character, and offset by exactly as much room as that character takes.
+    private func layoutPrompt(mode: Int, text: String) {
+        let prefix = Self.modes[mode].prefix
+        ghost.isHidden = text.count > prefix.count
+        guard !ghost.isHidden else { return }
+        ghost.stringValue = Self.modes[mode].prompt
+        // Three points clear of the caret even with no prefix, so the caret blinks beside
+        // the prompt rather than through its first letter.
+        ghostOffset.constant =
+            prefix.isEmpty
+            ? 3
+            : (prefix as NSString).size(withAttributes: [.font: Self.prefixFont]).width + 10
     }
 
     // MARK: - Showing and dismissing
@@ -211,6 +383,23 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         } else {
             show()
         }
+    }
+
+    /// The second hotkey: straight into the agent, as if `>` had been typed.
+    ///
+    /// Pressed while the agent is already showing, it closes — the same key does the same
+    /// thing twice. Pressed while blindspot is showing something else, it switches mode
+    /// rather than closing, which is what the keystroke asked for.
+    func toggleAgent() {
+        let alreadyThere = isVisible && Self.mode(of: field.stringValue) == 3
+        if alreadyThere {
+            dismiss(restoringFocus: true)
+            return
+        }
+        if !isVisible {
+            show()
+        }
+        switchMode(to: 3)
     }
 
     func show() {
@@ -231,6 +420,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // show path. Clearing before `makeFirstResponder` still clears the live field
         // editor: checked by typing, dismissing and re-showing.
         field.stringValue = ""
+        entranceDue = true
         refresh()
 
         // Order first, focus second, and set first responder on every single show.
@@ -239,6 +429,34 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // later invocation would come up with a dead field.
         makeKeyAndOrderFront(nil)
         makeFirstResponder(field)
+        animateIn()
+    }
+
+    /// Fades and scales the panel in. The window is already on screen when this runs, so the
+    /// first frame is drawn at full size and then scaled — which is why the starting alpha is
+    /// set before `makeKeyAndOrderFront` would otherwise show it.
+    private func animateIn() {
+        guard let layer = contentView?.layer else { return }
+        alphaValue = 0
+        layer.transform = Self.scaled(layer, by: Self.openScale)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.openDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            animator().alphaValue = 1
+            layer.transform = CATransform3DIdentity
+        }
+    }
+
+    /// Scales a layer about its own centre.
+    ///
+    /// Around the centre by translating rather than by moving `anchorPoint`: changing the
+    /// anchor point *moves* a layer, and the panel's content stayed displaced by half its size
+    /// after the animation had finished.
+    private static func scaled(_ layer: CALayer, by scale: CGFloat) -> CATransform3D {
+        let bounds = layer.bounds
+        var transform = CATransform3DMakeTranslation(bounds.midX, bounds.midY, 0)
+        transform = CATransform3DScale(transform, scale, scale, 1)
+        return CATransform3DTranslate(transform, -bounds.midX, -bounds.midY, 0)
     }
 
     /// Guards against re-entry: `orderOut` makes the panel resign key, which calls
@@ -262,7 +480,13 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         isDismissing = true
         defer { isDismissing = false }
 
-        orderOut(nil)
+        // Faded out when you dismissed it, instant when you launched something: there the app
+        // you asked for is already coming forward, and a panel lingering over it reads as lag.
+        if restoringFocus, isVisible {
+            fadeOut()
+        } else {
+            orderOut(nil)
+        }
 
         // Order out before handing activation back. A nonactivating panel's key status
         // is independent of app activation, so a panel still ordered in can sit on top
@@ -282,10 +506,75 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         }
     }
 
+    /// Hides the panel after a short fade. `orderOut` happens at the end, so the window is
+    /// really gone rather than merely transparent — `windowDidResignKey` and the show path
+    /// both depend on `isVisible` meaning what it says.
+    private func fadeOut() {
+        let contentLayer = contentView?.layer
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = Self.closeDuration
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            animator().alphaValue = 0
+            if let contentLayer {
+                contentLayer.transform = Self.scaled(contentLayer, by: Self.openScale)
+            }
+        } completionHandler: { [weak self] in
+            // The completion runs on the main queue but carries no isolation of its own.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.orderOut(nil)
+                self.alphaValue = 1
+                self.contentView?.layer?.transform = CATransform3DIdentity
+            }
+        }
+    }
+
+    /// Takes up a setting the panel holds a copy of rather than asking the core per query.
+    ///
+    /// Only `max_results`: everything else the panel draws is read from the core on the
+    /// keystroke that needs it, so a swapped config is already in force.
+    func applySettings() {
+        results.show(atMost: core.maxResults)
+        guard isVisible else { return }
+        refresh()
+        layoutForResults()
+    }
+
+    /// Gets out of the way so another window can take key.
+    ///
+    /// Deliberately not restoring focus: the user asked for the settings window, and
+    /// reactivating whatever they came from would drag it back over the thing they just
+    /// opened. The panel would dismiss itself from `windowDidResignKey` anyway — doing it
+    /// first means the two are not racing over who is key.
+    func standDown() {
+        guard isVisible else { return }
+        dismiss(restoringFocus: false)
+    }
+
     /// Esc. Reached through the responder chain from the field editor, which is why the
     /// window is the right place to catch it regardless of what holds focus.
     override func cancelOperation(_ sender: Any?) {
+        // Esc stops the agent first and dismisses second: a model mid-answer or a command
+        // mid-run is the thing you want stopped, and the panel is where you see that it was.
+        if agentWorking {
+            core.agentCancel()
+            refresh()
+            return
+        }
         dismiss(restoringFocus: true)
+    }
+
+    /// True while the agent is generating or running, which is what makes Esc mean "stop".
+    private var agentWorking = false
+
+    /// Set when the next refresh is one whose rows should animate in — a show, or a mode
+    /// change — rather than the steady replacement typing does.
+    private var entranceDue = false
+
+    /// The typed request with the agent's prefix taken off, matching what the core does.
+    private static func request(in text: String) -> String {
+        guard text.hasPrefix(">") else { return text }
+        return String(text.dropFirst().drop { $0 == " " })
     }
 
     // MARK: - Query
@@ -300,16 +589,22 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     private func refresh(poll: Bool = false) {
         let text = field.stringValue
         let mode = Self.mode(of: text)
-        for (index, chip) in chips.enumerated() {
-            chip.tintProminence = index == mode ? .primary : .none
-        }
+        tabBar.select(mode)
+        layoutPrompt(mode: mode, text: text)
+        styleQuery()
 
         // An empty field is the welcome screen — suggested apps and recent files — which
         // reverses M2's "nothing until you type". That was right while the only thing an
         // empty query could return was the alphabetical head of the index.
         let (matches, pending) = core.query(text, limit: Self.resultLimit)
+        tabBar.show(status: Self.status(for: mode, in: matches))
+        agentWorking = pending && text.hasPrefix(">")
         if !(poll && matches == results.matches) {
-            results.update(matches)
+            // Rows animate in where rows actually arrive: the panel opening, a change of mode,
+            // and the agent's steps landing one at a time. Typing just replaces the list.
+            let entering = entranceDue || (poll && text.hasPrefix(">"))
+            entranceDue = false
+            results.update(matches, entering: entering)
             layoutForResults()
         }
 
@@ -340,6 +635,10 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
 
     private func perform(_ action: Action) {
         guard let match = results.selectedMatch else { return }
+        if match.kind.isAgent {
+            performAgent(action, on: match)
+            return
+        }
         let hasPath = match.kind == .app || match.kind == .file
 
         switch action {
@@ -371,6 +670,45 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         }
     }
 
+    /// The agent's rows, where ↩ means "go on" rather than "open something": send the
+    /// request, run what came back, or copy a finished command's output. The panel stays up
+    /// throughout — the answer and then the run both land in it.
+    private func performAgent(_ action: Action, on match: Match) {
+        switch (action, match.kind) {
+        case (.open, .agentPrompt):
+            // Without the mode prefix: the core keys the session to the request it was asked,
+            // and it strips `>` before it ever sees one.
+            core.agentSubmit(Self.request(in: field.stringValue))
+            refresh()
+        case (.open, .agentStep):
+            core.agentRun()
+            refresh()
+        case (.open, .agentOk), (.open, .agentFailed):
+            // The output, because that is what you came back for; ⌘↩ still copies the command.
+            watcher.writeOwn { $0.setString(match.subtitle, forType: .string) }
+        case (.open, .agentAnswer):
+            watcher.writeOwn { $0.setString(match.name, forType: .string) }
+        case (.open, .agentRunning):
+            // Leave it running: a server never exits, and waiting for it to is not an answer.
+            core.agentDetach()
+            refresh()
+        case (.open, .agentPast):
+            // Back into the field, ready to send again — never re-run behind your back.
+            field.stringValue = ">\(match.name)"
+            field.currentEditor()?.selectedRange = NSRange(
+                location: (field.stringValue as NSString).length, length: 0)
+            refresh()
+        case (.open, .agentModel):
+            // The row's id is its place in the list the core handed over.
+            core.agentChoose(Int(match.id))
+            refresh()
+        case (.copyPath, _), (.reveal, _):
+            watcher.writeOwn { $0.setString(match.name, forType: .string) }
+        default:
+            NSSound.beep()
+        }
+    }
+
     /// ⌘↩ and ⌘1–3, none of which reach `doCommandBy` in a usable form — see `Action`.
     /// Matched by key code, so the mode keys sit on the number row whatever the layout.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -383,6 +721,28 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         case kVK_ANSI_1: switchMode(to: 0)
         case kVK_ANSI_2: switchMode(to: 1)
         case kVK_ANSI_3: switchMode(to: 2)
+        case kVK_ANSI_4: switchMode(to: 3)
+        case kVK_ANSI_Comma:
+            // Handled here rather than left to fall through to the main menu.
+            //
+            // The menu route does work — measured, `NSApp.sendEvent` reaches the delegate
+            // both with the panel up and without. But it only works while blindspot is
+            // getting key events at all, and a `.nonactivatingPanel` means blindspot is
+            // never the frontmost application: with the panel shut, ⌘, belongs to whatever
+            // app actually is. Claiming it explicitly while the panel is key at least makes
+            // the one case that *can* work not depend on menu validation finding a target.
+            //
+            // `sendAction(to: nil)` walks the responder chain to the app delegate, which is
+            // the only thing that knows about the settings window.
+            NSApp.sendAction(Selector(("openSettings")), to: nil, from: self)
+        case kVK_ANSI_M:
+            // The model picker, in place of the results. Only in agent mode: everywhere else
+            // there is no model to pick.
+            guard Self.mode(of: field.stringValue) == 3 else {
+                return super.performKeyEquivalent(with: event)
+            }
+            core.agentModels()
+            refresh()
         default: return super.performKeyEquivalent(with: event)
         }
         return true
@@ -394,21 +754,31 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         modes.indices.dropFirst().first { text.hasPrefix(modes[$0].prefix) } ?? 0
     }
 
+    /// The right of the tab bar: whatever a mode can say about itself from what the core
+    /// has already handed over. Nothing here is worth a second FFI call per keystroke, so
+    /// most modes say nothing, which is a perfectly good answer.
+    private static func status(for mode: Int, in matches: [Match]) -> String {
+        if mode == 3 { return "MODEL ⌘M" }
+        // A converted value names its own form — "BYTES", "ISO 8601" — and that is the
+        // one label that says what a screenful of figures is.
+        if let computed = matches.first(where: { $0.kind == .tool }), !computed.detail.isEmpty {
+            return computed.detail.uppercased()
+        }
+        return ""
+    }
+
     /// Swaps the query's prefix and keeps what was typed after it, so switching mode
     /// re-asks the same question of a different source.
     private func switchMode(to index: Int) {
         let text = field.stringValue
         let typed = text.dropFirst(Self.modes[Self.mode(of: text)].prefix.count)
             .drop { $0 == " " }
+        entranceDue = true
         field.stringValue = Self.modes[index].prefix + typed
         // Programmatic edits bypass `controlTextDidChange`, and leave the caret where it was.
         field.currentEditor()?.selectedRange = NSRange(
             location: (field.stringValue as NSString).length, length: 0)
         refresh()
-    }
-
-    @objc private func chipClicked(_ sender: NSButton) {
-        switchMode(to: sender.tag)
     }
 
     private func launchSelected() {
@@ -471,8 +841,9 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             // asynchronous and the panel should not sit there while Launch Services works.
             dismiss(restoringFocus: false)
 
-        case .header:
-            // Unreachable: `selectedMatch` never returns a header.
+        case .header, .agentPrompt, .agentStep, .agentBlocked, .agentOk, .agentFailed,
+            .agentAnswer, .agentModel, .agentRunning, .agentPast:
+            // Headers are never selected, and agent rows are handled by `performAgent`.
             break
         }
     }
@@ -503,8 +874,9 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             // Belt and braces alongside the window's `cancelOperation` override. Esc
             // should reach the window through the responder chain, but AppKit has a
             // long-standing habit of routing Esc in a text field into `complete:`
-            // first (rdar://8967168), which would swallow it.
-            dismiss(restoringFocus: true)
+            // first (rdar://8967168), which would swallow it. Routed through the override
+            // rather than dismissing here, so Esc still stops the agent first.
+            cancelOperation(nil)
             return true
         default:
             return false
@@ -527,14 +899,15 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // A little above centre: the eye lands high on the screen, and the results list
         // then grows downward into empty space.
         topEdge = visible.maxY - visible.height * 0.22
-        leftEdge = visible.midX - Self.width / 2
+        leftEdge = visible.midX - Theme.panelWidth / 2
     }
 
     /// Grows and shrinks downward, keeping the top edge where `placeOnActiveScreen` put it.
     private func layoutForResults() {
         resultsHeight.constant = results.fittingHeight
-        let height = Self.fieldHeight + results.fittingHeight
-        let target = NSRect(x: leftEdge, y: topEdge - height, width: Self.width, height: height)
+        let height = Self.chromeHeight + results.fittingHeight
+        let target = NSRect(
+            x: leftEdge, y: topEdge - height, width: Theme.panelWidth, height: height)
         // Measured: across a realistic typing burst the height changes on only 4 of 12
         // keystrokes, while `setFrame(display:)` costs ~0.7ms median and 2.7ms at p99.
         guard target != frame else { return }

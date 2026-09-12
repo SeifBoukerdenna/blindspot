@@ -11,6 +11,13 @@ import AppKit
 enum MainMenu {
     static func make() -> NSMenu {
         let appMenu = NSMenu()
+        // No target, like the Edit items: the action walks the responder chain and the app
+        // delegate answers it. That is also what makes ⌘, work while the panel is up —
+        // `Panel.performKeyEquivalent` does not know the comma and hands it to `super`,
+        // which walks this menu.
+        appMenu.addItem(
+            withTitle: "Settings…", action: Selector(("openSettings")), keyEquivalent: ",")
+        appMenu.addItem(.separator())
         appMenu.addItem(
             withTitle: "Hide blindspot", action: #selector(NSApplication.hide(_:)),
             keyEquivalent: "h")
