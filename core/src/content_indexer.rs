@@ -996,7 +996,7 @@ mod tests {
         std::fs::write(&input, b"fixture").expect("input");
         std::fs::write(
             &helper,
-            "#!/bin/sh\nprintf '%s' '{\"status\":\"text\",\"text\":\"'\n/usr/bin/head -c 65536 /dev/zero | /usr/bin/tr '\\000' a\nprintf '%s\\n' '\"}'\n(sleep 2) &\n",
+            "#!/bin/sh\nprintf '%s' '{\"status\":\"text\",\"text\":\"'\n/usr/bin/head -c 65536 /dev/zero | /usr/bin/tr '\\000' a\nprintf '%s\\n' '\"}'\n(sleep 10) &\n",
         )
         .expect("helper");
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))
@@ -1013,7 +1013,9 @@ mod tests {
         .expect("capture")
         .expect("status");
         assert_eq!(result.0, Extraction::Extracted);
-        assert!(started.elapsed() < Duration::from_millis(500));
+        // Far below the grandchild's 10 s sleep, which is what would hold stdout open, yet far
+        // above process start-up on a loaded CI runner. 500 ms against a 2 s sleep failed there.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

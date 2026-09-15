@@ -46,7 +46,7 @@ SWIFTFLAGS := -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
               -framework Quartz -framework EventKit \
               -L $(CORE_DIR)/target/release -lblindspot_core
 
-.PHONY: all core header app sign package install version run clean test test-actions test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
+.PHONY: all core header app sign package install version media run clean test test-actions test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
 
 all: sign
 
@@ -138,6 +138,23 @@ install: sign
 
 version:
 	@echo $(VERSION)
+
+# README screenshots and GIFs (scripts/capture-media.sh). The harness and helpers live in a plain
+# directory, not an .app, so LaunchServices never registers a second Blindspot. The helpers sit
+# where the core looks for them, beside the executable's parent, so demo PDFs and Word files index.
+MEDIA_ROOT := $(BUILD)/media/Capture
+
+media: $(CORE_LIB) $(HEADER)
+	@mkdir -p $(MEDIA_ROOT)/MacOS $(MEDIA_ROOT)/Helpers
+	swiftc $(SWIFTFLAGS) -o $(MEDIA_ROOT)/MacOS/media-capture bench/MediaCapture.swift \
+	    $(filter-out shell/AppDelegate.swift,$(SWIFT_SRC))
+	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) -parse-as-library \
+	    -framework PDFKit -o $(MEDIA_ROOT)/Helpers/blindspot-extract helpers/ExtractWorker.swift
+	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) -parse-as-library \
+	    -framework NaturalLanguage -o $(MEDIA_ROOT)/Helpers/blindspot-semantic helpers/SemanticWorker.swift
+	MACOSX_DEPLOYMENT_TARGET=$(DEPLOY) cargo build --release --locked --manifest-path $(VECTOR_DIR)/Cargo.toml
+	cp $(VECTOR_DIR)/target/release/blindspot-vector-worker $(MEDIA_ROOT)/Helpers/blindspot-vectors
+	scripts/capture-media.sh $(MEDIA_ROOT)/MacOS/media-capture
 
 run: sign
 	@pkill -x blindspot 2>/dev/null || true

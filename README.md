@@ -41,6 +41,43 @@ file, and **⌘,** opens Settings.
 The full guide with real examples ships inside the download as **START-HERE.md**. You can also read
 it here: [docs/new-features.md](docs/new-features.md).
 
+## Media
+
+See Blindspot in action: app search, document search, conversions and clipboard history,
+all from the keyboard. These captures use fictional demo documents and clipboard entries.
+
+![Blindspot switching between app search, document search, byte conversions and clipboard history](media/launcher.gif)
+
+### Screenshots
+
+Click a screenshot to view it at full size. For still images without animation, open the
+[media gallery](media/README.md#screenshots).
+
+| Search inside documents | Clipboard history |
+|---|---|
+| [![Document search with matching excerpts and related results](media/search-inside-documents.png)](media/search-inside-documents.png) | [![Searchable clipboard history with demo text entries](media/clipboard-history.png)](media/clipboard-history.png) |
+| **Index dashboard** | **Calculator and conversions** |
+| [![Index dashboard showing status, document counts, folders and storage](media/index-dashboard.png)](media/index-dashboard.png) | [![Converting 1500 MB into GiB, GB and bytes](media/calculator.png)](media/calculator.png) |
+| **Command catalog** | **System commands** |
+| [![Discoverable command catalog opened with a colon](media/commands.png)](media/commands.png) | [![System commands including lock, sleep and operations that ask for confirmation](media/system-commands.png)](media/system-commands.png) |
+| **Saved snippets** | **Ask your documents** |
+| [![Named text snippets ready to paste](media/snippets.png)](media/snippets.png) | [![Local answer to a question about the demo documents, citing its sources](media/ask-your-documents.png)](media/ask-your-documents.png) |
+
+The document question is answered by a local model from the demo documents, with the numbered
+sources it drew on. Dashboard counts describe the small demo fixture.
+
+<details>
+<summary>Watch the document-question workflow</summary>
+
+Type a question with `>docs`, press Return, and a local model answers from your documents,
+citing the files it used.
+
+![Asking the demo documents when the Northwind renewal is due and getting a cited answer](media/ask-your-documents.gif)
+
+</details>
+
+[Full media gallery, original assets and capture instructions →](media/README.md)
+
 ## Permissions it may ask for
 
 Blindspot works without any of these and only asks when you use the feature that needs one.
