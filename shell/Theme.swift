@@ -61,7 +61,7 @@ enum Theme {
     static let selectionBar: CGFloat = 3
     /// Names the form of a computed row — "RAW", "BINARY". Fixed, so the figures beside
     /// it line up as a column you can read down.
-    static let railWidth: CGFloat = 64
+    static let railWidth: CGFloat = 76
     /// A proposed command's step number, or the mark saying how it ended.
     static let stepRail: CGFloat = 16
 
@@ -165,6 +165,8 @@ final class PlateView: NSView {
 @MainActor
 struct Palette {
     let name: String
+    /// One line for the picker. What it is, not how it was made.
+    let note: String
     let surface: NSColor
     let ground: NSColor
     let ink: NSColor
@@ -186,12 +188,13 @@ struct Palette {
     /// the one thing that has to move between a pale palette and a dark one — everything
     /// else is just different values.
     init(
-        name: String, surface: UInt32, ground: UInt32, ink: UInt32, inkSoft: UInt32,
-        muted: UInt32, faint: UInt32, accent: UInt32, ok: UInt32, warn: UInt32,
-        danger: UInt32, dark: Bool, hairline: CGFloat, rule: CGFloat, border: CGFloat,
-        selection: CGFloat
+        name: String, note: String, surface: UInt32, ground: UInt32, ink: UInt32,
+        inkSoft: UInt32, muted: UInt32, faint: UInt32, accent: UInt32, ok: UInt32,
+        warn: UInt32, danger: UInt32, dark: Bool, hairline: CGFloat, rule: CGFloat,
+        border: CGFloat, selection: CGFloat
     ) {
         self.name = name
+        self.note = note
         self.surface = NSColor(hex: surface)
         self.ground = NSColor(hex: ground)
         let type = NSColor(hex: ink)
@@ -214,29 +217,59 @@ struct Palette {
     /// Warm dark. The one the design was drawn in.
     ///
     /// `warn` is a cool blue rather than amber: it means "left running", and an outcome
-    /// drawn in the accent would read as the selected row.
+    /// drawn in the accent would read as the selected row. Every palette below keeps that
+    /// rule — no outcome colour may be the accent, or near it.
     static let ember = Palette(
-        name: "Ember", surface: 0x131210, ground: 0x1C1A17, ink: 0xF0ECE5,
-        inkSoft: 0xD4CFC5, muted: 0x938C80, faint: 0x7A7468, accent: 0xE0A533,
+        name: "Ember", note: "Warm dark, amber.",
+        surface: 0x131210, ground: 0x1C1A17, ink: 0xF0ECE5, inkSoft: 0xD4CFC5,
+        muted: 0x938C80, faint: 0x7A7468, accent: 0xE0A533,
         ok: 0x6EC28B, warn: 0x74A9DB, danger: 0xE8705C, dark: true,
         hairline: 0.13, rule: 0.30, border: 0.18, selection: 0.16)
 
     /// Neutral dark. The accent is the only hue on screen, which is what the grey-icon
     /// rule was built for.
     static let graphite = Palette(
-        name: "Graphite", surface: 0x1A1A1C, ground: 0x232326, ink: 0xF2F2F4,
-        inkSoft: 0xD6D6DA, muted: 0x94949C, faint: 0x6E6E77, accent: 0x4D8DFF,
+        name: "Graphite", note: "Neutral dark, periwinkle.",
+        surface: 0x1A1A1C, ground: 0x232326, ink: 0xF2F2F4, inkSoft: 0xD6D6DA,
+        muted: 0x94949C, faint: 0x6E6E77, accent: 0x4D8DFF,
         ok: 0x4ADE80, warn: 0xFBBF24, danger: 0xF87171, dark: true,
         hairline: 0.13, rule: 0.30, border: 0.18, selection: 0.18)
 
-    /// Cool paper. The plate inverted: hairlines in ink, and a window appearance to match.
+    /// Cool dark. Reads closest to a terminal.
+    static let slate = Palette(
+        name: "Slate", note: "Cool dark, cyan.",
+        surface: 0x0F1416, ground: 0x171E21, ink: 0xE6EDEE, inkSoft: 0xC6D0D2,
+        muted: 0x849498, faint: 0x5F6E71, accent: 0x4FD1E0,
+        ok: 0x7BD88F, warn: 0xE0B457, danger: 0xF0776B, dark: true,
+        hairline: 0.13, rule: 0.30, border: 0.18, selection: 0.16)
+
+    /// Indigo dark. The softest of the four, and the only one with a cool ground and a
+    /// warm accent.
+    static let nocturne = Palette(
+        name: "Nocturne", note: "Indigo dark, rose.",
+        surface: 0x14131C, ground: 0x1D1B28, ink: 0xEDEAF5, inkSoft: 0xCFCBDE,
+        muted: 0x8F8AA3, faint: 0x6B6780, accent: 0xF07BA0,
+        ok: 0x7DD3A0, warn: 0xF3C969, danger: 0xEF6F6F, dark: true,
+        hairline: 0.14, rule: 0.30, border: 0.20, selection: 0.16)
+
+    /// Warm light. The plate inverted: hairlines in ink, and a window appearance to match.
+    static let parchment = Palette(
+        name: "Parchment", note: "Warm light, ink blue.",
+        surface: 0xFFFFFF, ground: 0xF4F2ED, ink: 0x16150F, inkSoft: 0x33302A,
+        muted: 0x6F6B63, faint: 0x9A958C, accent: 0x1F4FD8,
+        ok: 0x1A7F37, warn: 0x9A6700, danger: 0xB42318, dark: false,
+        hairline: 0.11, rule: 0.30, border: 0.15, selection: 0.09)
+
+    /// Cool light, and the loudest accent of the six.
     static let coolPaper = Palette(
-        name: "Cool paper", surface: 0xFFFFFF, ground: 0xF1F3F5, ink: 0x111315,
-        inkSoft: 0x2E3338, muted: 0x69707A, faint: 0x99A1AB, accent: 0xE2552F,
+        name: "Cool paper", note: "Cool light, vermilion.",
+        surface: 0xFFFFFF, ground: 0xF1F3F5, ink: 0x111315, inkSoft: 0x2E3338,
+        muted: 0x69707A, faint: 0x99A1AB, accent: 0xE2552F,
         ok: 0x0E7C4A, warn: 0x9A6700, danger: 0xC0341B, dark: false,
         hairline: 0.11, rule: 0.30, border: 0.15, selection: 0.10)
 
-    static let all: [Palette] = [ember, graphite, coolPaper]
+    /// Dark first, then light — the order the picker draws them.
+    static let all: [Palette] = [ember, graphite, slate, nocturne, parchment, coolPaper]
 
     static func named(_ name: String) -> Palette {
         all.first { $0.name == name } ?? ember

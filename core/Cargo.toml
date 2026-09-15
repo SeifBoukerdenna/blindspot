@@ -7,11 +7,18 @@ edition = "2024"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+libc = "0.2"
 nucleo-matcher = "0.3.1"
 plist = "1.10.1"
 redb = "4.2.0"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "hooks"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.145"
+# `preserve_order` so the JSON tool does not silently reorder keys: `Value` is a
+# `BTreeMap` without it, and a formatter that sorts your config is a formatter you cannot
+# diff against the original. It costs no new crates — indexmap, hashbrown and equivalent
+# are already in the tree via `toml` — which is the criterion the redb decision was settled
+# on.
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
 toml = "1.1.5"
 
 [dev-dependencies]

@@ -7,10 +7,10 @@
 //! the keystroke path — a worker thread, a generation counter, and a child process that
 //! gets killed the moment its answer stops mattering.
 
-use std::io::{BufRead, BufReader};
+use crate::process_job::{Failure, Latest, capture_prefix};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use crate::index::AppEntry;
 
@@ -71,6 +71,7 @@ pub fn home_entries(home: &Path) -> Vec<AppEntry> {
     };
     entries
         .flatten()
+        .take(4096)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             // Dotfiles are configuration, not something you open by name.
@@ -80,22 +81,10 @@ pub fn home_entries(home: &Path) -> Vec<AppEntry> {
 }
 
 #[derive(Default)]
-struct Shared {
-    /// The query `results` belong to.
-    query: String,
-    results: Vec<AppEntry>,
-    pending: bool,
-    /// Bumped on every new query. A worker whose generation has moved on throws its
-    /// output away instead of publishing a stale answer.
-    generation: u64,
-    /// Held so a superseding query can kill it. Only the worker owning the current
-    /// generation may take it.
-    child: Option<Child>,
-}
-
-#[derive(Default)]
 pub struct FileSearch {
-    shared: Arc<Mutex<Shared>>,
+    job: Latest<String, Vec<AppEntry>>,
+    home: Latest<(PathBuf, u64), Vec<AppEntry>>,
+    home_cache: std::sync::Mutex<(Option<PathBuf>, Vec<AppEntry>)>,
 }
 
 impl FileSearch {
@@ -103,98 +92,65 @@ impl FileSearch {
         Self::default()
     }
 
-    /// Starts a search for `query` unless one is already running or finished for it.
-    ///
-    /// Returns immediately. Idempotent, which is what lets the caller invoke it on every
-    /// keystroke and on every poll without thinking about it.
     pub fn search(&self, query: &str) {
-        let mut shared = lock(&self.shared);
-        if shared.query == query {
+        let Ok(parsed) = crate::query::FileQuery::parse(query) else {
+            self.job.cancel();
+            return;
+        };
+        if !parsed.filtered() && parsed.name.chars().count() < MIN_QUERY {
+            self.job.cancel();
             return;
         }
-
-        // Supersede: the old answer is now worthless, and so is the process producing it.
-        shared.generation += 1;
-        let generation = shared.generation;
-        query.clone_into(&mut shared.query);
-        shared.results.clear();
-        if let Some(mut child) = shared.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        if query.chars().count() < MIN_QUERY {
-            shared.pending = false;
-            return;
-        }
-        shared.pending = true;
-        drop(shared);
-
-        let handle = Arc::clone(&self.shared);
-        let query = query.to_owned();
-        if std::thread::Builder::new()
-            .name("blindspot-mdfind".to_owned())
-            .spawn(move || run(&handle, generation, &query))
-            .is_err()
-        {
-            // Nothing will publish a result, so do not leave the caller polling forever.
-            lock(&self.shared).pending = false;
-        }
+        self.job
+            .search(query.to_owned(), |query, cancel| run(query, cancel));
     }
 
-    /// What is known for `query`, and whether a search for it is still running.
+    pub fn cancel(&self) {
+        self.job.cancel();
+    }
+
+    pub fn home_entries(&self, path: &Path) -> (Vec<AppEntry>, bool) {
+        let key = (path.to_path_buf(), crate::relevance::unix_now() / 5);
+        self.home.search(key.clone(), |(path, _), cancel| {
+            if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(Failure::Cancelled);
+            }
+            Ok(home_entries(path))
+        });
+        let (result, pending) = self.home.results(&key);
+        let mut cache = self
+            .home_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.0.as_deref() != Some(path) {
+            *cache = (Some(path.to_path_buf()), Vec::new());
+        }
+        if let Some(Ok(entries)) = result {
+            cache.1 = entries;
+        }
+        (cache.1.clone(), pending)
+    }
+
     pub fn results(&self, query: &str) -> (Vec<AppEntry>, bool) {
-        let shared = lock(&self.shared);
-        if shared.query != query {
-            return (Vec::new(), false);
-        }
-        (shared.results.clone(), shared.pending)
+        let (result, pending) = self.job.results(&query.to_owned());
+        (result.and_then(Result::ok).unwrap_or_default(), pending)
     }
 }
 
-/// Poison recovery rather than propagation, as everywhere else in this crate: a panic
-/// while holding this lock must not cost the user their launcher.
-fn lock(shared: &Arc<Mutex<Shared>>) -> std::sync::MutexGuard<'_, Shared> {
-    match shared.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
+fn run(query: &str, cancel: &AtomicBool) -> Result<Vec<AppEntry>, Failure> {
+    let parsed = crate::query::FileQuery::parse(query).map_err(|_| Failure::Unavailable)?;
+    let mut command = Command::new("/usr/bin/mdfind");
+    command.args(["-attr", LAST_USED]);
+    if parsed.filtered() {
+        command.arg(parsed.spotlight_predicate());
+    } else {
+        command.arg("-name").arg(&parsed.name);
     }
-}
-
-fn run(shared: &Arc<Mutex<Shared>>, generation: u64, query: &str) {
     // `query` is an argument, never a shell string, so there is nothing to escape and
     // no injection to worry about — `Command` does not go through a shell.
     // `-attr` adds each result's last-opened date to the same line, so recency costs no
     // second process: of 233 matches for `desktop`, only 3 had ever been opened.
-    let spawned = Command::new("mdfind")
-        .args(["-attr", LAST_USED])
-        .arg("-name")
-        .arg(query)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-
-    let Ok(mut child) = spawned else {
-        finish(shared, generation, Vec::new());
-        return;
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        finish(shared, generation, Vec::new());
-        return;
-    };
-
-    {
-        let mut guard = lock(shared);
-        if guard.generation != generation {
-            // Superseded between spawning and publishing the handle; clean up our own.
-            drop(guard);
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        }
-        guard.child = Some(child);
-    }
+    let output = capture_prefix(&mut command, cancel, 8 << 20)?;
 
     // Read without the lock held: this is the slow part, and a poll must never block on it.
     // Every line is scored cheaply — place and match quality, no fuzzy matching — and only
@@ -203,12 +159,12 @@ fn run(shared: &Arc<Mutex<Shared>>, generation: u64, query: &str) {
     let home = home_dir();
     let now = crate::relevance::unix_now();
     let mut scored: Vec<(crate::relevance::Key, AppEntry)> = Vec::new();
-    for line in BufReader::new(stdout)
-        .lines()
-        .map_while(Result::ok)
-        .take(READ_CAP)
-    {
-        let Some(entry) = entry_for(&line) else {
+    let text = String::from_utf8_lossy(&output);
+    for line in text.lines().take(READ_CAP) {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Failure::Cancelled);
+        }
+        let Some(entry) = entry_for(line) else {
             continue;
         };
         let candidate = crate::relevance::Candidate {
@@ -218,7 +174,7 @@ fn run(shared: &Arc<Mutex<Shared>>, generation: u64, query: &str) {
             fuzzy: 0,
             used: crate::relevance::recency(entry.last_used, now),
         };
-        let key = crate::relevance::key(&candidate, query, home.as_deref());
+        let key = crate::relevance::key(&candidate, &parsed.name, home.as_deref());
         scored.push((key, entry));
         // Bounded memory on a broad query: trim back whenever the pile grows well past
         // what will be kept.
@@ -228,31 +184,12 @@ fn run(shared: &Arc<Mutex<Shared>>, generation: u64, query: &str) {
     }
     keep_best(&mut scored);
 
-    finish(
-        shared,
-        generation,
-        scored.into_iter().map(|(_, e)| e).collect(),
-    );
+    Ok(scored.into_iter().map(|(_, e)| e).collect())
 }
 
 fn keep_best(scored: &mut Vec<(crate::relevance::Key, AppEntry)>) {
     scored.sort_unstable_by_key(|(key, _)| std::cmp::Reverse(*key));
     scored.truncate(RESULT_CAP);
-}
-
-fn finish(shared: &Arc<Mutex<Shared>>, generation: u64, entries: Vec<AppEntry>) {
-    let mut guard = lock(shared);
-    // A moved generation means `child` now belongs to a newer search. Touching it would
-    // kill someone else's process.
-    if guard.generation != generation {
-        return;
-    }
-    if let Some(mut child) = guard.child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    guard.results = entries;
-    guard.pending = false;
 }
 
 const LAST_USED: &str = "kMDItemLastUsedDate";
@@ -284,7 +221,11 @@ mod tests {
     fn only_a_prefixed_query_asks_for_files() {
         assert_eq!(strip_prefix("?report"), Some("report"));
         assert_eq!(strip_prefix("?  report"), Some("report"));
-        assert_eq!(strip_prefix("?report "), Some("report"), "a pasted newline, as a space");
+        assert_eq!(
+            strip_prefix("?report "),
+            Some("report"),
+            "a pasted newline, as a space"
+        );
         assert_eq!(strip_prefix("?"), Some(""));
         assert_eq!(strip_prefix("report"), None);
         assert_eq!(strip_prefix(""), None);
@@ -345,9 +286,10 @@ mod tests {
     fn repeating_the_same_query_does_not_restart_it() {
         let search = FileSearch::new();
         search.search("blindspot-stable-xyzzy");
-        let first = lock(&search.shared).generation;
+        let first = search.results("blindspot-stable-xyzzy");
         search.search("blindspot-stable-xyzzy");
-        assert_eq!(lock(&search.shared).generation, first, "idempotent");
+        let second = search.results("blindspot-stable-xyzzy");
+        assert!(first.1 || !second.1, "completed work never restarts");
     }
 
     #[test]

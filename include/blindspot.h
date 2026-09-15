@@ -10,18 +10,21 @@
 #include <stdlib.h>
 
 /**
- * A query beginning with this asks the local model instead of searching.
- *
- * Explicit, like the other modes: no keystroke ever reaches a model by accident, and the
- * model is only contacted when Enter is pressed on the prompt row.
- */
-#define PREFIX '>'
-
-/**
  * Most clips kept by default. Oldest go first. Settable — see [`Clips::keep`] — unlike
  * the byte caps below, which are a disk-safety invariant rather than a preference.
  */
 #define DEFAULT_KEEP 200
+
+#define MAX_BODY_BYTES 65536
+
+#define MAX_BATCH 256
+
+#define MAX_CANDIDATES 10000
+
+/**
+ * Newer vectors searched exactly at query time before a shard rebuild is worth its cost.
+ */
+#define MAX_DELTA 2048
 
 /**
  * A [`BsResult`] that is an application bundle.
@@ -103,6 +106,48 @@
  * `id` is its index for [`bs_agent_choose`].
  */
 #define BS_KIND_AGENT_MODEL 13
+
+/**
+ * A [`BsResult`] that is a process listening on the port you asked about. `id` is its
+ * pid, `path` its executable, and `detail` the pid and address it is bound to. Enter
+ * copies the pid; ⌃↩ asks it to stop.
+ */
+#define BS_KIND_PORT 16
+
+/**
+ * A registered command whose path carries the query to complete.
+ */
+#define BS_KIND_COMMAND 17
+
+/**
+ * A setting whose path carries its schema key.
+ */
+#define BS_KIND_SETTING 18
+
+/**
+ * A `:link` / `:snippet` command that saves or removes a shortcut when run; `path` is the command.
+ */
+#define BS_KIND_SHORTCUT 19
+
+/**
+ * A saved quick link; `path` is the URL, or the template when no search text was typed.
+ */
+#define BS_KIND_LINK 20
+
+/**
+ * A saved text snippet; `path` is its text.
+ */
+#define BS_KIND_SNIPPET 21
+
+/**
+ * A macOS system command; `path` is its identifier in [`crate::system::COMMANDS`].
+ */
+#define BS_KIND_SYSTEM 22
+
+/**
+ * An AI command for selected text; `path` is what to type to run it.
+ */
+#define BS_KIND_PROMPT 23
 
 /**
  * A [`BsResult`] that is a section title on the welcome screen — "Suggested", "Recent
@@ -189,6 +234,12 @@
  */
 #define LIST_SEPARATOR '\u{0}'
 
+#define MAX_ENTRIES 256
+
+#define MAX_SNIPPET_BYTES (16 * 1024)
+
+#define SNIPPET_PREFIX '!'
+
 /**
  * Spotlight's usage score at or above which an app counts as recently used: one use four
  * weeks ago at the default 14-day half-life (`0.5^(28/14)`).
@@ -215,6 +266,8 @@ typedef struct Hotkey Hotkey;
  */
 typedef struct {
   uint64_t id;
+  uint32_t process_pid;
+  uint16_t network_port;
   const uint8_t *name;
   size_t name_len;
   const uint8_t *path;
@@ -270,6 +323,14 @@ typedef struct {
 } BsResults;
 
 /**
+ * Bytes owned by Rust. Must be passed to [`bs_free_blob`].
+ */
+typedef struct {
+  const uint8_t *data;
+  size_t len;
+} BsBlob;
+
+/**
  * A clip handed from Swift to Rust. Every pointer only has to live for the call:
  * [`bs_clip_add`] copies whatever it keeps before returning.
  */
@@ -297,14 +358,6 @@ typedef struct {
   uint32_t width;
   uint32_t height;
 } BsClip;
-
-/**
- * Bytes owned by Rust. Must be passed to [`bs_free_blob`].
- */
-typedef struct {
-  const uint8_t *data;
-  size_t len;
-} BsBlob;
 
 /**
  * What the shell needs from the config the moment it starts: the two hotkeys to register
@@ -459,6 +512,100 @@ BsHandle *bs_init(const char *config_path);
 BsResults bs_query(BsHandle *handle, const char *query, size_t limit);
 
 /**
+ * Cancels transient searches when the panel closes.
+ *
+ * # Safety
+ * `handle` must be NULL or a live pointer from `bs_init`.
+ */
+void bs_search_cancel(BsHandle *handle);
+
+/**
+ * Queues a coalesced content reconciliation without waiting for disk work.
+ * # Safety
+ * `handle` must be NULL or a live pointer from `bs_init` retained for this call.
+ */
+void bs_content_refresh(BsHandle *handle);
+
+/**
+ * Reconciles affected configured roots; invalid or oversized input requests a full scan.
+ * # Safety
+ * `handle` must be live and retained. `paths` must point to `len` readable bytes when non-NULL.
+ */
+void bs_content_refresh_paths(BsHandle *handle, const uint8_t *paths, size_t len);
+
+/**
+ * Applies the shell's power/thermal policy without waiting for the index worker.
+ * # Safety
+ * `handle` must be NULL or a live pointer from `bs_init` retained for this call.
+ */
+void bs_content_pause(BsHandle *handle, bool paused, uint8_t reason);
+
+/**
+ * Erases indexed content after explicit confirmation and disabling indexing.
+ * Returns an empty blob when queued, otherwise a refusal; free with `bs_free_blob`.
+ * # Safety
+ * `handle` must be NULL or a live pointer retained for this call.
+ */
+BsBlob bs_content_erase(BsHandle *handle, bool confirmed);
+
+/**
+ * Stops erasure between transactions; already removed records stay removed.
+ * # Safety
+ * `handle` must be NULL or a live pointer retained for this call.
+ */
+void bs_content_erase_cancel(BsHandle *handle);
+
+/**
+ * Returns bounded JSON configuration/status; free it with `bs_free_blob`.
+ * # Safety
+ * `handle` must be NULL or a live pointer from `bs_init` retained for this call.
+ */
+BsBlob bs_content_state(BsHandle *handle);
+
+/**
+ * Checks an FSEvents path against the configured scope without accessing the filesystem.
+ * # Safety
+ * `handle` must be NULL or a live retained handle; `path` must be NULL or a valid terminated string.
+ */
+bool bs_content_event_relevant(BsHandle *handle,
+                               const char *path);
+
+/**
+ * Runs a `:link` / `:snippet` / `:unlink` / `:unsnippet` command. Returns an empty blob on success
+ * or the reason it was refused; free it with `bs_free_blob`.
+ * # Safety
+ * `handle` must be NULL or a live pointer from `bs_init`; `command` must be NULL or NUL-terminated.
+ */
+BsBlob bs_shortcut_apply(BsHandle *handle, const char *command);
+
+/**
+ * Saves `len` bytes of UTF-8 `text` as snippet `keyword`. Returns an empty blob on success or the
+ * reason it was refused; free it with `bs_free_blob`.
+ * # Safety
+ * `handle` must be NULL or live; `keyword` NULL or NUL-terminated; `text` NULL or valid for `len` bytes.
+ */
+BsBlob bs_snippet_save(BsHandle *handle,
+                       const char *keyword,
+                       const uint8_t *text,
+                       size_t len);
+
+/**
+ * The instruction for the AI command `text` names (`fix grammar`, or `ai KEYWORD` for a saved one),
+ * or an empty blob when it names none; free it with `bs_free_blob`.
+ * # Safety
+ * `handle` must be NULL or a live pointer from `bs_init`; `text` must be NULL or NUL-terminated.
+ */
+BsBlob bs_prompt_resolve(BsHandle *handle, const char *text);
+
+/**
+ * Starts a user-confirmed compaction of the content index. Returns an empty blob when it started or
+ * the reason it could not; free it with `bs_free_blob`.
+ * # Safety
+ * `handle` must be NULL or a live pointer from `bs_init`.
+ */
+BsBlob bs_content_compact(BsHandle *handle);
+
+/**
  * Asks the local model what to do about `request`, on a background thread.
  *
  * Returns immediately. The answer arrives through [`bs_query`] on the same `>` request, whose
@@ -470,6 +617,14 @@ BsResults bs_query(BsHandle *handle, const char *query, size_t limit);
  * NUL-terminated C string alive for the call.
  */
 void bs_agent_submit(BsHandle *handle, const char *request);
+
+/**
+ * Submits a request with ephemeral selected text, only after an explicit user action.
+ *
+ * # Safety
+ * `handle` must be NULL or live; strings must be NULL or NUL-terminated and live for this call.
+ */
+void bs_agent_submit_context(BsHandle *handle, const char *request, const char *selected);
 
 /**
  * Runs the commands the agent proposed, in order, on a background thread.
@@ -604,6 +759,43 @@ BsBlob bs_clip_content(BsHandle *handle, uint64_t id, uint8_t part);
 uint32_t bs_clips_clear(BsHandle *handle);
 
 /**
+ * Removes one clipboard item and all stored representations.
+ *
+ * # Safety
+ * `handle` must be null or a live handle retained until this call returns. Thread-safe.
+ */
+bool bs_clip_remove(BsHandle *handle, uint64_t id);
+
+/**
+ * Reads pin state without accessing disk.
+ * # Safety
+ * The handle is null or retained and live for this call.
+ */
+bool bs_clip_pinned(BsHandle *handle, uint64_t id);
+
+/**
+ * Writes pin state. Call off the UI thread.
+ * # Safety
+ * The handle is null or retained and live for this call.
+ */
+bool bs_clip_pin(BsHandle *handle, uint64_t id, bool pinned);
+
+/**
+ * Clears history, distinguishing failure from an already empty history. Call off the UI thread.
+ * # Safety
+ * The handle is null or retained and live for this call.
+ */
+bool bs_clips_clear_checked(BsHandle *handle);
+
+/**
+ * Updates a clipboard item's recency without recording application launch history.
+ *
+ * # Safety
+ * `handle` must be null or a live handle retained until this call returns. Thread-safe.
+ */
+bool bs_clip_touch(BsHandle *handle, uint64_t id);
+
+/**
  * Asks, on a thread, whether the agent's host answers.
  *
  * Returns immediately; the answer shows up in the next [`bs_settings_list`], exactly as
@@ -615,6 +807,24 @@ uint32_t bs_clips_clear(BsHandle *handle);
  * `handle` must be NULL or a live pointer from [`bs_init`] that has not been shut down.
  */
 void bs_diagnostics_refresh(BsHandle *handle);
+
+/**
+ * Legacy PID-only signaling is unavailable; use bs_process_signal with a start time.
+ *
+ * # Safety
+ * Takes no pointers and always returns false, preserving the old ABI without signaling.
+ */
+bool bs_port_kill(uint32_t pid);
+
+/**
+ * Signals only the same process instance shown in the result. Requires UI confirmation.
+ */
+bool bs_process_signal(uint32_t pid, uint64_t started, bool force);
+
+/**
+ * Returns JSON for a still-current process; empty means unavailable. Free with bs_free_blob.
+ */
+BsBlob bs_process_inspect(uint32_t pid, uint64_t started);
 
 /**
  * Spells a Carbon key code and modifier mask the way config.toml writes it.

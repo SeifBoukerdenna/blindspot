@@ -50,6 +50,8 @@ const DOMAIN: &[u8] = b"blindspot:clip:";
 const META: TableDefinition<u64, (u8, u64, u32, u32, u64, &str)> = TableDefinition::new("meta");
 const CONTENT: TableDefinition<u64, &[u8]> = TableDefinition::new("content");
 const THUMB: TableDefinition<u64, &[u8]> = TableDefinition::new("thumb");
+const PINS: TableDefinition<u64, u8> = TableDefinition::new("pins");
+const MAX_PINS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipKind {
@@ -99,6 +101,7 @@ pub struct NewClip<'a> {
 /// What a result row needs to know beyond the name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipInfo {
+    pub pinned: bool,
     pub kind: ClipKind,
     /// Unix seconds, bumped whenever the clip is reused.
     pub created: u64,
@@ -109,6 +112,7 @@ pub struct ClipInfo {
     bytes: u64,
 }
 
+#[derive(Clone)]
 struct State {
     /// Most recent first. `Ranker` breaks ties by index, so this ordering is what makes
     /// a bare `;` return newest first and an equal fuzzy score favour the recent clip.
@@ -145,13 +149,19 @@ impl State {
         if let Some(info) = self.info.get_mut(&id) {
             info.created = now;
         }
+        self.order();
         true
+    }
+
+    fn order(&mut self) {
+        self.entries.sort_by_key(|entry|std::cmp::Reverse(self.info.get(&entry.id).map(|info|(info.pinned,info.created))));
     }
 
     fn insert_front(&mut self, entry: AppEntry, info: ClipInfo) {
         self.total_bytes += info.bytes;
         self.info.insert(entry.id, info);
         self.entries.insert(0, entry);
+        self.order();
     }
 
     /// Drops the oldest clips until both limits hold, returning their ids so the caller
@@ -159,12 +169,9 @@ impl State {
     /// byte budget, so one clip alone can never be over it.
     fn evict(&mut self) -> Vec<u64> {
         let mut gone = Vec::new();
-        while self.entries.len() > 1
-            && (self.entries.len() > self.keep || self.total_bytes > MAX_TOTAL_BYTES)
-        {
-            let Some(entry) = self.entries.pop() else {
-                break;
-            };
+        while self.info.values().filter(|info|!info.pinned).count()>self.keep || self.total_bytes>MAX_TOTAL_BYTES {
+            let Some(at)=self.entries.iter().rposition(|entry|self.info.get(&entry.id).is_some_and(|info|!info.pinned)) else {break;};
+            let entry=self.entries.remove(at);
             if let Some(info) = self.info.remove(&entry.id) {
                 self.total_bytes = self.total_bytes.saturating_sub(info.bytes);
             }
@@ -175,6 +182,7 @@ impl State {
 }
 
 pub struct Clips {
+    mutation: Mutex<()>,
     db: Database,
     state: Mutex<State>,
 }
@@ -191,7 +199,16 @@ impl Clips {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(StoreError::Io)?;
         }
-        let db = Database::create(path).map_err(|e| StoreError::Open(Box::new(e)))?;
+        use std::os::unix::{fs::{OpenOptionsExt, PermissionsExt, MetadataExt}};
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true)
+            .truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path).map_err(StoreError::Io)?;
+        let metadata = file.metadata().map_err(StoreError::Io)?;
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(StoreError::Io(std::io::Error::other("Clipboard store must be a regular unlinked file")));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(StoreError::Io)?;
+        let db = Database::builder().create_file(file).map_err(|e| StoreError::Open(Box::new(e)))?;
         Self::from_db(db)
     }
 
@@ -209,6 +226,7 @@ impl Clips {
         let mut rows = Vec::new();
         {
             let read = db.begin_read()?;
+            let pins=match read.open_table(PINS) {Ok(table)=>Some(table),Err(redb::TableError::TableDoesNotExist(_))=>None,Err(error)=>return Err(error.into())};
             match read.open_table(META) {
                 Ok(table) => {
                     for row in table.iter()? {
@@ -216,6 +234,7 @@ impl Clips {
                         let (kind, created, width, height, bytes, name) = value.value();
                         if let Some(kind) = ClipKind::from_byte(kind) {
                             let info = ClipInfo {
+                                pinned:match &pins {Some(table)=>table.get(id.value())?.is_some(),None=>false},
                                 kind,
                                 created,
                                 width,
@@ -243,6 +262,7 @@ impl Clips {
             state.insert_front(entry(id, name), info);
         }
         Ok(Self {
+            mutation: Mutex::new(()),
             db,
             state: Mutex::new(state),
         })
@@ -253,14 +273,22 @@ impl Clips {
     /// Content already present is bumped to the top rather than stored twice: the id is
     /// a hash of the bytes, so identical content always lands on the same id.
     pub fn add(&self, clip: NewClip<'_>, now: u64) -> Option<u64> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if clip.thumbnail.len() > MAX_TEXT_BYTES || clip.text.len() > MAX_TEXT_BYTES {
+            return None;
+        }
         let name = searchable_name(&clip)?;
         let id = fnv1a(&[DOMAIN, &[clip.kind.to_byte()], clip.content]);
 
-        if self.touch(id, now) {
-            return Some(id);
+        if lock(&self.state).info.contains_key(&id) {
+            return self.touch_inner(id, now).then_some(id);
         }
 
         let info = ClipInfo {
+            pinned:false,
             kind: clip.kind,
             created: now,
             width: clip.width,
@@ -268,22 +296,15 @@ impl Clips {
             bytes: (clip.content.len() + clip.thumbnail.len()) as u64,
         };
 
-        // Written before the clip is published in memory, so a query can never return
-        // an id whose content is not on disk yet. And written *without* the state lock,
-        // so a keystroke never waits on an fsync behind a 25 MB screenshot.
-        if let Err(e) = self.write(id, &name, &info, clip.content, clip.thumbnail) {
-            eprintln!("blindspot: could not save clip: {e}");
+        let mut next=lock(&self.state).clone();
+        next.insert_front(entry(id,name.clone()),info);
+        let evicted=next.evict();
+        if !next.info.contains_key(&id) {return None;}
+        if self.write(id,&name,&info,clip.content,clip.thumbnail,&evicted).is_err() {
+            eprintln!("blindspot: clipboard transaction failed; previous history retained");
             return None;
         }
-
-        let evicted = {
-            let mut state = lock(&self.state);
-            state.insert_front(entry(id, name), info);
-            state.evict()
-        };
-        if let Err(e) = self.delete(&evicted) {
-            eprintln!("blindspot: could not evict old clips: {e}");
-        }
+        *lock(&self.state)=next;
         Some(id)
     }
 
@@ -291,15 +312,38 @@ impl Clips {
     ///
     /// Live rather than at-open so the settings window can lower it and have history
     /// actually shrink — a cap that only applied to the next copy would look broken.
-    pub fn keep(&self, count: usize) {
-        let evicted = {
-            let mut state = lock(&self.state);
-            state.keep = count.max(1);
-            state.evict()
-        };
-        if let Err(e) = self.delete(&evicted) {
-            eprintln!("blindspot: could not evict old clips: {e}");
-        }
+    pub fn keep(&self, count: usize) -> bool {
+        let _mutation=self.mutation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next=lock(&self.state).clone();
+        next.keep=count.clamp(1,2000);
+        let evicted=next.evict();
+        if self.delete(&evicted).is_err() {return false;}
+        *lock(&self.state)=next;
+        true
+    }
+
+    pub fn pinned(&self,id:u64)->bool {lock(&self.state).info.get(&id).is_some_and(|info|info.pinned)}
+
+    pub fn pin(&self,id:u64,pinned:bool)->bool {
+        let _mutation=self.mutation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next=lock(&self.state).clone();
+        if pinned && !next.info.get(&id).is_some_and(|info|info.pinned)
+            && next.info.values().filter(|info|info.pinned).count()>=MAX_PINS {return false;}
+        let Some(info)=next.info.get_mut(&id) else {return false;};
+        info.pinned=pinned;
+        next.order();
+        let evicted=next.evict();
+        let saved=(||->Result<(),StoreError> {
+            let write=self.db.begin_write()?;
+            {let mut pins=write.open_table(PINS)?;
+             if pinned {pins.insert(id,1)?;} else {pins.remove(id)?;}}
+            delete_rows(&write,&evicted)?;
+            write.commit()?;
+            Ok(())
+        })();
+        if saved.is_err() {return false;}
+        *lock(&self.state)=next;
+        true
     }
 
     /// How many clips are held and what they take on disk, for the settings window.
@@ -310,39 +354,54 @@ impl Clips {
 
     /// Forgets everything, returning how many went. Its own file, so this cannot touch
     /// launch history — see [`Clips::default_path`].
-    pub fn clear(&self) -> usize {
-        let ids: Vec<u64> = {
-            let mut state = lock(&self.state);
-            let ids = state.entries.iter().map(|e| e.id).collect();
-            *state = State {
-                keep: state.keep,
-                ..State::default()
-            };
-            ids
+    pub fn clear(&self) -> usize {self.clear_checked().unwrap_or(0)}
+
+    pub fn clear_checked(&self) -> Result<usize,StoreError> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids: Vec<u64> = lock(&self.state).entries.iter().map(|e| e.id).collect();
+        self.delete(&ids)?;
+        let mut state = lock(&self.state);
+        *state = State {
+            keep: state.keep,
+            ..State::default()
         };
-        if let Err(e) = self.delete(&ids) {
-            eprintln!("blindspot: could not clear clipboard history: {e}");
+        Ok(ids.len())
+    }
+
+    pub fn remove(&self, id: u64) -> bool {
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !lock(&self.state).info.contains_key(&id) || self.delete(&[id]).is_err() {
+            return false;
         }
-        ids.len()
+        let mut state = lock(&self.state);
+        if let Some(info) = state.info.remove(&id) {
+            state.total_bytes = state.total_bytes.saturating_sub(info.bytes);
+        }
+        state.entries.retain(|entry| entry.id != id);
+        true
     }
 
     /// Moves a clip to the top, as when it is pasted again. False if it is not a clip —
     /// which is how `bs_activate` tells clip ids from app and file ids.
     pub fn touch(&self, id: u64, now: u64) -> bool {
-        let bumped = {
-            let mut state = lock(&self.state);
-            state
-                .bump(id, now)
-                .then(|| state.info.get(&id).copied())
-                .flatten()
-        };
-        let Some(info) = bumped else {
-            return false;
-        };
-        if let Err(e) = self.write_meta(id, &info) {
-            eprintln!("blindspot: could not update clip: {e}");
-        }
-        true
+        let _mutation = self
+            .mutation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.touch_inner(id, now)
+    }
+
+    fn touch_inner(&self, id: u64, now: u64) -> bool {
+        let Some(mut info)=lock(&self.state).info.get(&id).copied() else {return false;};
+        info.created=now;
+        if self.write_meta(id,&info).is_err() {return false;}
+        lock(&self.state).bump(id,now)
     }
 
     pub fn content(&self, id: u64, part: Part) -> Option<Vec<u8>> {
@@ -353,7 +412,9 @@ impl Clips {
                 Part::Thumbnail => THUMB,
             })
             .ok()?;
-        Some(table.get(id).ok()??.value().to_vec())
+        let value=table.get(id).ok()??;
+        let bytes=value.value();
+        (bytes.len()<=MAX_IMAGE_BYTES).then(||bytes.to_vec())
     }
 
     /// Runs `f` over the clips, newest first, plus their per-clip details.
@@ -372,6 +433,7 @@ impl Clips {
         info: &ClipInfo,
         content: &[u8],
         thumbnail: &[u8],
+        evicted: &[u64],
     ) -> Result<(), StoreError> {
         let write = self.db.begin_write()?;
         {
@@ -379,6 +441,7 @@ impl Clips {
             write.open_table(THUMB)?.insert(id, thumbnail)?;
             write.open_table(META)?.insert(id, meta_row(info, name))?;
         }
+        delete_rows(&write,evicted)?;
         write.commit()?;
         Ok(())
     }
@@ -403,19 +466,19 @@ impl Clips {
             return Ok(());
         }
         let write = self.db.begin_write()?;
-        {
-            let mut meta = write.open_table(META)?;
-            let mut content = write.open_table(CONTENT)?;
-            let mut thumb = write.open_table(THUMB)?;
-            for id in ids {
-                meta.remove(*id)?;
-                content.remove(*id)?;
-                thumb.remove(*id)?;
-            }
-        }
+        delete_rows(&write,ids)?;
         write.commit()?;
         Ok(())
     }
+}
+
+fn delete_rows(write:&redb::WriteTransaction,ids:&[u64])->Result<(),StoreError> {
+    let mut meta=write.open_table(META)?;
+    let mut content=write.open_table(CONTENT)?;
+    let mut thumb=write.open_table(THUMB)?;
+    let mut pins=write.open_table(PINS)?;
+    for id in ids {meta.remove(*id)?;content.remove(*id)?;thumb.remove(*id)?;pins.remove(*id)?;}
+    Ok(())
 }
 
 fn meta_row<'a>(info: &ClipInfo, name: &'a str) -> (u8, u64, u32, u32, u64, &'a str) {
@@ -516,6 +579,23 @@ mod tests {
 
     fn fresh() -> Clips {
         Clips::in_memory().expect("in-memory store opens")
+    }
+
+    #[test]
+    fn concurrent_identical_copies_publish_only_one_record() {
+        let clips = fresh();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    clips.add(text("same content"), 1);
+                });
+            }
+        });
+        assert_eq!(names(&clips), ["same content"]);
+        assert_eq!(clips.clear(), 1);
+        assert!(names(&clips).is_empty());
     }
 
     #[test]
@@ -718,6 +798,49 @@ mod tests {
         let clips = Clips::open(&path).expect("reopens");
         assert_eq!(names(&clips), ["newer", "older"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_one_clip_removes_all_parts_and_survives_reopen() {
+        let dir =
+            std::env::temp_dir().join(format!("blindspot-clip-delete-{}", std::process::id()));
+        let path = dir.join("clips.redb");
+        std::fs::create_dir_all(&dir).expect("directory");
+        let id;
+        {
+            let clips = Clips::open(&path).expect("open");
+            id = clips.add(text("delete me"), 1).expect("add");
+            clips.add(text("keep me"), 2).expect("add");
+            assert!(clips.remove(id));
+            assert!(!clips.remove(id));
+            assert_eq!(names(&clips), ["keep me"]);
+            assert!(clips.content(id, Part::Full).is_none());
+            assert!(clips.content(id, Part::Thumbnail).is_none());
+        }
+        let clips = Clips::open(&path).expect("reopen");
+        assert_eq!(names(&clips), ["keep me"]);
+        assert!(!clips.touch(id, 3));
+        drop(clips);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn pinned_items_survive_retention_and_reopen_but_explicit_clear_removes_them() {
+        let root=std::env::temp_dir().join(format!("blindspot-clip-pins-{}",std::process::id()));
+        let path=root.join("clips.redb");
+        let clips=Clips::open(&path).unwrap();
+        let pin=clips.add(text("pinned"),1).unwrap();
+        assert!(clips.pin(pin,true));
+        clips.keep(1);
+        clips.add(text("old"),2);clips.add(text("new"),3);
+        assert_eq!(names(&clips),["pinned","new"]);
+        drop(clips);
+        let clips=Clips::open(&path).unwrap();
+        assert!(clips.pinned(pin));
+        assert_eq!(names(&clips),["pinned","new"]);
+        assert_eq!(clips.clear_checked().unwrap(),2);
+        assert!(!clips.pinned(pin));
+        drop(clips);std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

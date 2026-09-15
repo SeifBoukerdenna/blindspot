@@ -13,6 +13,9 @@ final class TabBar: NSView {
     private let titles: [String]
     private let tabs: [NSTextField]
     private let status = NSTextField(labelWithString: "")
+    /// What the status slot already says. Re-setting an attributed string repaints it, and
+    /// this is asked on every poll.
+    private var shownStatus: String?
     /// Positioned by hand in `layout()`: it has to sit under whichever tab is current,
     /// and constraints that move between four anchors are more machinery than a frame.
     private let underline = PlateView(fill: Theme.accent)
@@ -82,6 +85,8 @@ final class TabBar: NSView {
     /// What this mode can say about itself, at the right of the bar. Empty is a
     /// perfectly good answer and most modes give it.
     func show(status text: String) {
+        guard text != shownStatus else { return }
+        shownStatus = text
         status.attributedStringValue = Theme.label(
             text, size: 9.5, tracking: 0.14, color: Theme.faint)
     }
@@ -152,6 +157,10 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// field always holds at least its prefix.
     private let ghost = NSTextField(labelWithString: "")
     private let results: ResultsView
+    private let preview = Preview()
+    /// True while Quick Look is up. The preview takes key status, and without this the
+    /// panel would tear itself down from `windowDidResignKey` with the query still in it.
+    private var previewing = false
 
     /// The browse modes, each nothing more than the prefix that selects it — so typing `?`
     /// and pressing ⌘2 are the same act, and the tabs keep no state of their own.
@@ -171,6 +180,15 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// Captured on show so dismissal can hand focus back. Getting this wrong is the
     /// single most annoying possible regression in daily use.
     private var previousApp: NSRunningApplication?
+    /// The labels the core gives intents that change existing files (`Intent::label`).
+    private static let destructivePrefixes = ["Rename:", "Move:", "Move to Trash:"]
+    private let schedule: ScheduleProvider
+    private var context: LauncherContext?
+    private var contextTask: Task<Void, Never>?
+    private let actionRegistry: ActionRegistry
+    private var offeredActions: [ResultAction] = []
+    private var actionTarget: Match?
+    private var actionTask: Task<Void, Never>?
 
     /// The screen y-coordinate of the panel's top edge, held fixed while the list grows
     /// and shrinks underneath it. Without this the panel appears to jump as you type.
@@ -184,6 +202,9 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     init(core: Core, watcher: ClipboardWatcher) {
         self.core = core
         self.watcher = watcher
+        let schedule = ScheduleProvider()
+        self.schedule = schedule
+        self.actionRegistry = ActionRegistry(clipSink: core.clipSink, core: core, schedule: schedule)
         self.results = ResultsView(visibleRows: core.maxResults)
 
         super.init(
@@ -246,6 +267,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
 
         buildContentView()
         results.onActivate = { [weak self] in self?.launchSelected() }
+        preview.onClose = { [weak self] in self?.previewClosed() }
         ActionHint.startTracking()
     }
 
@@ -403,9 +425,23 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     }
 
     func show() {
+        let interval = Diagnostics.performance.beginInterval("LauncherShow")
+        defer { Diagnostics.performance.endInterval("LauncherShow", interval) }
         // Captured before anything touches the window server, while the answer is still
         // whatever the user was actually in.
         previousApp = NSWorkspace.shared.frontmostApplication
+        contextTask?.cancel()
+        context = nil
+        if let app = previousApp {
+            let id = app.bundleIdentifier
+            let pid = app.processIdentifier
+            contextTask = Task { @MainActor [weak self] in
+                let snapshot = await LauncherContext.capture(applicationID: id, processID: pid)
+                guard !Task.isCancelled, let self, self.isVisible else { return }
+                self.context = snapshot
+                if LauncherContext.isTextCommand(self.field.stringValue) || self.core.promptInstruction(for: self.field.stringValue) != nil || LocalRequest.parse(self.field.stringValue) != nil { self.refresh(poll: true) }
+            }
+        }
 
         // Returns immediately; the walk runs on a thread inside Rust and swaps the new
         // list in when it finishes. An app installed since launch therefore shows up on
@@ -470,14 +506,49 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// Focus is deliberately *not* restored here: the user picked the app they clicked
     /// on, and reactivating whatever they came from would drag them back.
     func windowDidResignKey(_ notification: Notification) {
+        // Quick Look took key, not another application. Going away here would close the
+        // panel behind the preview and lose the query that found the file.
+        guard !previewing else { return }
         dismiss(restoringFocus: false)
+    }
+
+    /// Quick Look went away, by whatever route. The panel takes key back with the query
+    /// and the selection exactly as they were.
+    private func previewClosed() {
+        previewing = false
+        guard isVisible else { return }
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(field)
+    }
+
+    /// ⌘Y. Only a row with something on disk behind it — a calculated value and a clip
+    /// have no file to look at.
+    private func previewSelected() {
+        guard let match = results.selectedMatch, match.kind == .app || match.kind == .file
+        else {
+            NSSound.beep()
+            return
+        }
+        // Raised *before* the preview opens, not after: `toggle` orders Quick Look in and
+        // takes key status before it returns, so a flag set on the way out would arrive
+        // after `windowDidResignKey` had already dismissed the panel. Measured exactly
+        // that way round.
+        previewing = true
+        previewing = preview.toggle(match.path)
     }
 
     /// `restoringFocus` is false when dismissing because the user launched something:
     /// reactivating the app they came from would fight the app they just asked for.
     private func dismiss(restoringFocus: Bool) {
         guard !isDismissing else { return }
+        actionTask?.cancel()
+        contextTask?.cancel()
+        contextTask = nil
+        context = nil
         isDismissing = true
+        pollTask?.cancel()
+        pollTask = nil
+        core.cancelSearch()
         defer { isDismissing = false }
 
         // Faded out when you dismissed it, instant when you launched something: there the app
@@ -540,6 +611,14 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         layoutForResults()
     }
 
+    func refreshContentResults() {
+        let text = field.stringValue
+        guard isVisible, !agentWorking, !text.hasPrefix(">"), !text.hasPrefix(";"),
+            (!text.hasPrefix(":") || text.hasPrefix(":content")),
+            !LauncherContext.isTextCommand(text), core.promptInstruction(for: text) == nil else { return }
+        refresh(poll: true)
+    }
+
     /// Gets out of the way so another window can take key.
     ///
     /// Deliberately not restoring focus: the user asked for the settings window, and
@@ -564,8 +643,17 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         dismiss(restoringFocus: true)
     }
 
+    /// What is in the field. Read by the latency harness and the navigation checks.
+    var query: String { field.stringValue }
+
+    /// Opens settings. Held rather than dispatched through the responder chain — see the
+    /// `kVK_ANSI_Comma` case in `performKeyEquivalent`.
+    var onSettings: (() -> Void)?
+    var onOpenSetting: ((String) -> Void)?
+
     /// True while the agent is generating or running, which is what makes Esc mean "stop".
     private var agentWorking = false
+    private var pollTask: Task<Void, Never>?
 
     /// Set when the next refresh is one whose rows should animate in — a show, or a mode
     /// change — rather than the steady replacement typing does.
@@ -587,22 +675,56 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// left alone rather than re-applied, which would snap the highlight back to the top
     /// under a user who has already started pressing ↓.
     private func refresh(poll: Bool = false) {
+        let interval = Diagnostics.performance.beginInterval("SearchRefresh")
+        defer { Diagnostics.performance.endInterval("SearchRefresh", interval) }
+        pollTask?.cancel()
+        pollTask = nil
         let text = field.stringValue
         let mode = Self.mode(of: text)
-        tabBar.select(mode)
-        layoutPrompt(mode: mode, text: text)
-        styleQuery()
+
+        // None of the chrome can have moved on a poll: the poll path is guarded on the
+        // text being unchanged, and the mode, the prompt and the query's styling are all
+        // derived from it. Doing it anyway forced a layout of the tab bar and a mutation
+        // of the field editor's storage sixteen times a second while the model streamed —
+        // which is what made a generation flicker.
+        if !poll {
+            tabBar.select(mode)
+            layoutPrompt(mode: mode, text: text)
+            styleQuery()
+        }
 
         // An empty field is the welcome screen — suggested apps and recent files — which
         // reverses M2's "nothing until you type". That was right while the only thing an
         // empty query could return was the alphabetical head of the index.
-        let (matches, pending) = core.query(text, limit: Self.resultLimit)
-        tabBar.show(status: Self.status(for: mode, in: matches))
-        agentWorking = pending && text.hasPrefix(">")
+        let contextual = LauncherContext.isTextCommand(text) || core.promptInstruction(for: text) != nil
+        let plan = LocalRequest.parse(text)
+        let effectiveQuery = plan?.query ?? (contextual ? ">" + text : text)
+        var (matches, pending) = core.query(effectiveQuery, limit: Self.resultLimit)
+        if plan == .currentProject {
+            if let url = context?.projectDirectory {
+                matches = [Match(id: 0, name: url.lastPathComponent, kind: .file, path: url.path,
+                    score: 0, timestamp: 0, width: 0, height: 0, detail: "Current folder", highlights: [])]
+            } else {
+                matches = [Match(id: 0, name: "Read current folder", kind: .command, path: "open current project",
+                    score: 0, timestamp: 0, width: 0, height: 0, detail: "Return requests context access", highlights: [])]
+            }
+            pending = false
+        }
+        if plan == .schedule {
+            schedule.onChange = { [weak self] in self?.refresh() }
+            matches = schedule.rows()
+            pending = false
+        }
+        tabBar.show(status: plan?.status ?? Self.status(for: mode, in: matches))
+        agentWorking = pending && effectiveQuery.hasPrefix(">")
         if !(poll && matches == results.matches) {
-            // Rows animate in where rows actually arrive: the panel opening, a change of mode,
-            // and the agent's steps landing one at a time. Typing just replaces the list.
-            let entering = entranceDue || (poll && text.hasPrefix(">"))
+            // Rows animate in where rows actually *arrive*: the panel opening, a change of
+            // mode, and a new step landing. Counting rows rather than asking "is this a
+            // poll in agent mode" — the model streams characters, so the command on the
+            // last row grows on nearly every poll, and the old test replayed the whole
+            // table's fade sixteen times a second. That was the flicker.
+            let arrived = poll && matches.count > results.matches.count
+            let entering = entranceDue || arrived
             entranceDue = false
             results.update(matches, entering: entering)
             layoutForResults()
@@ -613,9 +735,10 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // re-query costs ~0.4ms, so the poll is free next to the ~120ms `mdfind` it is
         // waiting on. Guarded on the text being unchanged so a stale poll cannot
         // overwrite what the user has since typed.
-        if pending {
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(60))
+        if pending || effectiveQuery.hasPrefix(":") {
+            pollTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .milliseconds(pending ? 60 : 2000)) }
+                catch { return }
                 guard let self, self.isVisible, self.field.stringValue == text else { return }
                 self.refresh(poll: true)
             }
@@ -639,34 +762,123 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             performAgent(action, on: match)
             return
         }
-        let hasPath = match.kind == .app || match.kind == .file
-
+        if action == .open { launchSelected(); return }
+        let shortcut: String
         switch action {
-        case .open:
-            launchSelected()
-        case .reveal where hasPath:
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: match.path)])
-            dismiss(restoringFocus: false)
-        case .copyPath where hasPath:
-            // Through `writeOwn`, so the path never lands in clipboard history.
-            watcher.writeOwn { $0.setString(match.path, forType: .string) }
-            dismiss(restoringFocus: true)
-        case .quit where match.kind == .app:
-            // Looked up afresh rather than trusting the hint's snapshot from show time.
-            let target = ActionHint.resolved(match.path)
-            let app = NSWorkspace.shared.runningApplications.first { app in
-                guard let path = app.bundleURL?.path else { return false }
-                return path == match.path || path == target
+        case .reveal: shortcut = "⌘↩"
+        case .copyPath: shortcut = "⌥↩"
+        case .quit: shortcut = "⌃↩"
+        case .open: return
+        }
+        guard let offered = actionRegistry.actions(for: match).first(where: { $0.shortcut == shortcut }) else {
+            NSSound.beep(); return
+        }
+        runAction(offered, on: match)
+    }
+
+    private func showActions() {
+        guard actionTask == nil, let match = results.selectedMatch else { return }
+        actionTarget = match
+        offeredActions = actionRegistry.actions(for: match)
+        let menu = NSMenu(title: "Actions")
+        for (index, action) in offeredActions.enumerated() {
+            let item = NSMenuItem(title: action.label + (action.shortcut.isEmpty ? "" : "  " + action.shortcut),
+                                  action: #selector(runOfferedAction(_:)), keyEquivalent: "")
+            item.tag = index
+            item.target = self
+            menu.addItem(item)
+        }
+        guard !offeredActions.isEmpty else { NSSound.beep(); return }
+        menu.popUp(positioning: menu.items.first, at: NSPoint(x: Theme.gutter, y: 0), in: field)
+    }
+
+    @objc private func runOfferedAction(_ sender: NSMenuItem) {
+        guard let match = actionTarget, offeredActions.indices.contains(sender.tag) else { return }
+        let action = offeredActions[sender.tag]
+        runAction(action, on: match)
+    }
+
+    private func runAction(_ action: ResultAction, on match: Match) {
+        guard actionTask == nil else { return }
+        if let message = action.confirmation {
+            let alert = NSAlert()
+            alert.messageText = message
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: action.label)
+            previewing = true
+            let response = alert.runModal()
+            previewing = false
+            guard response == .alertSecondButtonReturn else { return }
+        }
+        tabBar.show(status: "WORKING…  ⎋ CANCEL")
+        actionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.previewing = action.presentsModal
+            defer {
+                self.actionTask = nil
+                self.previewing = self.preview.isShowing
             }
-            guard let app else {
-                NSSound.beep()
+            do {
+                let effect = try await self.actionRegistry.perform(action, on: match, confirmed: true)
+                guard !Task.isCancelled, self.isVisible else { return }
+                switch effect {
+                case .query(let text):
+                    self.field.stringValue = text
+                    self.field.currentEditor()?.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+                    self.refresh()
+                case .setting(let key):
+                    self.dismiss(restoringFocus: false)
+                    self.onOpenSetting?(key)
+                case .none: self.refresh()
+                case .preview(let path):
+                    self.previewing = true
+                    self.previewing = self.preview.toggle(path)
+                case .dismiss(let restoringFocus): self.dismiss(restoringFocus: restoringFocus)
+                case .localAI(let request, let reference):
+                    self.field.stringValue = ">" + request
+                    self.core.agentSubmit(request, selectedText: reference)
+                    self.refresh()
+                case .message(let title, let body):
+                    self.previewing = true
+                    let alert = NSAlert()
+                    alert.messageText = title
+                    alert.informativeText = body
+                    alert.addButton(withTitle: "Done")
+                    alert.runModal()
+                    self.refresh()
+                case .clipboard(let data, let image, let paste):
+                    self.watcher.writeOwn { pasteboard in
+                        if image {
+                            if let decoded = NSImage(data: data) { pasteboard.writeObjects([decoded]) }
+                        } else {
+                            pasteboard.setString(String(decoding: data, as: UTF8.self), forType: .string)
+                        }
+                    }
+                    let target = self.previousApp
+                    self.dismiss(restoringFocus: true)
+                    if paste, let target {
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(150))
+                            guard !target.isTerminated, AXIsProcessTrusted(),
+                                  NSWorkspace.shared.frontmostApplication?.processIdentifier == target.processIdentifier,
+                                  let down = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: true),
+                                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 9, keyDown: false) else { return }
+                            down.flags = .maskCommand; up.flags = .maskCommand
+                            down.postToPid(target.processIdentifier); up.postToPid(target.processIdentifier)
+                        }
+                    }
+                }
+            } catch is CancellationError {
                 return
+            } catch {
+                guard !Task.isCancelled && self.isVisible else { return }
+                self.previewing = true
+                let alert = NSAlert()
+                alert.messageText = "Action could not finish"
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+                self.refresh()
             }
-            app.terminate()
-            dismiss(restoringFocus: true)
-        case .reveal, .copyPath, .quit:
-            // A clip or a calculated value has no file behind it and no process to quit.
-            NSSound.beep()
         }
     }
 
@@ -678,16 +890,74 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         case (.open, .agentPrompt):
             // Without the mode prefix: the core keys the session to the request it was asked,
             // and it strips `>` before it ever sees one.
-            core.agentSubmit(Self.request(in: field.stringValue))
-            refresh()
+            let request = Self.request(in: field.stringValue)
+            // An explicit `>` is the general local-model prompt. A request such as
+            // `>explain Rust` must remain an ordinary question even though “explain” is
+            // also a contextual text action when typed in the normal launcher mode.
+            guard !field.stringValue.hasPrefix(">"),
+                  LauncherContext.isTextCommand(request) || core.promptInstruction(for: request) != nil else {
+                core.agentSubmit(request)
+                refresh()
+                return
+            }
+            guard actionTask == nil else { return }
+            let query = field.stringValue
+            tabBar.show(status: "READING CONTEXT…  ⎋ CANCEL")
+            actionTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.actionTask = nil }
+                do {
+                    if self.context?.reference(for: request) == nil, let app = self.previousApp {
+                        self.contextTask?.cancel()
+                        let snapshot = await LauncherContext.capture(applicationID: app.bundleIdentifier,
+                            processID: app.processIdentifier, requestAccess: true, request: request)
+                        guard !Task.isCancelled, self.isVisible, self.field.stringValue == query else { return }
+                        self.context = snapshot
+                    }
+                    var reference = self.context?.reference(for: request)
+                    let lower = request.lowercased()
+                    if reference == nil, !lower.contains("copied"), !lower.contains("clipboard"), !lower.contains("page"),
+                       case let .available(url) = self.context?.documentURL, url.isFileURL, FileText.supports(url) {
+                        reference = try await FileText.read(url)
+                    }
+                    guard !Task.isCancelled, self.isVisible, self.field.stringValue == query else { return }
+                    guard let reference else {
+                        self.tabBar.show(status: "CONTEXT UNAVAILABLE · SELECT TEXT OR CHECK PERMISSIONS")
+                        return
+                    }
+                    self.core.agentSubmit(request, selectedText: reference)
+                    self.refresh()
+                } catch {
+                    guard !Task.isCancelled, self.isVisible, self.field.stringValue == query else { return }
+                    self.tabBar.show(status: "DOCUMENT TEXT UNAVAILABLE")
+                }
+            }
         case (.open, .agentStep):
+            // Rename, move and trash change things that already exist, so the plan is spelled out and
+            // confirmed first; creating or listing still runs on Return.
+            let changes = results.matches.filter { match in
+                match.kind == .agentStep && Self.destructivePrefixes.contains { match.name.hasPrefix($0) }
+            }
+            if !changes.isEmpty {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = changes.count == 1 ? "Run this change?" : "Run these \(changes.count) changes?"
+                alert.informativeText = changes.map(\.name).joined(separator: "\n")
+                    + "\n\nNothing is overwritten. Items moved to the Trash can be restored from there."
+                alert.addButton(withTitle: "Run")
+                alert.addButton(withTitle: "Cancel")
+                previewing = true
+                let response = alert.runModal()
+                previewing = false
+                guard response == .alertFirstButtonReturn else { return }
+            }
             core.agentRun()
             refresh()
         case (.open, .agentOk), (.open, .agentFailed):
             // The output, because that is what you came back for; ⌘↩ still copies the command.
-            watcher.writeOwn { $0.setString(match.subtitle, forType: .string) }
+            watcher.copy { $0.setString(match.subtitle, forType: .string) }
         case (.open, .agentAnswer):
-            watcher.writeOwn { $0.setString(match.name, forType: .string) }
+            watcher.copy { $0.setString(match.name, forType: .string) }
         case (.open, .agentRunning):
             // Leave it running: a server never exits, and waiting for it to is not an answer.
             core.agentDetach()
@@ -703,7 +973,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             core.agentChoose(Int(match.id))
             refresh()
         case (.copyPath, _), (.reveal, _):
-            watcher.writeOwn { $0.setString(match.name, forType: .string) }
+            watcher.copy { $0.setString(match.name, forType: .string) }
         default:
             NSSound.beep()
         }
@@ -722,6 +992,10 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         case kVK_ANSI_2: switchMode(to: 1)
         case kVK_ANSI_3: switchMode(to: 2)
         case kVK_ANSI_4: switchMode(to: 3)
+        case kVK_ANSI_Y:
+            previewSelected()
+        case kVK_ANSI_K:
+            showActions()
         case kVK_ANSI_Comma:
             // Handled here rather than left to fall through to the main menu.
             //
@@ -732,9 +1006,14 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             // app actually is. Claiming it explicitly while the panel is key at least makes
             // the one case that *can* work not depend on menu validation finding a target.
             //
-            // `sendAction(to: nil)` walks the responder chain to the app delegate, which is
-            // the only thing that knows about the settings window.
-            NSApp.sendAction(Selector(("openSettings")), to: nil, from: self)
+            // A held callback rather than `NSApp.sendAction(to: nil)`, which walks the
+            // responder chain to find the app delegate and then does nothing at all —
+            // silently, returning false — if the walk comes up empty. That walk begins at
+            // the *key* window, and this panel's key status is the one thing that is not
+            // dependable here: it is a `.nonactivatingPanel`, so blindspot is never the
+            // frontmost application and `NSApp.keyWindow` is not always what you would
+            // expect. A closure the delegate handed over cannot come up empty.
+            onSettings?()
         case kVK_ANSI_M:
             // The model picker, in place of the results. Only in agent mode: everywhere else
             // there is no model to pick.
@@ -764,7 +1043,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         if let computed = matches.first(where: { $0.kind == .tool }), !computed.detail.isEmpty {
             return computed.detail.uppercased()
         }
-        return ""
+        return "ACTIONS ⌘K"
     }
 
     /// Swaps the query's prefix and keeps what was typed after it, so switching mode
@@ -784,62 +1063,60 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     private func launchSelected() {
         guard let match = results.selectedMatch else { return }
 
+        let plan = LocalRequest.parse(field.stringValue)
+        if plan == .currentProject, match.kind == .command {
+            guard actionTask == nil, let app = previousApp else { return }
+            let query = field.stringValue
+            tabBar.show(status: "READING CURRENT FOLDER…  ⎋ CANCEL")
+            actionTask = Task { @MainActor [weak self] in
+                let snapshot = await LauncherContext.capture(applicationID: app.bundleIdentifier,
+                    processID: app.processIdentifier, requestAccess: true)
+                guard let self else { return }
+                defer { self.actionTask = nil }
+                guard !Task.isCancelled, self.isVisible, self.field.stringValue == query else { return }
+                self.context = snapshot
+                self.refresh()
+                if snapshot.projectDirectory == nil { self.tabBar.show(status: "CURRENT FOLDER UNAVAILABLE · CHECK PERMISSIONS") }
+            }
+            return
+        }
+        if case .terminatePort = plan, match.kind == .port {
+            guard let action = actionRegistry.actions(for: match).first(where: {
+                $0.id == ResultActionID(provider: "native.process", operation: "terminate")
+            }) else { NSSound.beep(); return }
+            runAction(action, on: match)
+            return
+        }
+
         switch match.kind {
+        case .command, .setting, .shortcut, .quickLink, .snippet, .system, .prompt, .event:
+            guard let action = actionRegistry.actions(for: match).first else { return }
+            runAction(action, on: match)
+        case .port:
+            guard let action = actionRegistry.actions(for: match).first else { return }
+            runAction(action, on: match)
+
         case .calc, .tool:
+            if let action = actionRegistry.actions(for: match).first {
+                runAction(action, on: match)
+                return
+            }
             // Copy and hand focus back, so the answer can be pasted straight into
             // whatever the user was working in. No `activate`: a calculated row has no
             // stable id, and recording one would put junk in the frecency store.
-            watcher.writeOwn { $0.setString(match.name, forType: .string) }
+            watcher.copy { $0.setString(match.name, forType: .string) }
             dismiss(restoringFocus: true)
 
         case .clipText, .clipImage:
-            // Back onto the pasteboard, then focus returns so ⌘V pastes it. Not pasted
-            // automatically: synthesising ⌘V needs Accessibility permission, a prompt
-            // blindspot has so far never had to show.
-            if let data = core.clipContent(match.id, part: .full) {
-                watcher.writeOwn { pasteboard in
-                    if match.kind == .clipText {
-                        pasteboard.setString(String(decoding: data, as: UTF8.self), forType: .string)
-                    } else if let image = NSImage(data: data) {
-                        // `writeObjects` offers several representations, not just PNG,
-                        // so apps that only accept TIFF still take the paste.
-                        pasteboard.writeObjects([image])
-                    }
-                }
-                core.activate(match.id)
-            }
-            dismiss(restoringFocus: true)
+            guard let action = actionRegistry.actions(for: match).first(where: {
+                $0.id == ResultActionID(provider: "native.clipboard", operation: "copy")
+            }) else { return }
+            runAction(action, on: match)
 
         case .app, .file:
-            core.activate(match.id)
-
-            let configuration = NSWorkspace.OpenConfiguration()
-            configuration.activates = true
-            // Reuse a running copy rather than starting a second one.
-            configuration.createsNewApplicationInstance = false
-
-            let path = match.path
-            let url = URL(fileURLWithPath: path)
-            // Runs off the main thread, so nothing in here may touch AppKit.
-            let report: @Sendable (NSRunningApplication?, (any Error)?) -> Void = { _, error in
-                if let error {
-                    NSLog("blindspot: could not open %@: %@", path, error.localizedDescription)
-                }
-            }
-
-            if match.kind == .app {
-                NSWorkspace.shared.openApplication(
-                    at: url, configuration: configuration, completionHandler: report)
-            } else {
-                // Hands the file to whichever application owns it, rather than treating
-                // the path as a bundle to launch.
-                NSWorkspace.shared.open(
-                    url, configuration: configuration, completionHandler: report)
-            }
-
-            // Dismissed immediately rather than from the completion handler: the open is
-            // asynchronous and the panel should not sit there while Launch Services works.
-            dismiss(restoringFocus: false)
+            guard let action = actionRegistry.actions(for: match).first else { return }
+            if match.id != 0 { core.activate(match.id) }
+            runAction(action, on: match)
 
         case .header, .agentPrompt, .agentStep, .agentBlocked, .agentOk, .agentFailed,
             .agentAnswer, .agentModel, .agentRunning, .agentPast:
@@ -860,6 +1137,19 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             return true
         case #selector(NSResponder.moveDown(_:)):
             results.moveSelection(by: 1)
+            return true
+        // Tab and ⇧Tab do what the arrows do. There is nowhere else for focus to go — the
+        // field is the only thing in the panel that takes it — so the default behaviour
+        // would either put a tab in the query or ring the bell.
+        case #selector(NSResponder.insertTab(_:)):
+            if results.selectedMatch?.kind == .command {
+                launchSelected()
+                return true
+            }
+            results.moveSelection(by: 1)
+            return true
+        case #selector(NSResponder.insertBacktab(_:)):
+            results.moveSelection(by: -1)
             return true
         case #selector(NSResponder.insertNewline(_:)):
             perform(.open)

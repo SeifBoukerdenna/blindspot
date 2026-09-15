@@ -501,30 +501,25 @@ impl Readable {
                 return;
             }
             text.push_str(&String::from_utf8_lossy(&buffer[..read]));
-            text.truncate(MAX_OUTPUT);
+            let mut end = MAX_OUTPUT.min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
         }
     }
 }
 
-/// Appends a line to `~/.local/share/blindspot/agent.log`, best effort.
-///
-/// Every proposal and every run, so there is a record of what the agent did that does not
-/// depend on the panel still being open.
+/// Emits a fixed development event, excluding prompts, commands, paths and output.
 pub fn log(line: &str) {
-    use std::io::Write;
-    let Ok(dir) = crate::store::data_dir() else {
-        return;
-    };
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let stamp = crate::civil::format_iso(crate::relevance::unix_now());
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("agent.log"))
-    {
-        let _ = writeln!(file, "{stamp} {line}");
+    if cfg!(debug_assertions) {
+        let event = match line.split_whitespace().next() {
+            Some("ask") => "request started",
+            Some("proposed") => "plan validated",
+            Some("ran") => "action completed",
+            _ => "agent event",
+        };
+        eprintln!("blindspot: {event}");
     }
 }
 

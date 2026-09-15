@@ -1,0 +1,45 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/Users/malikboukerdenna/blindspot/.codex/hooks/guard-bash.sh'",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/Users/malikboukerdenna/blindspot/.codex/hooks/guard-paths.sh'",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/Users/malikboukerdenna/blindspot/.codex/hooks/rust-check.sh'",
+            "timeout": 120,
+            "statusMessage": "Checking Rust..."
+          },
+          {
+            "type": "command",
+            "command": "bash '/Users/malikboukerdenna/blindspot/.codex/hooks/swift-check.sh'",
+            "timeout": 60,
+            "statusMessage": "Checking Swift..."
+          }
+        ]
+      }
+    ]
+  }
+}

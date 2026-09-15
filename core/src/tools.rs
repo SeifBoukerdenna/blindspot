@@ -34,10 +34,16 @@ type Detector = fn(&str) -> Option<Vec<ToolRow>>;
 /// included, which is the calculator's, so `12 * 34` stays one row rather than three.
 pub fn evaluate(query: &str) -> Vec<ToolRow> {
     let query = query.trim();
-    let detectors: [Detector; 8] = [
+    if query.len()<=4096 && (query.starts_with("https://") || query.starts_with("http://"))
+        && !query.chars().any(char::is_whitespace) {
+        return vec![ToolRow::new(query.to_owned(),"URL · Return to open; actions to copy or extract domain")];
+    }
+    let detectors: [Detector; 10] = [
         epoch,
         now,
         uuid,
+        sha256_tool,
+        json_tool,
         base64_tool,
         url_tool,
         hex_tool,
@@ -132,6 +138,199 @@ fn after_keyword<'a>(query: &'a str, keyword: &str) -> Option<&'a str> {
     let (head, rest) = query.split_once(char::is_whitespace)?;
     let rest = rest.trim();
     (head.eq_ignore_ascii_case(keyword) && !rest.is_empty()).then_some(rest)
+}
+
+// ---------------------------------------------------------------------------
+// Hashing
+// ---------------------------------------------------------------------------
+
+/// `sha256 <text>`: the digest in hex, and in base64.
+///
+/// Both forms, because the two places you meet a SHA-256 want different ones — an image
+/// digest or a checksum is hex, while Kubernetes secrets and subresource integrity are
+/// base64.
+fn sha256_tool(query: &str) -> Option<Vec<ToolRow>> {
+    let payload = after_keyword(query, "sha256")?;
+    let digest = sha256(payload.as_bytes());
+    let hex = digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write;
+            // Writing to a `String` cannot fail; the result is discarded rather than unwrapped.
+            let _ = write!(out, "{byte:02x}");
+            out
+        });
+    Some(vec![
+        ToolRow::new(hex, "SHA-256"),
+        ToolRow::new(base64_encode(&digest), "base64"),
+    ])
+}
+
+/// SHA-256 (FIPS 180-4), by hand.
+///
+/// Hand-rolled for the same reason base64 above is: `sha2` brings five transitive crates
+/// for sixty lines of arithmetic that is fully specified and testable against published
+/// vectors — and CLAUDE.md settled the redb question on exactly that criterion.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+
+    let mut message = data.to_vec();
+    let bits = (data.len() as u64).wrapping_mul(8);
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bits.to_be_bytes());
+
+    for chunk in message.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (word, bytes) in w.iter_mut().zip(chunk.chunks_exact(4)) {
+            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        }
+        for i in 16..64 {
+            let a = w[i - 15];
+            let b = w[i - 2];
+            let s0 = a.rotate_right(7) ^ a.rotate_right(18) ^ (a >> 3);
+            let s1 = b.rotate_right(17) ^ b.rotate_right(19) ^ (b >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut acc] = h;
+        for (round, word) in K.iter().zip(w.iter()) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ (!e & g);
+            let t1 = acc
+                .wrapping_add(s1)
+                .wrapping_add(choose)
+                .wrapping_add(*round)
+                .wrapping_add(*word);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let major = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(major);
+            acc = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, added) in h.iter_mut().zip([a, b, c, d, e, f, g, acc]) {
+            *slot = slot.wrapping_add(added);
+        }
+    }
+
+    let mut out = [0u8; 32];
+    for (bytes, word) in out.chunks_exact_mut(4).zip(h.iter()) {
+        bytes.copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// JSON
+// ---------------------------------------------------------------------------
+
+/// `json <text>`: formatted, then on one line.
+///
+/// Formatted first because that is what you want when you have pasted a log line and cannot
+/// read it. A blob that will not parse still returns a row — saying *where* it stopped is
+/// the useful answer, and falling through to an app search would just look broken.
+fn json_tool(query: &str) -> Option<Vec<ToolRow>> {
+    let payload = after_keyword(query, "json")?;
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => {
+            let pretty = serde_json::to_string_pretty(&value).ok()?;
+            let flat = serde_json::to_string(&value).ok()?;
+            // Short, because a tool row's detail is drawn on a fixed rail beside the
+            // value — it names the form, it is not a place for statistics.
+            Some(vec![
+                ToolRow::new(pretty, "formatted"),
+                ToolRow::new(flat, "one line"),
+            ])
+        }
+        // The payload, so Enter hands back what was given rather than an error message.
+        Err(e) => Some(vec![ToolRow::new(payload, format!("not JSON — {e}"))]),
+    }
 }
 
 /// `b64 <text>`: decoded, when the text is valid base64 of valid UTF-8, then encoded.
@@ -648,6 +847,92 @@ fn human_duration(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_matches_the_published_vectors() {
+        // FIPS 180-4 and the two everyone checks against.
+        let hex = |text: &str| {
+            sha256(text.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex("hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        // Longer than one 64-byte block, so the multi-chunk path is covered too.
+        assert_eq!(
+            hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn sha256_gives_hex_and_base64() {
+        let rows = evaluate("sha256 hello");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].value,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert_eq!(rows[0].detail, "SHA-256");
+        assert_eq!(
+            rows[1].value,
+            "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ="
+        );
+        // A bare keyword is not a request to hash nothing.
+        assert!(evaluate("sha256").is_empty());
+        assert!(evaluate("sha256 ").is_empty());
+    }
+
+    #[test]
+    fn json_formats_then_flattens() {
+        // Deliberately not alphabetical, so a reordering formatter would fail this.
+
+        let rows = evaluate(r#"json {"b":1,"a":[2,3]}"#);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[0].value.contains('\n'),
+            "the first row is the formatted one"
+        );
+        assert_eq!(rows[0].detail, "formatted");
+        // Key order survives: `serde_json`'s `preserve_order` is on precisely so a
+        // formatter cannot quietly sort your config out of the order you wrote it in.
+        assert_eq!(rows[1].value, r#"{"b":1,"a":[2,3]}"#);
+        assert_eq!(rows[1].detail, "one line");
+    }
+
+    #[test]
+    fn json_that_will_not_parse_says_where() {
+        let rows = evaluate("json {oops");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one row, not a fall-through to an app search"
+        );
+        assert_eq!(rows[0].value, "{oops", "Enter hands back what was given");
+        assert!(
+            rows[0].detail.starts_with("not JSON — "),
+            "{:?}",
+            rows[0].detail
+        );
+        assert!(rows[0].detail.contains("line 1"), "{:?}", rows[0].detail);
+    }
+
+    #[test]
+    fn a_scalar_is_still_json() {
+        assert_eq!(evaluate("json 42")[1].value, "42");
+        assert_eq!(evaluate(r#"json "hi""#)[1].value, r#""hi""#);
+    }
 
     fn values(q: &str) -> Vec<String> {
         evaluate(q).into_iter().map(|r| r.value).collect()

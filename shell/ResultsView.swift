@@ -241,8 +241,15 @@ enum ActionHint {
         case .app:
             let quit = isRunning(match.path) ? " · ⌃↩ QUIT" : ""
             return "⌘↩ REVEAL · ⌥↩ PATH" + quit
+        case .port:
+            // Reveal only when `ps` could name the executable; the core leaves the path
+            // empty when it could not, and the row then has nothing to show in Finder.
+            let reveal = match.path.isEmpty ? "" : " · ⌘↩ REVEAL"
+            return "↩ COPY PID" + reveal + " · ⌃↩ STOP"
         case .file:
-            return "⌘↩ REVEAL · ⌥↩ PATH"
+            // Quick Look is advertised on files and not on apps: previewing a bundle shows
+            // you its icon, which you can already see in the row.
+            return "⌘Y LOOK · ⌘↩ REVEAL · ⌥↩ PATH"
         case .agentPrompt:
             return "↩ ASK"
         case .agentStep:
@@ -255,6 +262,14 @@ enum ActionHint {
             return "↩ LEAVE IT · ⎋ STOP"
         case .agentPast:
             return "↩ ASK AGAIN · ⌘↩ COPY"
+        case .command: return "↩ COMPLETE"
+        case .setting: return "↩ OPEN SETTING"
+        case .shortcut: return "↩ SAVE"
+        case .quickLink: return "↩ OPEN"
+        case .snippet: return "↩ PASTE"
+        case .system: return "↩ RUN"
+        case .prompt: return "↩ USE"
+        case .event: return "↩ JOIN OR OPEN"
         case .calc, .tool, .clipText, .clipImage:
             return "↩ COPY"
         // An answer draws its own key line, and a refusal and a model both carry a badge.
@@ -396,6 +411,8 @@ private final class ResultRow: NSView {
         // right edge of the screen. Truncation needs something willing to give way.
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         subtitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        rail.lineBreakMode = .byTruncatingTail
+        rail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         iconView.imageScaling = .scaleProportionallyUpOrDown
 
         badgeLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -426,6 +443,10 @@ private final class ResultRow: NSView {
 
             rail.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Theme.gutter),
             rail.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // Bounded, so a label longer than the rail truncates instead of running under
+            // the value beside it. Measured the ugly way: "formatted · 8 lines" drew
+            // straight through the JSON it was labelling.
+            rail.widthAnchor.constraint(lessThanOrEqualToConstant: Theme.railWidth - 8),
 
             textLeading,
             text.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -609,7 +630,7 @@ private final class ResultRow: NSView {
             // and `select` decides whether those keep their colour.
             iconView.contentTintColor =
                 switch shown?.kind {
-                case .app, .file, .clipImage: nil
+                case .app, .file, .clipImage, .port: nil
                 default: Theme.faint
                 }
             leadWidth.constant = Theme.iconSize
@@ -632,7 +653,7 @@ private final class ResultRow: NSView {
 
     private static func lead(of match: Match) -> Lead {
         switch match.kind {
-        case .app, .file, .clipText, .clipImage, .agentPrompt, .agentPast:
+        case .app, .file, .clipText, .clipImage, .agentPrompt, .agentPast, .port, .command, .setting, .shortcut, .quickLink, .snippet, .system, .prompt, .event:
             .icon
         case .calc:
             .rail("Result")
@@ -672,7 +693,7 @@ private final class ResultRow: NSView {
             // The form is on the rail now, so the second line is only the instant.
             return (match.name, LocalTime.describe(match.timestamp))
         case .tool, .calc:
-            return (match.name, "")
+            return (oneLine(match.name), "")
         case .agentPast, .agentRunning:
             // The core writes these as one sentence — "ran · 2 commands · ~/dev · model",
             // "running… 6s · ↩ leave it running · ⎋ stop". The outcome moves to the right
@@ -687,21 +708,44 @@ private final class ResultRow: NSView {
         case .agentModel:
             // "current · 2.4 GB" marks the model in use; the badge says so instead.
             return (match.name, match.subtitle.replacingOccurrences(of: currentPrefix, with: ""))
-        case .app, .file, .header, .agentPrompt, .agentStep, .agentBlocked, .agentOk,
-            .agentFailed, .agentAnswer:
+        case .app, .file, .port, .command, .setting, .shortcut, .quickLink, .snippet, .system, .prompt, .event, .header, .agentPrompt, .agentStep, .agentBlocked,
+            .agentOk, .agentFailed, .agentAnswer:
             return (match.name, match.subtitle)
         }
+    }
+
+    /// A value with newlines in it, on one line.
+    ///
+    /// Display only — Enter copies `match.name`, so formatted JSON still reaches the
+    /// clipboard formatted. Without this, the row for a pretty-printed blob would be
+    /// titled `{`, which says nothing about which row you are standing on.
+    private static func oneLine(_ text: String) -> String {
+        guard text.contains(where: \.isNewline) else { return text }
+        return text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .joined(separator: " ")
     }
 
     /// `colour` is false for every row but the selected one: a list of grey icons with a
     /// single coloured one in it says which row Enter acts on without a second mark.
     private static func image(for match: Match, colour: Bool) -> NSImage? {
         switch match.kind {
+        case .command: NSImage(systemSymbolName: "terminal", accessibilityDescription: "Command")
+        case .setting: NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Setting")
+        case .shortcut: NSImage(systemSymbolName: "plus.circle", accessibilityDescription: "Save shortcut")
+        case .quickLink: NSImage(systemSymbolName: "link", accessibilityDescription: "Quick link")
+        case .snippet: NSImage(systemSymbolName: "text.quote", accessibilityDescription: "Snippet")
+        case .system: NSImage(systemSymbolName: "power", accessibilityDescription: "System command")
+        case .prompt: NSImage(systemSymbolName: "sparkles", accessibilityDescription: "AI command")
+        case .event: NSImage(systemSymbolName: match.path.hasPrefix("https") ? "video" : "calendar", accessibilityDescription: "Calendar event")
         case .agentPrompt: IconCache.agentPrompt
         case .agentPast: IconCache.agentPast
         case .clipText: IconCache.textClip
         case .clipImage: IconCache.thumbnail(forClip: match.id, colour: colour)
         case .app, .file: IconCache.icon(for: match.path, colour: colour)
+        // A listener whose executable `ps` could not name has nothing to draw.
+        case .port where !match.path.isEmpty:
+            IconCache.icon(for: match.path, colour: colour)
         default: nil
         }
     }

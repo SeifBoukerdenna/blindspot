@@ -68,6 +68,20 @@ impl Ranker {
         limit: usize,
         boost: impl Fn(u64) -> f64,
     ) -> Vec<Ranked> {
+        if entries.len() > 4096 {
+            self.rank_impl::<true>(query, entries, limit, boost)
+        } else {
+            self.rank_impl::<false>(query, entries, limit, boost)
+        }
+    }
+
+    fn rank_impl<const BOUNDED: bool>(
+        &mut self,
+        query: &str,
+        entries: &[AppEntry],
+        limit: usize,
+        boost: impl Fn(u64) -> f64,
+    ) -> Vec<Ranked> {
         if limit == 0 {
             return Vec::new();
         }
@@ -88,23 +102,33 @@ impl Ranker {
         } = self;
 
         candidates.clear();
+        let mut cutoff = None;
         for (index, entry) in entries.iter().enumerate() {
             let haystack = Utf32Str::new(&entry.name, buf);
             if let Some(score) = pattern.score(haystack, matcher) {
                 // `as u32` on a float saturates rather than wrapping, and the boost is
                 // bounded well under 2x, so this cannot overflow into a bogus rank.
                 let blended = (f64::from(score) * boost(entry.id)).round() as u32;
-                candidates.push(Ranked {
+                let candidate = Ranked {
                     index,
                     score: blended,
-                });
+                };
+                if BOUNDED && cutoff.is_some_and(|worst| compare(&candidate, &worst).is_ge()) {
+                    continue;
+                }
+                candidates.push(candidate);
+                if BOUNDED && candidates.len() >= limit.saturating_mul(4) {
+                    candidates.select_nth_unstable_by(limit, compare);
+                    candidates.truncate(limit);
+                    cutoff = candidates.iter().max_by(|a, b| compare(a, b)).copied();
+                }
             }
         }
 
         // A full sort of a few hundred candidates is well inside budget, and it keeps
         // the tie-break honest; a partial select would leave equal scores unordered.
         // Ties fall back to index order, which `Index::replace` made alphabetical.
-        candidates.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.index.cmp(&b.index)));
+        candidates.sort_unstable_by(compare);
         candidates.truncate(limit);
         candidates.clone()
     }
@@ -140,10 +164,33 @@ impl Ranker {
     }
 }
 
+fn compare(a: &Ranked, b: &Ranked) -> std::cmp::Ordering {
+    b.score.cmp(&a.score).then(a.index.cmp(&b.index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn bounded_selection_matches_full_ranking_including_ties() {
+        let entries: Vec<_> = (0..10000)
+            .map(|i| {
+                AppEntry::new(
+                    format!("document-{:05}.txt", i % 200),
+                    PathBuf::from(format!("/fixture/{i}")),
+                )
+            })
+            .collect();
+        let mut ranker = Ranker::new();
+        let all = ranker.rank("doc", &entries, entries.len());
+        let mut bounded = Ranker::new();
+        for limit in [1, 8, 50, 199] {
+            assert_eq!(bounded.rank("doc", &entries, limit), all[..limit]);
+            assert!(bounded.candidates.capacity() < 2048);
+        }
+    }
 
     fn entries(names: &[&str]) -> Vec<AppEntry> {
         names

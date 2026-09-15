@@ -7,7 +7,8 @@
 //! Fetched in the background and cached between panel shows, so opening the panel paints
 //! instantly from the last list and never waits on `mdfind`.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -111,13 +112,13 @@ impl Drop for Done {
 /// `None` if `mdfind` could not run at all, so a failure keeps the last good list rather
 /// than blanking the section.
 fn fetch() -> Option<Vec<AppEntry>> {
-    let output = Command::new("mdfind")
-        .args(["-attr", "kMDItemLastUsedDate", QUERY])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    Some(parse(&String::from_utf8_lossy(&output.stdout)))
+    let output = crate::process_job::capture_prefix(
+        Command::new("/usr/bin/mdfind").args(["-attr", "kMDItemLastUsedDate", QUERY]),
+        &AtomicBool::new(false),
+        8 << 20,
+    )
+    .ok()?;
+    Some(parse(&String::from_utf8_lossy(&output)))
 }
 
 /// Most recent first; system files, anything inside a bundle or a hidden folder, and

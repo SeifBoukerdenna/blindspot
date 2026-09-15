@@ -1,16 +1,22 @@
 # blindspot — Rust core as a static library, thin Swift/AppKit shell.
 #
-# No .xcodeproj on purpose. The product is one binary, an Info.plist and a header;
+# No .xcodeproj on purpose. The product has a launcher, native helpers and an Info.plist;
 # a project file would be a second source of truth for the build settings below.
 
 APP        := Blindspot
 BUNDLE_ID  := com.seifboukerdenna.blindspot
-VERSION    := 0.1.0
+VERSION    := 0.2.8
 
 BUILD      := build
 BUNDLE     := $(BUILD)/$(APP).app
 CONTENTS   := $(BUNDLE)/Contents
 BINARY     := $(CONTENTS)/MacOS/blindspot
+RESOURCE_STAMP := $(CONTENTS)/Resources/.release-resources
+SEMANTIC   := $(CONTENTS)/Helpers/blindspot-semantic
+VECTORS    := $(CONTENTS)/Helpers/blindspot-vectors
+EXTRACT    := $(CONTENTS)/Helpers/blindspot-extract
+VECTOR_DIR := helpers/vector-worker
+VECTOR_SRC := $(shell find $(VECTOR_DIR)/src -name '*.rs')
 
 CORE_DIR   := core
 CORE_LIB   := $(CORE_DIR)/target/release/libblindspot_core.a
@@ -37,16 +43,17 @@ ARCH       := arm64
 SWIFTFLAGS := -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
               -import-objc-header $(HEADER) \
               -framework AppKit -framework Carbon -framework Vision -framework ServiceManagement \
+              -framework Quartz -framework EventKit \
               -L $(CORE_DIR)/target/release -lblindspot_core
 
-.PHONY: all core header app sign run clean test bench bench-shell check
+.PHONY: all core header app sign run clean test test-actions test-content test-semantic test-vectors smoke-panel bench bench-shell check
 
 all: sign
 
 core: $(CORE_LIB)
 
-$(CORE_LIB): $(CORE_SRC) $(CORE_DIR)/Cargo.toml
-	cargo build --release --manifest-path $(CORE_DIR)/Cargo.toml
+$(CORE_LIB): $(CORE_SRC) $(CORE_DIR)/Cargo.toml $(CORE_DIR)/Cargo.lock Makefile
+	MACOSX_DEPLOYMENT_TARGET=$(DEPLOY) cargo build --release --manifest-path $(CORE_DIR)/Cargo.toml
 
 header: $(HEADER)
 
@@ -54,13 +61,37 @@ $(HEADER): $(CORE_DIR)/src/ffi.rs $(CORE_DIR)/cbindgen.toml
 	@mkdir -p include
 	cbindgen --config $(CORE_DIR)/cbindgen.toml --crate blindspot_core --output $@ $(CORE_DIR)
 
-app: $(BINARY)
+app: $(BINARY) $(SEMANTIC) $(VECTORS) $(EXTRACT) $(RESOURCE_STAMP)
 
-$(BINARY): $(SWIFT_SRC) $(CORE_LIB) $(HEADER) shell/Info.plist
+$(VECTORS): $(VECTOR_SRC) $(VECTOR_DIR)/Cargo.toml $(VECTOR_DIR)/Cargo.lock Makefile
+	MACOSX_DEPLOYMENT_TARGET=$(DEPLOY) cargo build --release --locked --manifest-path $(VECTOR_DIR)/Cargo.toml
+	@mkdir -p $(CONTENTS)/Helpers
+	cp $(VECTOR_DIR)/target/release/blindspot-vector-worker $@
+
+$(EXTRACT): helpers/ExtractWorker.swift Makefile
+	@mkdir -p $(CONTENTS)/Helpers
+	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) -parse-as-library \
+	    -framework PDFKit -o $@ helpers/ExtractWorker.swift
+
+$(SEMANTIC): helpers/SemanticWorker.swift Makefile
+	@mkdir -p $(CONTENTS)/Helpers
+	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) -parse-as-library \
+	    -framework NaturalLanguage -o $@ helpers/SemanticWorker.swift
+
+$(BINARY): $(SWIFT_SRC) $(CORE_LIB) $(HEADER) shell/Info.plist Makefile
 	@mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
 	swiftc $(SWIFTFLAGS) -o $@ $(SWIFT_SRC)
 	sed -e 's/@BUNDLE_ID@/$(BUNDLE_ID)/g' -e 's/@VERSION@/$(VERSION)/g' \
 	    shell/Info.plist > $(CONTENTS)/Info.plist
+
+RESOURCE_FILES := $(shell find docs/licenses -type f -print 2>/dev/null)
+$(RESOURCE_STAMP): scripts/package-resources.py core/Cargo.lock helpers/vector-worker/Cargo.lock \
+		docs/new-features.md $(RESOURCE_FILES)
+	python3 scripts/package-resources.py --root . --output $(BUILD)/release-licenses
+	@mkdir -p $(CONTENTS)/Resources/ThirdPartyLicenses
+	cp docs/new-features.md $(CONTENTS)/Resources/README.md
+	cp -R $(BUILD)/release-licenses/. $(CONTENTS)/Resources/ThirdPartyLicenses/
+	@touch $@
 
 # Developer ID, not ad-hoc, since clipboard history. An ad-hoc identity is the binary's
 # hash, which changes on every build. `NSPasteboard.h` documents a pasteboard-access
@@ -72,12 +103,15 @@ $(BINARY): $(SWIFT_SRC) $(CORE_LIB) $(HEADER) shell/Info.plist
 # server on every build: a network call CLAUDE.md rules out, and a build that fails
 # offline. A secure timestamp only matters for notarization, which this is not.
 #
-# No --deep: Apple deprecated it for signing, and there is nothing nested to sign. Not
+# No --deep: sign the nested helpers explicitly before their enclosing bundle. Not
 # conditional on the binary being newer, because a stale signature is a confusing way
 # to fail and a re-sign is cheap.
 SIGN_ID ?= Developer ID Application: seif boukerdenna (VZR89A8Z89)
 
 sign: app
+	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID).extract $(EXTRACT)
+	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID).semantic $(SEMANTIC)
+	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID).vectors $(VECTORS)
 	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID) $(BUNDLE)
 
 run: sign
@@ -86,6 +120,30 @@ run: sign
 
 test:
 	cargo test --manifest-path $(CORE_DIR)/Cargo.toml
+
+test-actions: $(CORE_LIB) $(HEADER)
+	@mkdir -p $(BUILD)
+	swiftc $(SWIFTFLAGS) -o $(BUILD)/action-tests bench/ActionTests.swift shell/Actions.swift shell/Bridge.swift shell/Context.swift shell/LocalRequest.swift shell/Schedule.swift
+	$(BUILD)/action-tests
+
+smoke-panel: $(CORE_LIB) $(HEADER)
+	@mkdir -p $(BUILD)
+	swiftc $(SWIFTFLAGS) -o $(BUILD)/panel-smoke bench/PanelSmoke.swift \
+	    $(filter-out shell/AppDelegate.swift,$(SWIFT_SRC))
+	$(BUILD)/panel-smoke
+
+test-content: $(BUILD)/content-tests
+	$(BUILD)/content-tests
+
+test-semantic: $(SEMANTIC)
+	python3 bench/SemanticWorkerTests.py $(SEMANTIC)
+
+test-vectors: $(VECTORS)
+	python3 bench/VectorWorkerTests.py $(VECTORS)
+
+$(BUILD)/content-tests: bench/ContentWatcherTests.swift shell/ContentWatcher.swift shell/Bridge.swift $(CORE_LIB) $(HEADER)
+	@mkdir -p $(BUILD)
+	swiftc $(SWIFTFLAGS) -o $@ bench/ContentWatcherTests.swift shell/ContentWatcher.swift shell/Bridge.swift
 
 check:
 	cargo clippy --manifest-path $(CORE_DIR)/Cargo.toml --all-targets -- -D warnings

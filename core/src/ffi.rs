@@ -25,6 +25,9 @@ use crate::index::{AppEntry, Index, apps};
 use crate::matching::Ranker;
 use crate::store::Store;
 
+pub(crate) mod process_native;
+pub mod index_native;
+
 /// How often a rescan may actually run.
 ///
 /// The panel asks for one on every show, and a walk of the configured paths costs about
@@ -32,6 +35,15 @@ use crate::store::Store;
 /// is that a newly installed app can take this long to surface. FSEvents is the real
 /// answer to that and belongs at M4.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+struct ClipRetention { clips:Arc<Clips>, count:usize }
+impl PartialEq for ClipRetention {fn eq(&self,other:&Self)->bool {self.count==other.count}}
+impl Eq for ClipRetention {}
+fn retain_clips(request:&ClipRetention,cancel:&AtomicBool)->Result<(),crate::process_job::Failure> {
+    if cancel.load(Ordering::Acquire) {return Err(crate::process_job::Failure::Cancelled);}
+    request.clips.keep(request.count).then_some(()).ok_or(crate::process_job::Failure::Unavailable)
+}
 
 /// Opaque to C. Swift only ever holds a `BsHandle *`.
 pub struct BsHandle {
@@ -69,20 +81,196 @@ pub struct BsHandle {
     last_scan: Mutex<Option<Instant>>,
     frecency: Mutex<Frecency>,
     files: FileSearch,
+    content: crate::content_service::ContentService,
+    content_path: Option<PathBuf>,
+    content_stats: Arc<Mutex<ContentStats>>,
+    content_stats_running: Arc<AtomicBool>,
+    resource_sample: Mutex<ResourceSample>,
+    ports: crate::ports::PortSearch,
     /// Whose top-level folders `?` lists directly. Held rather than read from `$HOME` on
     /// each query so tests can point it somewhere controlled — otherwise their results
     /// depend on whatever is in the home folder of whoever runs them.
     home: Option<PathBuf>,
     /// `None` only if even an in-memory store could not be created. Clipboard history is
     /// then unavailable, and everything else carries on.
-    clips: Option<Clips>,
+    clips: Option<Arc<Clips>>,
+    clip_retention: crate::process_job::Latest<ClipRetention, ()>,
     /// `None` if the store could not be opened. Frecency then works for the session and
     /// is forgotten at exit, which is a far better failure than refusing to launch.
     store: Option<Arc<Store>>,
     /// `None` when `agent.enabled` is false, which is the only state in which blindspot
     /// opens no socket at all.
     agent: Option<crate::agent::session::Session>,
+    shortcuts: crate::shortcuts::Library,
 }
+
+#[derive(Clone, Default)]
+struct ContentStats {
+    database_bytes: Option<u64>,
+    wal_bytes: Option<u64>,
+    shm_bytes: Option<u64>,
+    vector_catalog_bytes: Option<u64>,
+    documents: Option<u64>,
+    embeddings: Option<u64>,
+    extraction_counts: Option<[u64; 4]>,
+    extracted: Option<u64>,
+    semantic_eligible: Option<u64>,
+    semantic_current: Option<u64>,
+    taken: Option<Instant>,
+    reclaimable_bytes: Option<u64>,
+    kinds: Vec<(String, u64, u64)>,
+    folders: Vec<(String, u64, u64)>,
+    attention: Vec<(String, u8)>,
+    recent: Vec<(String, i64)>,
+    sampled: bool,
+}
+
+#[derive(Default)]
+struct ResourceSample {
+    taken: Option<Instant>,
+    cpu: std::collections::HashMap<u32, u64>,
+    line: String,
+    rows: Vec<(String, u64, Option<f64>)>,
+}
+
+#[derive(Default)]
+struct Inventory {
+    kinds: Vec<(String, u64, u64)>,
+    folders: Vec<(String, u64, u64)>,
+    attention: Vec<(String, u8)>,
+    recent: Vec<(String, i64)>,
+}
+
+/// What the index holds, for the Index page: documents by kind and by top-level folder under each
+/// root, documents whose text could not be extracted, and the most recently modified. One
+/// read-only pass over paths and sizes (never bodies), bounded by the sampler's deadline.
+fn inventory(connection: &rusqlite::Connection, roots: &[String]) -> Inventory {
+    const KINDS: &[(&str, &[&str])] = &[
+        ("Notes & text", &["txt", "md", "markdown", "rst"]),
+        ("PDF & Word documents", &["pdf", "docx", "doc", "rtf", "odt"]),
+        ("Code", &["rs", "swift", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "hpp", "rb", "sh", "sql"]),
+        ("Data & config", &["json", "toml", "yaml", "yml", "csv", "tsv", "xml"]),
+        ("Web pages & styles", &["html", "css"]),
+    ];
+    let mut inventory = Inventory::default();
+    let Ok(mut statement) = connection.prepare("SELECT path,bytes,extraction,modified_ns FROM documents") else { return inventory; };
+    let Ok(mut rows) = statement.query([]) else { return inventory; };
+    let mut kinds = vec![(0u64, 0u64); KINDS.len() + 1];
+    let mut folders = std::collections::HashMap::<String, (u64, u64)>::new();
+    let mut recent: Vec<(i64, String)> = Vec::new();
+    while let Ok(Some(row)) = rows.next() {
+        let (Ok(path), Ok(bytes), Ok(extraction), Ok(modified)) =
+            (row.get::<_, String>(0), row.get::<_, i64>(1), row.get::<_, i64>(2), row.get::<_, i64>(3)) else { continue; };
+        let bytes = u64::try_from(bytes).unwrap_or(0);
+        let extension = std::path::Path::new(&path).extension().and_then(|value| value.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+        let kind = KINDS.iter().position(|(_, extensions)| extensions.contains(&extension.as_str())).unwrap_or(KINDS.len());
+        if let Some(slot) = kinds.get_mut(kind) {
+            slot.0 += 1;
+            slot.1 += bytes;
+        }
+        let root = roots.iter()
+            .filter(|root| path.starts_with(root.as_str()) && path.as_bytes().get(root.len()) == Some(&b'/'))
+            .max_by_key(|root| root.len());
+        if let Some(root) = root && let Some(rest) = path.get(root.len() + 1..) {
+            let folder = match rest.split_once('/') { Some((first, _)) => format!("{root}/{first}"), None => root.clone() };
+            let entry = folders.entry(folder).or_default();
+            entry.0 += 1;
+            entry.1 += bytes;
+        }
+        if let Ok(status @ 2..=5) = u8::try_from(extraction) && inventory.attention.len() < 20 {
+            inventory.attention.push((path.clone(), status));
+        }
+        recent.push((modified, path));
+        if recent.len() >= 256 {
+            recent.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+            recent.truncate(8);
+        }
+    }
+    recent.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+    recent.truncate(8);
+    inventory.recent = recent.into_iter().map(|(modified, path)| (path, modified)).collect();
+    inventory.kinds = kinds.into_iter().enumerate().filter(|(_, (count, _))| *count > 0)
+        .map(|(index, (count, bytes))| (KINDS.get(index).map_or("Other", |(label, _)| label).to_owned(), count, bytes)).collect();
+    inventory.kinds.sort_by_key(|kind| std::cmp::Reverse(kind.1));
+    let mut folders: Vec<_> = folders.into_iter().map(|(path, (count, bytes))| (path, count, bytes)).collect();
+    folders.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    folders.truncate(10);
+    inventory.folders = folders;
+    inventory
+}
+
+/// Structured state for the Index page. The shell formats numbers, sizes and times; the core
+/// decides what each count means, so the page cannot drift from the indexer.
+fn content_overview(handle: &BsHandle, config: &Config, snapshot: &crate::content_service::Snapshot, stats: &ContentStats) -> serde_json::Value {
+    use crate::content_service::Phase;
+    use serde_json::json;
+    let state = match snapshot.phase {
+        Phase::Disabled => "off",
+        Phase::NeedsRoots => "needsRoots",
+        Phase::Paused => "paused",
+        Phase::Indexing => "indexing",
+        Phase::Ready => "ready",
+        Phase::Partial => "partial",
+        Phase::Failed => "failed",
+        Phase::Erasing => "erasing",
+        Phase::Erased => "erased",
+        Phase::EraseFailed => "eraseFailed",
+        Phase::Compacting => "compacting",
+    };
+    let elapsed = |time: std::time::SystemTime| time.elapsed().ok().map(|duration| duration.as_secs());
+    let named = |path: &str| {
+        let path = std::path::Path::new(path);
+        (path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |name| name.to_string_lossy().into_owned()),
+            path.parent().map_or_else(String::new, short_path))
+    };
+    let progress = &snapshot.progress;
+    let semantic = snapshot.semantic_progress.as_ref();
+    let database = [stats.database_bytes, stats.wal_bytes, stats.shm_bytes].into_iter().flatten().sum::<u64>();
+    let mut overview = serde_json::Map::new();
+    let mut put = |key: &str, value: serde_json::Value| { overview.insert(key.to_owned(), value); };
+    put("state", json!(state));
+    put("stage", json!(snapshot.stage));
+    put("compact", json!(snapshot.last_compact.map(|report| json!({"before": report.before_bytes, "after": report.after_bytes, "removed": report.removed_vectors}))));
+    put("compactError", json!(snapshot.compact_error));
+    put("reclaimable", json!(stats.reclaimable_bytes));
+    put("message", json!(handle.content.status()));
+    put("stageSeconds", json!(snapshot.pass_started.filter(|_| snapshot.phase == Phase::Indexing).and_then(elapsed)));
+    put("lastPassAgo", json!(snapshot.last_pass.and_then(|(finished, _)| elapsed(finished))));
+    put("lastPassSeconds", json!(snapshot.last_pass.map(|(_, took)| took.as_secs_f64())));
+    put("currentFolder", json!(snapshot.current_path.as_deref().map(short_path)));
+    put("pass", json!({"checked": progress.visited, "updated": progress.indexed, "sourceBytes": progress.indexed_bytes,
+        "unchanged": progress.unchanged, "skipped": progress.skipped, "unreadable": progress.failed, "removed": progress.removed}));
+    put("roots", json!(handle.content.watched_roots().iter().map(|root| short_path(std::path::Path::new(root))).collect::<Vec<_>>()));
+    put("semantic", json!({"enabled": config.content.semantic, "embedded": stats.semantic_current, "eligible": stats.semantic_eligible,
+        "passEmbedded": semantic.map(|progress| progress.written), "passFailed": semantic.map(|progress| progress.failed)}));
+    put("documents", json!(stats.documents));
+    put("pdfText", json!(stats.extracted));
+    put("pdfIssues", json!(stats.extraction_counts));
+    put("disk", json!({"database": database, "cache": stats.vector_catalog_bytes}));
+    put("processes", json!(handle.resource_rows().into_iter()
+        .map(|(name, memory, cpu)| json!({"name": name, "memory": memory, "cpu": cpu})).collect::<Vec<_>>()));
+    put("pacing", json!({"lowImpact": config.content.low_impact, "battery": config.content.on_battery,
+        "documents": config.content.documents, "documentLimitMB": config.content.max_document_mb}));
+    put("busy", json!(handle.content.busy_folders().into_iter()
+        .map(|(path, changes)| json!({"folder": short_path(&path), "path": path.to_string_lossy(), "changes": changes})).collect::<Vec<_>>()));
+    put("sampled", json!(stats.sampled));
+    put("sampleAgo", json!(stats.taken.map(|taken| taken.elapsed().as_secs())));
+    put("kinds", json!(stats.kinds.iter()
+        .map(|(label, count, bytes)| json!({"label": label, "count": count, "bytes": bytes})).collect::<Vec<_>>()));
+    put("folders", json!(stats.folders.iter()
+        .map(|(path, count, bytes)| json!({"folder": short_path(std::path::Path::new(path)), "path": path, "count": count, "bytes": bytes})).collect::<Vec<_>>()));
+    put("attention", json!(stats.attention.iter().map(|(path, status)| {
+        let (name, folder) = named(path);
+        let reason = match status { 2 => "No text — scanned or image-only", 3 => "Locked", 4 => "Over the size limit", _ => "Unreadable" };
+        json!({"name": name, "folder": folder, "path": path, "reason": reason})
+    }).collect::<Vec<_>>()));
+    put("recent", json!(stats.recent.iter().map(|(path, modified)| {
+        let (name, folder) = named(path);
+        json!({"name": name, "folder": folder, "path": path, "modified": modified / 1_000_000_000})
+    }).collect::<Vec<_>>()));
+    serde_json::Value::Object(overview)
+}
+
 
 /// A [`BsResult`] that is an application bundle.
 pub const BS_KIND_APP: u8 = 0;
@@ -121,6 +309,24 @@ pub const BS_KIND_AGENT_PAST: u8 = 15;
 /// `id` is its index for [`bs_agent_choose`].
 pub const BS_KIND_AGENT_MODEL: u8 = 13;
 
+/// A [`BsResult`] that is a process listening on the port you asked about. `id` is its
+/// pid, `path` its executable, and `detail` the pid and address it is bound to. Enter
+/// copies the pid; ⌃↩ asks it to stop.
+pub const BS_KIND_PORT: u8 = 16;
+/// A registered command whose path carries the query to complete.
+pub const BS_KIND_COMMAND: u8 = 17;
+/// A setting whose path carries its schema key.
+pub const BS_KIND_SETTING: u8 = 18;
+/// A `:link` / `:snippet` command that saves or removes a shortcut when run; `path` is the command.
+pub const BS_KIND_SHORTCUT: u8 = 19;
+/// A saved quick link; `path` is the URL, or the template when no search text was typed.
+pub const BS_KIND_LINK: u8 = 20;
+/// A saved text snippet; `path` is its text.
+pub const BS_KIND_SNIPPET: u8 = 21;
+/// A macOS system command; `path` is its identifier in [`crate::system::COMMANDS`].
+pub const BS_KIND_SYSTEM: u8 = 22;
+/// An AI command for selected text; `path` is what to type to run it.
+pub const BS_KIND_PROMPT: u8 = 23;
 /// A [`BsResult`] that is a section title on the welcome screen — "Suggested", "Recent
 /// files". Not selectable; `name` is the title and everything else is empty.
 pub const BS_KIND_HEADER: u8 = 6;
@@ -142,6 +348,8 @@ pub const BS_CLIP_THUMBNAIL: u8 = 1;
 #[repr(C)]
 pub struct BsResult {
     pub id: u64,
+    pub process_pid: u32,
+    pub network_port: u16,
     pub name: *const u8,
     pub name_len: usize,
     pub path: *const u8,
@@ -283,12 +491,81 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn content_stats(path: Option<&PathBuf>, roots: &[String]) -> ContentStats {
+    let Some(path) = path else { return ContentStats::default(); };
+    let size = |suffix: &str| std::fs::metadata(PathBuf::from(format!("{}{}", path.display(), suffix))).ok().map(|m| m.len());
+    let database_bytes = std::fs::metadata(path).ok().map(|m| m.len());
+    let wal_bytes = size("-wal");
+    let shm_bytes = size("-shm");
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    ).or_else(|_| rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)).ok();
+    let Some(connection) = connection else {
+        return ContentStats { database_bytes, wal_bytes, shm_bytes, taken: Some(Instant::now()), sampled: true, ..Default::default() };
+    };
+    let _ = connection.busy_timeout(Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let _ = connection.progress_handler(1000, Some(move || Instant::now() >= deadline));
+    let scalar = |sql: &str| connection.query_row(sql, [], |row| row.get::<_, i64>(0)).ok().and_then(|value| u64::try_from(value).ok());
+    let mut extraction_counts = [0; 4];
+    let mut extraction_ok = false;
+    if let Ok(mut statement) = connection.prepare("SELECT extraction,count(*) FROM documents WHERE extraction BETWEEN 2 AND 5 GROUP BY extraction")
+        && let Ok(mut rows) = statement.query([]) {
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let (Ok(kind), Ok(count)) = (row.get::<_, i64>(0), row.get::<_, i64>(1)) else { break; };
+                    let (Ok(index), Ok(count)) = (usize::try_from(kind - 2), u64::try_from(count)) else { break; };
+                    if index >= extraction_counts.len() { break; }
+                    extraction_counts[index] = count;
+                }
+                Ok(None) => { extraction_ok = true; break; }
+                Err(_) => break,
+            }
+        }
+    }
+    let inventory = inventory(&connection, roots);
+    ContentStats {
+        database_bytes,
+        wal_bytes,
+        shm_bytes,
+        vector_catalog_bytes: scalar("SELECT COALESCE(sum(bytes),0) FROM vector_shards"),
+        documents: scalar("SELECT count(*) FROM documents"),
+        embeddings: scalar("SELECT count(*) FROM embeddings"),
+        extraction_counts: extraction_ok.then_some(extraction_counts),
+        extracted: scalar("SELECT count(*) FROM documents WHERE extraction=1"),
+        semantic_eligible: scalar(&format!("SELECT count(*) FROM documents d WHERE {}", crate::content::SEMANTIC_ELIGIBLE)),
+        semantic_current: scalar(&format!("SELECT count(*) FROM documents d WHERE {} AND EXISTS(SELECT 1 FROM embeddings e WHERE e.document_id=d.id AND e.revision=d.revision AND e.model GLOB '[[]\"apple-contextual-en\",*')", crate::content::SEMANTIC_ELIGIBLE)),
+        taken: Some(Instant::now()),
+        reclaimable_bytes: reclaimable(&connection),
+        kinds: inventory.kinds,
+        folders: inventory.folders,
+        attention: inventory.attention,
+        recent: inventory.recent,
+        sampled: true,
+    }
+}
+
+fn spawn_content_stats(path: Option<PathBuf>, roots: Vec<String>, slot: Arc<Mutex<ContentStats>>, running: Arc<AtomicBool>) {
+    if running.swap(true, Ordering::AcqRel) { return; }
+    let worker_running = Arc::clone(&running);
+    let result = std::thread::Builder::new().name("blindspot-content-stats".to_owned()).spawn(move || {
+        let sample = content_stats(path.as_ref(), &roots);
+        match slot.lock() {
+            Ok(mut guard) => *guard = sample,
+            Err(poisoned) => *poisoned.into_inner() = sample,
+        }
+        worker_running.store(false, Ordering::Release);
+    });
+    if result.is_err() { running.store(false, Ordering::Release); }
+}
+
 impl BsSetting {
     /// A row that only reports. No source and no bounds, because nothing set it.
     fn reading(key: &str, label: &str, help: &str, value: &str) -> Self {
         let (key, key_len) = leak_bytes(key.as_bytes());
-        let (section, section_len) =
-            leak_bytes(crate::settings::Section::Status.name().as_bytes());
+        let (section, section_len) = leak_bytes(crate::settings::Section::Status.name().as_bytes());
         let (label, label_len) = leak_bytes(label.as_bytes());
         let (help, help_len) = leak_bytes(help.as_bytes());
         let (value, value_len) = leak_bytes(value.as_bytes());
@@ -468,6 +745,319 @@ pub unsafe extern "C" fn bs_query(
         .unwrap_or_else(|_| BsResults::empty())
 }
 
+/// Cancels transient searches when the panel closes.
+///
+/// # Safety
+/// `handle` must be NULL or a live pointer from `bs_init`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_search_cancel(handle: *mut BsHandle) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: the caller retains the live allocation throughout this call.
+    let handle = unsafe { &*handle };
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        handle.files.cancel();
+        handle.content.cancel_search();
+        handle.ports.cancel();
+        if let Some(agent) = &handle.agent {
+            agent.cancel();
+        }
+    }));
+}
+
+/// Queues a coalesced content reconciliation without waiting for disk work.
+/// # Safety
+/// `handle` must be NULL or a live pointer from `bs_init` retained for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_refresh(handle: *mut BsHandle) {
+    if handle.is_null() {return;}
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle=unsafe {&*handle};
+    let _=catch_unwind(AssertUnwindSafe(||handle.content.refresh()));
+}
+
+/// Reconciles affected configured roots; invalid or oversized input requests a full scan.
+/// # Safety
+/// `handle` must be live and retained. `paths` must point to `len` readable bytes when non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_refresh_paths(handle: *mut BsHandle, paths: *const u8, len: usize) {
+    if handle.is_null() { return; }
+    // SAFETY: the caller retains the handle for this call.
+    let handle = unsafe { &*handle };
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if paths.is_null() || len > 64 * 1024 { handle.content.refresh(); return; }
+        // SAFETY: the caller supplies len readable bytes and the size is bounded above.
+        let bytes = unsafe { std::slice::from_raw_parts(paths, len) };
+        match serde_json::from_slice::<Vec<std::path::PathBuf>>(bytes) {
+            Ok(paths) => handle.content.refresh_paths(paths),
+            Err(_) => handle.content.refresh(),
+        }
+    }));
+}
+
+/// Applies the shell's power/thermal policy without waiting for the index worker.
+/// # Safety
+/// `handle` must be NULL or a live pointer from `bs_init` retained for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_pause(handle: *mut BsHandle, paused: bool, reason: u8) {
+    if handle.is_null() {return;}
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle=unsafe {&*handle};
+    let _=catch_unwind(AssertUnwindSafe(||handle.content.set_paused(paused, reason)));
+}
+
+/// Erases indexed content after explicit confirmation and disabling indexing.
+/// Returns an empty blob when queued, otherwise a refusal; free with `bs_free_blob`.
+/// # Safety
+/// `handle` must be NULL or a live pointer retained for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_erase(handle: *mut BsHandle, confirmed: bool) -> BsBlob {
+    if handle.is_null() { return leak_blob(b"Content index unavailable"); }
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle = unsafe { &*handle };
+    catch_unwind(AssertUnwindSafe(|| {
+        if !confirmed { return leak_blob(b"Erasing indexed content requires confirmation"); }
+        match handle.content.erase() {
+            Ok(()) => leak_blob(b""),
+            Err(why) => leak_blob(why.as_bytes()),
+        }
+    })).unwrap_or_else(|_| leak_blob(b"Content erasure unavailable"))
+}
+
+/// Stops erasure between transactions; already removed records stay removed.
+/// # Safety
+/// `handle` must be NULL or a live pointer retained for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_erase_cancel(handle: *mut BsHandle) {
+    if handle.is_null() { return; }
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle = unsafe { &*handle };
+    let _ = catch_unwind(AssertUnwindSafe(|| handle.content.cancel_erase()));
+}
+
+/// Returns bounded JSON configuration/status; free it with `bs_free_blob`.
+/// # Safety
+/// `handle` must be NULL or a live pointer from `bs_init` retained for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_state(handle: *mut BsHandle) -> BsBlob {
+    if handle.is_null() {return leak_blob(b"");}
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle=unsafe {&*handle};
+    catch_unwind(AssertUnwindSafe(|| {
+        let config=handle.config();let snapshot=handle.content.snapshot();
+        let stats = match handle.content_stats.lock() { Ok(guard) => guard.clone(), Err(poisoned) => poisoned.into_inner().clone() };
+        // Counts need SQL over the whole index, so they refresh in the background at most every 15 s;
+        // live pass counters come from the snapshot instead.
+        if stats.taken.is_none_or(|taken| taken.elapsed() > Duration::from_secs(15)) {
+            spawn_content_stats(handle.content_path.clone(), handle.content.watched_roots(), Arc::clone(&handle.content_stats), Arc::clone(&handle.content_stats_running));
+        }
+        let overview = content_overview(handle, &config, &snapshot, &stats);
+        let roots:Vec<_>=config.content.roots.iter().take(32).filter(|path|path.len()<=4096).collect();
+        let progress=&snapshot.progress;
+        let current_path=snapshot.current_path.as_ref().map(|path| short_path(path));
+        let state=serde_json::json!({"enabled":config.content.enabled,"onBattery":config.content.on_battery,"roots":roots,
+            "watchRoots":handle.content.watched_roots(),"indexing":snapshot.phase==crate::content_service::Phase::Indexing,"status":handle.content.status(),
+            "phase":format!("{:?}",snapshot.phase),"visited":progress.visited,"indexed":progress.indexed,
+            "indexedBytes":progress.indexed_bytes,"unchanged":progress.unchanged,"skipped":progress.skipped,"failed":progress.failed,"removed":progress.removed,
+            "currentPath":current_path,
+            "databaseBytes":stats.database_bytes,"walBytes":stats.wal_bytes,"shmBytes":stats.shm_bytes,
+            "vectorCatalogBytes":stats.vector_catalog_bytes,
+            "documents":stats.documents,"embeddings":stats.embeddings,"statsSampled":stats.sampled,
+            "extractionCounts":stats.extraction_counts,"overview":overview,
+            "erasing":handle.content.erasing(),"erased":snapshot.phase==crate::content_service::Phase::Erased,"eraseFailed":snapshot.phase==crate::content_service::Phase::EraseFailed});
+        match serde_json::to_vec(&state) {Ok(bytes)=>leak_blob(&bytes),Err(_)=>leak_blob(b"")}
+    })).unwrap_or_else(|_|leak_blob(b""))
+}
+
+/// Maps launcher file filters onto the content index. `used:` needs Spotlight's last-opened date,
+/// which the index does not store, so it is refused rather than silently ignored.
+fn content_filter(query: &crate::query::FileQuery) -> Result<crate::content::SearchFilter, &'static str> {
+    use crate::query::{AgeFilter, Comparison, FileKind};
+    const NOTES: &[&str] = &["txt", "md", "markdown", "rst"];
+    const WORD: &[&str] = &["docx", "doc", "rtf", "odt"];
+    const CODE: &[&str] = &["rs", "swift", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "hpp", "rb", "sh", "sql"];
+    let mut filter = crate::content::SearchFilter::default();
+    if query.used.is_some() {
+        return Err("used: is not available for content search; use modified:");
+    }
+    match &query.kind {
+        None => {}
+        Some(FileKind::Extension(extension)) => {
+            let list = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
+            filter.extensions = match extension.to_ascii_lowercase().as_str() {
+                "document" | "documents" | "docs" => [list(&["pdf"]), list(WORD), list(NOTES)].concat(),
+                "note" | "notes" | "text" => list(NOTES),
+                "word" => list(WORD),
+                "code" => list(CODE),
+                other => vec![other.to_owned()],
+            };
+        }
+        Some(_) => return Err("kind: in content search takes an extension, documents, notes, word or code"),
+    }
+    if let Some(size) = query.size {
+        match size.comparison {
+            Comparison::Greater => filter.min_bytes = Some(size.bytes.saturating_add(1)),
+            Comparison::AtLeast => filter.min_bytes = Some(size.bytes),
+            Comparison::Less => filter.max_bytes = Some(size.bytes.saturating_sub(1)),
+            Comparison::AtMost => filter.max_bytes = Some(size.bytes),
+            Comparison::Equal => { filter.min_bytes = Some(size.bytes); filter.max_bytes = Some(size.bytes); }
+        }
+    }
+    if let Some(age) = query.modified {
+        const DAY: i64 = 86_400;
+        let midnight = local_midnight(i64::try_from(unix_now()).unwrap_or(i64::MAX));
+        let ns = |seconds: i64| seconds.saturating_mul(1_000_000_000);
+        match age {
+            AgeFilter::Today => filter.modified_after_ns = Some(ns(midnight)),
+            AgeFilter::Yesterday => { filter.modified_after_ns = Some(ns(midnight - DAY)); filter.modified_before_ns = Some(ns(midnight)); }
+            AgeFilter::WithinDays(days) => filter.modified_after_ns = Some(ns(midnight - DAY * i64::from(days))),
+            AgeFilter::OlderThanDays(days) => filter.modified_before_ns = Some(ns(midnight - DAY * i64::from(days))),
+        }
+    }
+    Ok(filter)
+}
+
+/// Local midnight, matching Spotlight's `$time.today` so `modified:today` means the same thing in
+/// file search and content search.
+fn local_midnight(now: i64) -> i64 {
+    let fallback = now - now.rem_euclid(86_400);
+    let time: libc::time_t = now;
+    // SAFETY: an all-zero `tm` is valid plain data (its zone pointer is NULL); localtime_r overwrites it.
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers refer to live locals for the duration of the call.
+    if unsafe { libc::localtime_r(&time, &mut parts) }.is_null() {
+        return fallback;
+    }
+    parts.tm_hour = 0;
+    parts.tm_min = 0;
+    parts.tm_sec = 0;
+    parts.tm_isdst = -1;
+    // SAFETY: `parts` was filled by localtime_r and adjusted in place; mktime normalizes it.
+    let midnight = unsafe { libc::mktime(&mut parts) };
+    if midnight < 0 { fallback } else { midnight }
+}
+
+fn one_line(text: &str, limit: usize) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= limit { joined } else { format!("{}…", joined.chars().take(limit).collect::<String>()) }
+}
+
+fn link_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    format!("Quick link · {}", rest.split(['/', '?', '#']).next().unwrap_or(rest))
+}
+
+fn reclaimable(connection: &rusqlite::Connection) -> Option<u64> {
+    let free: i64 = connection.query_row("SELECT page_size*freelist_count FROM pragma_page_size(), pragma_freelist_count()", [], |row| row.get(0)).ok()?;
+    let vectors: i64 = connection.query_row(
+        &format!("SELECT coalesce(sum(length(vector)),0) FROM embeddings WHERE model NOT GLOB '[[]\"{}\",*'", crate::semantic::MODEL_IDENTIFIER),
+        [], |row| row.get(0)).ok()?;
+    u64::try_from(free.saturating_add(vectors)).ok()
+}
+
+/// Checks an FSEvents path against the configured scope without accessing the filesystem.
+/// # Safety
+/// `handle` must be NULL or a live retained handle; `path` must be NULL or a valid terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_event_relevant(handle:*mut BsHandle,path:*const c_char)->bool {
+    if handle.is_null() {return false;}
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle=unsafe {&*handle};
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: path follows this entry point's terminated-string contract.
+        let Some(path)=(unsafe {cstr_to_string(path)}).filter(|path|path.len()<=4096) else {return false;};
+        handle.content.event_relevant(std::path::Path::new(&path))
+    })).unwrap_or(false)
+}
+
+/// Runs a `:link` / `:snippet` / `:unlink` / `:unsnippet` command. Returns an empty blob on success
+/// or the reason it was refused; free it with `bs_free_blob`.
+/// # Safety
+/// `handle` must be NULL or a live pointer from `bs_init`; `command` must be NULL or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_shortcut_apply(handle: *mut BsHandle, command: *const c_char) -> BsBlob {
+    if handle.is_null() {
+        return leak_blob(b"Blindspot is not ready");
+    }
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle = unsafe { &*handle };
+    // SAFETY: `command` follows this entry point's terminated-string contract.
+    let command = unsafe { cstr_to_string(command) }.unwrap_or_default();
+    catch_unwind(AssertUnwindSafe(|| {
+        use crate::shortcuts::Command;
+        let found = |removed: bool, missing: &'static str| if removed { Ok(()) } else { Err(missing) };
+        let outcome = match crate::shortcuts::parse(&command) {
+            Some(Command::SaveLink { keyword, url }) => handle.shortcuts.save_link(keyword, url),
+            Some(Command::SaveSnippet { keyword, text }) => handle.shortcuts.save_snippet(keyword, &text),
+            Some(Command::RemoveLink(keyword)) => handle.shortcuts.remove_link(keyword).and_then(|removed| found(removed, "No quick link with that keyword")),
+            Some(Command::RemoveSnippet(keyword)) => handle.shortcuts.remove_snippet(keyword).and_then(|removed| found(removed, "No snippet with that keyword")),
+            Some(Command::SavePrompt { keyword, text }) => handle.shortcuts.save_prompt(keyword, &text),
+            Some(Command::RemovePrompt(keyword)) => handle.shortcuts.remove_prompt(keyword).and_then(|removed| found(removed, "No saved AI command with that keyword")),
+            Some(Command::ListLinks(_) | Command::ListSnippets(_) | Command::ListPrompts(_)) | None => Err("Not a shortcut command"),
+        };
+        leak_blob(outcome.err().unwrap_or("").as_bytes())
+    }))
+    .unwrap_or_else(|_| leak_blob(b"The shortcut could not be saved"))
+}
+
+/// Saves `len` bytes of UTF-8 `text` as snippet `keyword`. Returns an empty blob on success or the
+/// reason it was refused; free it with `bs_free_blob`.
+/// # Safety
+/// `handle` must be NULL or live; `keyword` NULL or NUL-terminated; `text` NULL or valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_snippet_save(handle: *mut BsHandle, keyword: *const c_char, text: *const u8, len: usize) -> BsBlob {
+    if handle.is_null() {
+        return leak_blob(b"Blindspot is not ready");
+    }
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle = unsafe { &*handle };
+    // SAFETY: `keyword` follows this entry point's terminated-string contract.
+    let keyword = unsafe { cstr_to_string(keyword) }.unwrap_or_default();
+    // SAFETY: the caller guarantees `text` is valid for `len` bytes for this call; NULL reads as empty.
+    let bytes = unsafe { slice_or_empty(text, len) }.to_vec();
+    catch_unwind(AssertUnwindSafe(|| {
+        let outcome = std::str::from_utf8(&bytes).map_err(|_| "Snippets must be UTF-8 text")
+            .and_then(|text| handle.shortcuts.save_snippet(&keyword, text));
+        leak_blob(outcome.err().unwrap_or("").as_bytes())
+    }))
+    .unwrap_or_else(|_| leak_blob(b"The snippet could not be saved"))
+}
+
+/// The instruction for the AI command `text` names (`fix grammar`, or `ai KEYWORD` for a saved one),
+/// or an empty blob when it names none; free it with `bs_free_blob`.
+/// # Safety
+/// `handle` must be NULL or a live pointer from `bs_init`; `text` must be NULL or NUL-terminated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_prompt_resolve(handle: *mut BsHandle, text: *const c_char) -> BsBlob {
+    if handle.is_null() {
+        return leak_blob(b"");
+    }
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle = unsafe { &*handle };
+    // SAFETY: `text` follows this entry point's terminated-string contract.
+    let text = unsafe { cstr_to_string(text) }.unwrap_or_default();
+    catch_unwind(AssertUnwindSafe(|| {
+        leak_blob(handle.shortcuts.prompt(&text).map(|(_, instruction)| instruction).unwrap_or_default().as_bytes())
+    }))
+    .unwrap_or_else(|_| leak_blob(b""))
+}
+
+/// Starts a user-confirmed compaction of the content index. Returns an empty blob when it started or
+/// the reason it could not; free it with `bs_free_blob`.
+/// # Safety
+/// `handle` must be NULL or a live pointer from `bs_init`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_compact(handle: *mut BsHandle) -> BsBlob {
+    if handle.is_null() {
+        return leak_blob(b"Blindspot is not ready");
+    }
+    // SAFETY: the caller retains a live handle throughout this call.
+    let handle = unsafe { &*handle };
+    catch_unwind(AssertUnwindSafe(|| leak_blob(handle.content.compact().err().unwrap_or("").as_bytes())))
+        .unwrap_or_else(|_| leak_blob(b"Compaction could not start"))
+}
+
 /// Asks the local model what to do about `request`, on a background thread.
 ///
 /// Returns immediately. The answer arrives through [`bs_query`] on the same `>` request, whose
@@ -487,7 +1077,43 @@ pub unsafe extern "C" fn bs_agent_submit(handle: *mut BsHandle, request: *const 
     let request = unsafe { cstr_to_string(request) }.unwrap_or_default();
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if let Some(session) = &handle.agent {
-            session.submit(request.trim(), handle.home.as_deref());
+            let request = request.trim();
+            match request.strip_prefix("docs").filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+                Some(question) => session.submit_documents(request, question.trim(), handle.content.retriever()),
+                None => session.submit(request, handle.home.as_deref()),
+            }
+        }
+    }));
+}
+
+/// Submits a request with ephemeral selected text, only after an explicit user action.
+///
+/// # Safety
+/// `handle` must be NULL or live; strings must be NULL or NUL-terminated and live for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_agent_submit_context(
+    handle: *mut BsHandle,
+    request: *const c_char,
+    selected: *const c_char,
+) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: caller retains handle and both input buffers throughout the call.
+    let handle = unsafe { &*handle };
+    // SAFETY: input is NULL or NUL-terminated, as required by the contract.
+    let request = unsafe { cstr_to_string(request) }.unwrap_or_default();
+    // SAFETY: input is NULL or NUL-terminated, as required by the contract.
+    let selected = unsafe { cstr_to_string(selected) };
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(session) = &handle.agent {
+            let instruction = handle.shortcuts.prompt(request.trim()).map(|(_, instruction)| instruction);
+            session.submit_with_context(
+                request.trim(),
+                handle.home.as_deref(),
+                selected.as_deref(),
+                instruction.as_deref(),
+            );
         }
     }));
 }
@@ -749,9 +1375,68 @@ pub unsafe extern "C" fn bs_clips_clear(handle: *mut BsHandle) -> u32 {
     // SAFETY: as `bs_query` — a live handle, borrowed only for this call.
     let handle = unsafe { &*handle };
     catch_unwind(AssertUnwindSafe(|| {
-        u32::try_from(handle.clips.as_ref().map_or(0, Clips::clear)).unwrap_or(u32::MAX)
+        u32::try_from(handle.clips.as_ref().map_or(0, |clips|clips.clear())).unwrap_or(u32::MAX)
     }))
     .unwrap_or(0)
+}
+
+/// Removes one clipboard item and all stored representations.
+///
+/// # Safety
+/// `handle` must be null or a live handle retained until this call returns. Thread-safe.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_clip_remove(handle: *mut BsHandle, id: u64) -> bool {
+    if handle.is_null() { return false; }
+    // SAFETY: the caller retains the live handle for this call.
+    let handle = unsafe { &*handle };
+    catch_unwind(AssertUnwindSafe(|| handle.clips.as_ref().is_some_and(|clips| clips.remove(id))))
+        .unwrap_or(false)
+}
+
+/// Reads pin state without accessing disk.
+/// # Safety
+/// The handle is null or retained and live for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_clip_pinned(handle:*mut BsHandle,id:u64)->bool {
+    if handle.is_null() {return false;}
+    // SAFETY: caller retains the live handle for this call.
+    let handle=unsafe {&*handle};
+    catch_unwind(AssertUnwindSafe(||handle.clips.as_ref().is_some_and(|clips|clips.pinned(id)))).unwrap_or(false)
+}
+
+/// Writes pin state. Call off the UI thread.
+/// # Safety
+/// The handle is null or retained and live for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_clip_pin(handle:*mut BsHandle,id:u64,pinned:bool)->bool {
+    if handle.is_null() {return false;}
+    // SAFETY: caller retains the live handle for this call.
+    let handle=unsafe {&*handle};
+    catch_unwind(AssertUnwindSafe(||handle.clips.as_ref().is_some_and(|clips|clips.pin(id,pinned)))).unwrap_or(false)
+}
+
+/// Clears history, distinguishing failure from an already empty history. Call off the UI thread.
+/// # Safety
+/// The handle is null or retained and live for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_clips_clear_checked(handle:*mut BsHandle)->bool {
+    if handle.is_null() {return false;}
+    // SAFETY: caller retains the live handle for this call.
+    let handle=unsafe {&*handle};
+    catch_unwind(AssertUnwindSafe(||handle.clips.as_ref().is_some_and(|clips|clips.clear_checked().is_ok()))).unwrap_or(false)
+}
+
+/// Updates a clipboard item's recency without recording application launch history.
+///
+/// # Safety
+/// `handle` must be null or a live handle retained until this call returns. Thread-safe.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_clip_touch(handle: *mut BsHandle, id: u64) -> bool {
+    if handle.is_null() { return false; }
+    // SAFETY: the caller retains the live handle for this call.
+    let handle = unsafe { &*handle };
+    catch_unwind(AssertUnwindSafe(|| handle.clips.as_ref().is_some_and(|clips| clips.touch(id, unix_now()))))
+        .unwrap_or(false)
 }
 
 /// Asks, on a thread, whether the agent's host answers.
@@ -771,6 +1456,40 @@ pub unsafe extern "C" fn bs_diagnostics_refresh(handle: *mut BsHandle) {
     // SAFETY: as `bs_query`.
     let handle = unsafe { &*handle };
     let _ = catch_unwind(AssertUnwindSafe(|| handle.probe_host()));
+    let _ = catch_unwind(AssertUnwindSafe(|| spawn_content_stats(handle.content_path.clone(), handle.content.watched_roots(), Arc::clone(&handle.content_stats), Arc::clone(&handle.content_stats_running))));
+}
+
+/// Legacy PID-only signaling is unavailable; use bs_process_signal with a start time.
+///
+/// # Safety
+/// Takes no pointers and always returns false, preserving the old ABI without signaling.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_port_kill(pid: u32) -> bool {
+    let _ = pid;
+    false
+}
+
+/// Signals only the same process instance shown in the result. Requires UI confirmation.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_process_signal(pid: u32, started: u64, force: bool) -> bool {
+    catch_unwind(|| process_native::signal(pid, started, force)).unwrap_or(false)
+}
+
+/// Returns JSON for a still-current process; empty means unavailable. Free with bs_free_blob.
+#[unsafe(no_mangle)]
+pub extern "C" fn bs_process_inspect(pid: u32, started: u64) -> BsBlob {
+    catch_unwind(|| {
+        let Some(snapshot) = process_native::snapshot(pid, true).filter(|p| started == 0 || p.started == started) else {
+            return leak_blob(&[]);
+        };
+        match serde_json::to_vec(&snapshot) {
+            Ok(bytes) => {
+                let (data, len) = leak_bytes(&bytes);
+                BsBlob { data, len }
+            }
+            Err(_) => leak_blob(&[]),
+        }
+    }).unwrap_or_else(|_| leak_blob(&[]))
 }
 
 /// Spells a Carbon key code and modifier mask the way config.toml writes it.
@@ -1038,6 +1757,15 @@ fn init(explicit: Option<String>) -> *mut BsHandle {
         .enabled
         .then(|| crate::agent::session::Session::new(config.agent.clone()));
 
+    let helpers=std::env::current_exe().ok().and_then(|path|path.parent()?.parent().map(|contents| {
+        crate::semantic::search::Helpers {
+            embedding:contents.join("Helpers/blindspot-semantic"),
+            vectors:contents.join("Helpers/blindspot-vectors"),
+        }
+    }));
+    let content_path = crate::store::data_dir().ok().map(|path|path.join("content.sqlite"));
+    let content = crate::content_service::ContentService::with_helpers(content_path.clone(),helpers);
+    content.configure(&config.content);
     let keep = config.clips.keep;
     let usage = spawn_usage_refresh(config.frecency.half_life_days);
     // Fetched now so the first panel show already has a list to paint.
@@ -1058,16 +1786,24 @@ fn init(explicit: Option<String>) -> *mut BsHandle {
         last_scan: Mutex::new(Some(Instant::now())),
         frecency: Mutex::new(frecency),
         files: FileSearch::new(),
+        content,
+        content_path,
+        content_stats: Arc::new(Mutex::new(ContentStats::default())),
+        content_stats_running: Arc::new(AtomicBool::new(false)),
+        resource_sample: Mutex::new(ResourceSample::default()),
+        ports: crate::ports::PortSearch::new(),
         home: crate::files::home_dir(),
         clips: {
             let opened = open_clips();
             if let Some(clips) = &opened {
                 clips.keep(keep);
             }
-            opened
+            opened.map(Arc::new)
         },
+        clip_retention: crate::process_job::Latest::default(),
         store,
         agent: config_agent,
+        shortcuts: crate::shortcuts::Library::open(crate::store::data_dir().ok().map(|directory| directory.join("shortcuts.toml"))),
     }))
 }
 
@@ -1143,6 +1879,52 @@ impl BsHandle {
         }
     }
 
+    /// Blindspot and its own helper processes, with CPU percentage computed between two samples.
+    /// Sampled at most every two seconds because it enumerates processes; Ollama and other apps
+    /// are excluded on purpose — their memory is not the launcher's.
+    fn resource_line(&self) -> String {
+        let mut sample = match self.resource_sample.lock() { Ok(guard) => guard, Err(poisoned) => poisoned.into_inner() };
+        if sample.taken.is_some_and(|taken| taken.elapsed() < Duration::from_secs(2)) && !sample.line.is_empty() {
+            return sample.line.clone();
+        }
+        let own = std::process::id();
+        let now = Instant::now();
+        let mut processes: Vec<(u32, String)> = crate::ffi::process_native::list(&AtomicBool::new(false)).into_iter()
+            .filter(|process| process.parent_pid == own).map(|process| (process.pid, process.name)).collect();
+        processes.sort_unstable();
+        processes.insert(0, (own, "Blindspot".to_owned()));
+        let elapsed = sample.taken.map(|taken| now.duration_since(taken).as_nanos() as f64);
+        let mut cpu = std::collections::HashMap::new();
+        let mut parts = Vec::new();
+        let mut rows = Vec::new();
+        for (pid, name) in processes {
+            let Some((resident, total)) = crate::ffi::process_native::usage(pid) else { continue; };
+            let percent = match (elapsed, sample.cpu.get(&pid)) {
+                (Some(elapsed), Some(previous)) if elapsed > 0.0 => Some(total.saturating_sub(*previous) as f64 / elapsed * 100.0),
+                _ => None,
+            };
+            cpu.insert(pid, total);
+            let name = name.trim_start_matches("blindspot-").to_owned();
+            let memory = human_bytes(resident);
+            let load = percent.map_or_else(|| "CPU % on next refresh".to_owned(), |percent| format!("{percent:.1}% CPU"));
+            parts.push(format!("{name} {memory} {load}"));
+            rows.push((name, resident, percent));
+        }
+        sample.line = if parts.is_empty() { "unavailable".to_owned() } else { parts.join(" · ") };
+        sample.taken = Some(now);
+        sample.cpu = cpu;
+        sample.rows = rows;
+        sample.line.clone()
+    }
+
+    fn resource_rows(&self) -> Vec<(String, u64, Option<f64>)> {
+        let _ = self.resource_line();
+        match self.resource_sample.lock() {
+            Ok(guard) => guard.rows.clone(),
+            Err(poisoned) => poisoned.into_inner().rows.clone(),
+        }
+    }
+
     /// Every row the settings window draws: the schema, then what can only be measured.
     fn settings_list(&self) -> BsSettingList {
         let overrides = self.with_overrides(|o| o.clone());
@@ -1159,7 +1941,7 @@ impl BsHandle {
     /// free function.
     fn diagnostics(&self, overrides: &crate::settings::Overrides) -> Vec<BsSetting> {
         let config = self.config();
-        let (kept, bytes) = self.clips.as_ref().map_or((0, 0), Clips::stats);
+        let (kept, bytes) = self.clips.as_ref().map_or((0, 0), |clips|clips.stats());
         let (path, trouble) = &self.config_note;
 
         let file = match (path, trouble) {
@@ -1182,8 +1964,21 @@ impl BsHandle {
             (true, Some(true)) => format!("{} · answering", config.agent.host),
             (true, Some(false)) => format!("{} · not answering", config.agent.host),
         };
+        let resources = format!("{} · no OS CPU/RAM quota", self.resource_line());
+        let stats = match self.content_stats.lock() { Ok(guard) => guard.clone(), Err(poisoned) => poisoned.into_inner().clone() };
+        let stat_value = |value: Option<u64>| value.map_or_else(|| "Unavailable".to_owned(), human_bytes);
+        let records = match (stats.documents, stats.embeddings) {
+            (Some(documents), Some(embeddings)) => format!("{documents} documents · {embeddings} embeddings"),
+            _ => "Unavailable".to_owned(),
+        };
+        let storage = if stats.sampled {
+            format!("DB {} · WAL {} · SHM {} · vector catalog {}", stat_value(stats.database_bytes), stat_value(stats.wal_bytes), stat_value(stats.shm_bytes), stat_value(stats.vector_catalog_bytes))
+        } else { "Sampling…".to_owned() };
 
         vec![
+            BsSetting::reading("status.content", "Content index", "Open the Index tab for what is indexed, activity and resources.", &match stats.documents { Some(documents) => format!("{} · {documents} documents", self.content.headline()), None => self.content.headline() }),
+            BsSetting::reading("status.content.records", "Content records", "Last complete read-only sample from the content database; counts can change while indexing.", &records),
+            BsSetting::reading("status.content.storage", "Content storage", "On-disk SQLite files and the vector catalog, sampled in the background. WAL and SHM are separate from the database file.", &storage),
             BsSetting::reading(
                 "status.apps",
                 "Applications indexed",
@@ -1214,6 +2009,12 @@ impl BsHandle {
                 "Loopback only, checked on every request.",
                 &agent,
             ),
+            BsSetting::reading(
+                "status.resources",
+                "App resources",
+                "Blindspot and its own helpers (semantic model, vector search, PDF extraction): resident memory and CPU percentage between two refreshes. Ollama is a separate process. macOS offers no per-app CPU or RAM quota.",
+                &resources,
+            ),
         ]
     }
 
@@ -1229,14 +2030,10 @@ impl BsHandle {
         let _ = std::thread::Builder::new()
             .name("blindspot-reach".to_owned())
             .spawn(move || {
-                use std::net::{TcpStream, ToSocketAddrs};
-                let answered = host
-                    .to_socket_addrs()
-                    .ok()
-                    .and_then(|mut found| found.next())
-                    .is_some_and(|addr| {
-                        TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok()
-                    });
+                use std::net::{TcpStream,SocketAddr};
+                let host=host.strip_prefix("localhost:").map_or_else(||host.clone(),|port|format!("127.0.0.1:{port}"));
+                let answered=host.parse::<SocketAddr>().ok().filter(|address|address.ip().is_loopback())
+                    .is_some_and(|address|TcpStream::connect_timeout(&address,Duration::from_millis(400)).is_ok());
                 match slot.lock() {
                     Ok(mut guard) => *guard = Some(answered),
                     Err(poisoned) => *poisoned.into_inner() = Some(answered),
@@ -1246,23 +2043,33 @@ impl BsHandle {
 
     /// Records `key` as set and applies it, or says why it was refused.
     fn apply_setting(&self, key: &str, value: &str) -> BsBlob {
+        if key.starts_with("content.") && (self.content.erasing() || self.content.compacting()) {
+            return leak_blob(b"Wait for content erasure or compaction to finish before changing these settings");
+        }
         let Some(def) = crate::settings::def(key) else {
             return leak_blob(format!("{key:?} is not a setting").as_bytes());
         };
         if let Err(why) = crate::settings::validate(def, value) {
             return leak_blob(why.as_bytes());
         }
-        self.with_overrides(|o| o.set(key, value));
+        if let Err(why) = self.with_overrides(|o| o.set(key, value)) {
+            return leak_blob(why.as_bytes());
+        }
         self.recompute();
         leak_blob(b"")
     }
 
     /// Forgets what the window set for `key`, back to config.toml and then the built-in.
     fn reset_setting(&self, key: &str) -> BsBlob {
+        if key.starts_with("content.") && (self.content.erasing() || self.content.compacting()) {
+            return leak_blob(b"Wait for content erasure or compaction to finish before changing these settings");
+        }
         if crate::settings::def(key).is_none() {
             return leak_blob(format!("{key:?} is not a setting").as_bytes());
         }
-        self.with_overrides(|o| o.reset(key));
+        if let Err(why) = self.with_overrides(|o| o.reset(key)) {
+            return leak_blob(why.as_bytes());
+        }
         self.recompute();
         leak_blob(b"")
     }
@@ -1278,6 +2085,7 @@ impl BsHandle {
         let mut config = (*self.file_config).clone();
         self.with_overrides(|o| o.apply(&mut config));
 
+        self.content.configure(&config.content);
         let half_life = config.frecency.half_life_days;
         let agent = config.agent.clone();
         let keep = config.clips.keep;
@@ -1294,8 +2102,8 @@ impl BsHandle {
         if let Some(session) = &self.agent {
             session.reconfigure(agent);
         }
-        if let Some(clips) = &self.clips {
-            clips.keep(keep);
+        if keep!=previous.clips.keep && let Some(clips)=&self.clips {
+            self.clip_retention.search(ClipRetention {clips:Arc::clone(clips),count:keep},retain_clips);
         }
         if folders_moved {
             // Forget when the last walk was, so the next panel show rescans immediately
@@ -1313,6 +2121,74 @@ impl BsHandle {
     }
 
     fn query(&self, query: &str, limit: usize) -> BsResults {
+        if let Some(text) = crate::commands::content_request(query) {
+            self.files.cancel(); self.ports.cancel();
+            if let Some(agent) = &self.agent {agent.cancel();}
+            return self.content_query(text,limit);
+        }
+        if query.starts_with([':', ';', '>']) || query.trim().chars().count()<2 {
+            self.content.cancel_search();
+        }
+        if let Some(request) = crate::commands::settings_request(query) {
+            self.files.cancel();
+            self.ports.cancel();
+            if let Some(agent) = &self.agent { agent.cancel(); }
+            let rows = crate::commands::settings(request, limit).into_iter().map(|setting| {
+                BsResult::navigation(setting.label, setting.key,
+                    &format!("{} · {}", setting.section.name(), setting.help), BS_KIND_SETTING)
+            }).collect();
+            return leak_results(rows, false);
+        }
+        // Before completion, which would otherwise answer these exact words with their own help row.
+        if query.trim() == ":system" {
+            self.files.cancel();
+            self.ports.cancel();
+            self.content.cancel_search();
+            return leak_results(crate::system::COMMANDS.iter().take(limit).map(BsResult::system).collect(), false);
+        }
+        // The shell answers these from EventKit; the core only keeps them away from other searches.
+        if matches!(query.trim(), ":schedule" | ":today" | ":calendar") {
+            self.files.cancel();
+            self.ports.cancel();
+            self.content.cancel_search();
+            return leak_results(Vec::new(), false);
+        }
+        if let Some(commands) = crate::commands::builtins().complete(query) {
+            self.files.cancel();
+            self.ports.cancel();
+            if let Some(agent) = &self.agent { agent.cancel(); }
+            return leak_results(commands.into_iter().take(limit).map(|command| {
+                BsResult::navigation(&command.invocation, &command.invocation, &command.help, BS_KIND_COMMAND)
+            }).collect(), false);
+        }
+        if let Some(command) = crate::shortcuts::parse(query) {
+            self.files.cancel();
+            self.ports.cancel();
+            self.content.cancel_search();
+            if let Some(agent) = &self.agent { agent.cancel(); }
+            return leak_results(self.shortcut_rows(&command, query, limit), false);
+        }
+        if let Some(filter) = query.strip_prefix(crate::shortcuts::SNIPPET_PREFIX) {
+            self.files.cancel();
+            self.ports.cancel();
+            self.content.cancel_search();
+            if let Some(agent) = &self.agent { agent.cancel(); }
+            return leak_results(self.snippet_rows(filter.trim(), limit), false);
+        }
+        if !query.starts_with(crate::agent::PREFIX)
+            && let Some(agent) = &self.agent
+        {
+            agent.cancel();
+        }
+        if query.starts_with(crate::agent::PREFIX)
+            || query.starts_with(crate::clips::PREFIX)
+            || query.starts_with(crate::ports::PREFIX)
+            || query.trim().chars().count() < 2 {
+            self.files.cancel();
+        }
+        if crate::ports::ConsoleQuery::parse(query).is_none() {
+            self.ports.cancel();
+        }
         // Clipboard history is its own mode, not mixed into app results: clipboard contents
         // appearing among launcher results would be noise, and a privacy leak on screen.
         if let Some(rest) = query.strip_prefix(crate::clips::PREFIX) {
@@ -1321,14 +2197,41 @@ impl BsHandle {
         if let Some(request) = query.strip_prefix(crate::agent::PREFIX) {
             return self.agent_query(request.trim_start(), limit);
         }
+        // Colon commands are deterministic; unknown syntax offers the console vocabulary.
+        if let Some(port) = crate::ports::ConsoleQuery::parse(query) {
+            return self.port_query(port, limit);
+        }
+        if query.starts_with(crate::ports::PREFIX) {
+            return leak_results(vec![BsResult::header("Use :ports, :processes, :localhost, :3000, or :name")]
+                .into_iter().take(limit).collect(), false);
+        }
         let snapshot = self.index.snapshot();
         let now = unix_now();
         if query.trim().is_empty() {
             return self.welcome(limit, &snapshot, now);
         }
+        if let Some((keyword, rest)) = crate::shortcuts::split_link(query)
+            && let Some(template) = self.shortcuts.link(keyword)
+        {
+            self.files.cancel();
+            self.content.cancel_search();
+            let (title, target) = if rest.is_empty() {
+                (format!("{keyword} · type what to search for"), template.clone())
+            } else {
+                (format!("{keyword} · {rest}"), crate::shortcuts::expand(&template, rest))
+            };
+            return leak_results(vec![BsResult::navigation(&title, &target, &link_host(&template), BS_KIND_LINK)], false);
+        }
         match crate::files::strip_prefix(query) {
             Some(text) => self.file_query(text, limit, &snapshot, now),
-            None => self.app_query(query, limit, &snapshot, now),
+            None if query.trim().chars().count() >= 2 && answers(query).is_empty() => {
+                self.file_query(query.trim(), limit, &snapshot, now)
+            }
+            None => {
+                self.files.cancel();
+                self.content.cancel_search();
+                self.app_query(query, limit, &snapshot, now)
+            }
         }
     }
 
@@ -1356,7 +2259,10 @@ impl BsHandle {
             .iter()
             .take(limit)
             .enumerate()
-            .map(|(at, row)| BsResult::agent(row, at as u64))
+            .map(|(at, row)| match row.kind {
+                crate::agent::session::RowKind::Source => BsResult::source(row),
+                _ => BsResult::agent(row, at as u64),
+            })
             .collect();
         leak_results(items, pending)
     }
@@ -1413,8 +2319,7 @@ impl BsHandle {
         leak_results(items, self.recent.is_refreshing())
     }
 
-    /// A plain query: the calculator, then apps by fuzzy score and frecency — M3's ranking,
-    /// unchanged. Files only ever appear behind `?`.
+    /// Calculator/tool queries and one-character app searches retain the fast app path.
     fn app_query(&self, text: &str, limit: usize, snapshot: &[AppEntry], now: u64) -> BsResults {
         // A value is not a name, so a tool or the calculator is the most specific possible
         // reading and takes the top rows whenever it fires — and both decline everything
@@ -1450,6 +2355,18 @@ impl BsHandle {
     /// `?documents` work at all — Spotlight never returns `~/Documents` or `~/Downloads` —
     /// and it answers on the keystroke, while `mdfind` fills in the depths ~100ms later.
     fn file_query(&self, text: &str, limit: usize, snapshot: &[AppEntry], now: u64) -> BsResults {
+        let parsed = match crate::query::FileQuery::parse(text) {
+            Ok(parsed) => parsed,
+            Err(message) => {
+                self.files.cancel();
+                self.content.cancel_search();
+                return leak_results(vec![BsResult::header(message)].into_iter().take(limit).collect(), false);
+            }
+        };
+        // Room is reserved up front so system rows never displace, and never force freeing, file rows.
+        let full_limit = limit;
+        let system_count = if parsed.filtered() { 0 } else { crate::system::matching(&parsed.name).len().min(3).min(limit) };
+        let limit = limit - system_count;
         // A bare `?` is the Files browse mode: nothing to match yet, so the files you
         // opened most recently, rather than the alphabetical head of everything.
         if text.is_empty() {
@@ -1466,12 +2383,14 @@ impl BsHandle {
         // Idempotent, so calling it on every keystroke and every poll needs no bookkeeping.
         self.files.search(text);
         let (hits, pending) = self.files.results(text);
+        let text = parsed.name.as_str();
+        let snapshot = if parsed.filtered() { &[] } else { snapshot };
 
         let home = self.home.as_deref();
+        let (home_entries, home_pending) = if parsed.filtered() { (Vec::new(), false) }
+            else { home.map(|path| self.files.home_entries(path)).unwrap_or_default() };
         let mut seen = std::collections::HashSet::new();
-        let pool: Vec<AppEntry> = home
-            .map(crate::files::home_entries)
-            .unwrap_or_default()
+        let pool: Vec<AppEntry> = home_entries
             .into_iter()
             .chain(hits)
             .filter(|entry| seen.insert(entry.path.clone()))
@@ -1535,7 +2454,186 @@ impl BsHandle {
             })
             .collect();
         self.highlight(text, &mut items);
+        let (content, content_pending) = if parsed.filtered() {
+            self.content.cancel_search(); (None,false)
+        } else {self.content.search(text)};
+        if let Some(Ok(page)) = content {
+            let mut shown: std::collections::HashSet<PathBuf> = ranked.iter().filter_map(|&(_,is_app,index,_)| {
+                if is_app {snapshot.get(index)} else {pool.get(index)}
+            }).map(|entry|entry.path.clone()).collect();
+            for hit in page.hits {
+                if items.len()>=limit {break;}
+                if shown.insert(PathBuf::from(&hit.path)) {items.push(BsResult::content(&hit,page.limited));}
+            }
+        }
+        let pending = pending || home_pending || content_pending;
+        if items.is_empty() && !pending && parsed.filtered() {
+            let message = if parsed.used.is_some() {
+                "No matches. used: requires Spotlight last-opened dates."
+            } else {
+                "No files match these filters. Try a broader name or remove one filter."
+            };
+            items.push(BsResult::header(message));
+        }
+        if !parsed.filtered() {
+            let at = items.iter().position(|item| item.kind != BS_KIND_APP).unwrap_or(items.len());
+            let system: Vec<BsResult> = crate::system::matching(&parsed.name).into_iter().take(system_count).map(BsResult::system).collect();
+            items.splice(at..at, system);
+            // Only once searching settles, so the rows do not flash in and out while mdfind answers.
+            if items.len() < 3 && !pending {
+                let room = full_limit.saturating_sub(items.len());
+                items.extend(self.fallback_rows(&parsed.name).into_iter().take(room));
+            }
+        }
         leak_results(items, pending)
+    }
+
+    fn content_query(&self, text:&str, limit:usize)->BsResults {
+        if text.is_empty() {
+            self.content.cancel_search();
+            return leak_results(vec![BsResult::navigation("Content search settings","content.enabled",&self.content.status(),BS_KIND_SETTING)].into_iter().take(limit).collect(),false);
+        }
+        let parsed = match crate::query::FileQuery::parse(text) {
+            Ok(parsed) => parsed,
+            Err(why) => return leak_results(vec![BsResult::header(why)], false),
+        };
+        let filter = match content_filter(&parsed) {
+            Ok(filter) => filter,
+            Err(why) => return leak_results(vec![BsResult::header(why)], false),
+        };
+        if parsed.name.trim().chars().count() < 2 {
+            self.content.cancel_search();
+            return leak_results(vec![BsResult::header("Add words to search for, e.g. :content kind:pdf modified:month genetec")], false);
+        }
+        let (page,pending)=self.content.search_filtered(&parsed.name, filter);
+        let items=match page {
+            Some(Ok(page))=> {
+                if page.hits.is_empty() && !pending {vec![BsResult::header("No indexed content matches — try fewer words")]}
+                else {page.hits.iter().take(limit).map(|hit|BsResult::content(hit,page.limited)).collect()}
+            },
+            Some(Err(_))=>vec![BsResult::header("Content search unavailable — ordinary file search still works")],
+            None if pending=>Vec::new(),
+            None=>vec![BsResult::navigation("Content search settings","content.enabled",&self.content.status(),BS_KIND_SETTING)],
+        };
+        leak_results(items.into_iter().take(limit).collect(),pending)
+    }
+
+    fn shortcut_rows(&self, command: &crate::shortcuts::Command<'_>, query: &str, limit: usize) -> Vec<BsResult> {
+        use crate::shortcuts::{Command, valid_keyword, valid_url};
+        const KEYWORD: &str = "Keywords are 1–32 lowercase letters, digits, - or _";
+        let usage = |text: &str| vec![BsResult::header(text)];
+        let rows = match command {
+            Command::SaveLink { url: "", .. } => usage("Type a web address after the keyword, e.g. :link gh https://github.com/search?q={query}"),
+            Command::SaveLink { keyword, url } => {
+                if !valid_keyword(keyword) {
+                    usage(KEYWORD)
+                } else if !valid_url(url) {
+                    usage("Quick links must start with http:// or https://; put {query} where the search text goes")
+                } else {
+                    let verb = if self.shortcuts.link(keyword).is_some() { "Replace" } else { "Save" };
+                    vec![BsResult::navigation(&format!("{verb} quick link “{keyword}”"), query,
+                        &format!("Then type “{keyword} something” to open {url}"), BS_KIND_SHORTCUT)]
+                }
+            }
+            Command::SaveSnippet { text, .. } if text.is_empty() => usage("Type the text after the keyword, e.g. :snippet sig Best regards,\\nSeif"),
+            Command::SaveSnippet { keyword, text } => {
+                if !valid_keyword(keyword) {
+                    usage(KEYWORD)
+                } else {
+                    let verb = if self.shortcuts.snippets().iter().any(|(saved, _)| saved == keyword) { "Replace" } else { "Save" };
+                    vec![BsResult::navigation(&format!("{verb} snippet “{keyword}”"), query,
+                        &format!("Then type !{keyword} to paste: {}", one_line(text, 80)), BS_KIND_SHORTCUT)]
+                }
+            }
+            Command::RemoveLink(keyword) => match self.shortcuts.link(keyword) {
+                Some(url) => vec![BsResult::navigation(&format!("Remove quick link “{keyword}”"), query, &url, BS_KIND_SHORTCUT)],
+                None => usage("No quick link with that keyword · :links lists them"),
+            },
+            Command::RemoveSnippet(keyword) => match self.shortcuts.snippets().into_iter().find(|(saved, _)| saved == keyword) {
+                Some((_, text)) => vec![BsResult::navigation(&format!("Remove snippet “{keyword}”"), query, &one_line(&text, 80), BS_KIND_SHORTCUT)],
+                None => usage("No snippet with that keyword · :snippets lists them"),
+            },
+            Command::ListLinks(filter) => {
+                let links: Vec<_> = self.shortcuts.links().into_iter()
+                    .filter(|(keyword, url)| filter.is_empty() || keyword.contains(filter) || url.contains(filter)).collect();
+                if links.is_empty() {
+                    usage("No quick links yet · :link gh https://github.com/search?q={query}")
+                } else {
+                    links.iter().map(|(keyword, url)| BsResult::navigation(keyword, url, &link_host(url), BS_KIND_LINK)).collect()
+                }
+            }
+            Command::SavePrompt { text, .. } if text.is_empty() => usage("Type the instruction after the keyword, e.g. :prompt tldr Summarize this in one sentence"),
+            Command::SavePrompt { keyword, text } => {
+                if !valid_keyword(keyword) {
+                    usage(KEYWORD)
+                } else {
+                    let verb = if self.shortcuts.prompts().iter().any(|(saved, _)| saved == keyword) { "Replace" } else { "Save" };
+                    vec![BsResult::navigation(&format!("{verb} AI command “{keyword}”"), query,
+                        &format!("Then select text anywhere and type ai {keyword}: {}", one_line(text, 80)), BS_KIND_SHORTCUT)]
+                }
+            }
+            Command::RemovePrompt(keyword) => match self.shortcuts.prompts().into_iter().find(|(saved, _)| saved == keyword) {
+                Some((_, text)) => vec![BsResult::navigation(&format!("Remove AI command “{keyword}”"), query, &one_line(&text, 80), BS_KIND_SHORTCUT)],
+                None => usage("No saved AI command with that keyword · :prompts lists them"),
+            },
+            Command::ListPrompts(filter) => {
+                let filter = filter.to_lowercase();
+                crate::shortcuts::BUILT_IN_PROMPTS.iter()
+                    .map(|(title, text)| ((*title).to_owned(), (*text).to_owned(), true))
+                    .chain(self.shortcuts.prompts().into_iter().map(|(keyword, text)| (format!("ai {keyword}"), text, false)))
+                    .filter(|(name, text, _)| filter.is_empty() || name.contains(&filter) || text.to_lowercase().contains(&filter))
+                    .map(|(name, text, built_in)| BsResult::navigation(&name, &name,
+                        &format!("{} · {}", if built_in { "Built-in AI command" } else { "Saved AI command" }, one_line(&text, 90)), BS_KIND_PROMPT))
+                    .collect()
+            }
+            Command::ListSnippets(filter) => self.snippet_rows(filter, limit),
+        };
+        rows.into_iter().take(limit).collect()
+    }
+
+    /// Offered when a launcher search finds little: search inside documents, ask the documents or the
+    /// local model, or open the configured web search. Each is an explicit next step, never automatic.
+    fn fallback_rows(&self, text: &str) -> Vec<BsResult> {
+        let text = text.trim();
+        if text.chars().count() < 2 || text.len() > 512 {
+            return Vec::new();
+        }
+        let mut rows = vec![BsResult::navigation(&format!("Search documents for “{text}”"), &format!(":content {text}"),
+            "Fallback · text inside indexed files", BS_KIND_COMMAND)];
+        if self.agent.is_some() {
+            rows.push(BsResult::navigation(&format!("Ask your documents: “{text}”"), &format!(">docs {text}"),
+                "Fallback · local answer with sources", BS_KIND_COMMAND));
+            rows.push(BsResult::navigation(&format!("Ask local AI: “{text}”"), &format!(">{text}"), "Fallback · local model", BS_KIND_COMMAND));
+        }
+        let template = self.config().fallback_search.clone();
+        if crate::shortcuts::valid_url(&template) && template.contains("{query}") {
+            let host = link_host(&template);
+            rows.push(BsResult::navigation(&format!("Search the web for “{text}”"), &crate::shortcuts::expand(&template, text),
+                &format!("Fallback · {}", host.trim_start_matches("Quick link · ")), BS_KIND_LINK));
+        }
+        rows
+    }
+
+    fn snippet_rows(&self, filter: &str, limit: usize) -> Vec<BsResult> {
+        let filter = filter.to_lowercase();
+        let mut snippets: Vec<_> = self.shortcuts.snippets().into_iter().filter_map(|(keyword, text)| {
+            let rank = if filter.is_empty() || keyword.starts_with(&filter) { 0 }
+                else if keyword.contains(&filter) { 1 }
+                else if text.to_lowercase().contains(&filter) { 2 }
+                else { return None };
+            Some((rank, keyword, text))
+        }).collect();
+        snippets.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        if snippets.is_empty() {
+            return vec![BsResult::header(if filter.is_empty() {
+                "No snippets yet · :snippet sig Best regards,\\nSeif · or ⌘K on clipboard text → Save as Snippet"
+            } else {
+                "No snippet matches · :snippets lists them all"
+            })];
+        }
+        snippets.into_iter().take(limit)
+            .map(|(_, keyword, text)| BsResult::navigation(&keyword, &text, &format!("Snippet · {}", one_line(&text, 100)), BS_KIND_SNIPPET))
+            .collect()
     }
 
     /// Marks, on every row that was fuzzy-matched, which characters of its name the query
@@ -1574,6 +2672,45 @@ impl BsHandle {
                 }
             }
         });
+    }
+
+    /// A `:` query: what is listening on a port.
+    ///
+    /// Idempotent like the file search it mirrors — safe to call on every keystroke and
+    /// every poll — and `pending` stays true until `lsof` has answered, which is what makes
+    /// the shell poll rather than block.
+    fn port_query(&self, query: crate::ports::ConsoleQuery, limit: usize) -> BsResults {
+        self.ports.search_query(query.clone());
+        let (listeners, pending) = self.ports.results_query(&query);
+        let listeners = match listeners {
+            Ok(listeners) => listeners,
+            Err(_) => {
+                return leak_results(
+                    vec![BsResult::header(
+                        "Process inspection unavailable — retry or check permissions",
+                    )]
+                    .into_iter()
+                    .take(limit)
+                    .collect(),
+                    false,
+                );
+            }
+        };
+        if listeners.is_empty() && !pending {
+            return leak_results(
+                vec![BsResult::header("No matching processes or listeners")]
+                    .into_iter()
+                    .take(limit)
+                    .collect(),
+                false,
+            );
+        }
+        let items = listeners
+            .iter()
+            .take(limit)
+            .map(BsResult::listener)
+            .collect();
+        leak_results(items, pending)
     }
 
     /// Ranked by recency, not frecency: clips are stored newest first and the ranker
@@ -1717,6 +2854,30 @@ impl Drop for RescanGuard {
 }
 
 impl BsResult {
+    fn system(command: &crate::system::SystemCommand) -> Self {
+        Self::navigation(command.title, command.id, command.detail, BS_KIND_SYSTEM)
+    }
+
+    /// A file a document answer drew on: a real file row, so ↩ opens it and ⌘K offers file actions.
+    fn source(row: &crate::agent::session::Row) -> Self {
+        let entry = AppEntry::new(row.name.clone(), PathBuf::from(&row.detail));
+        Self::new(&entry, 0, BS_KIND_FILE)
+    }
+
+    fn content(hit:&crate::content::Hit, limited:bool)->Self {
+        let entry=AppEntry::new(hit.title.clone(),PathBuf::from(&hit.path));
+        let mut result=Self::new(&entry,0,BS_KIND_FILE);
+        let detail=match (&hit.snippet, hit.related) {
+            (Some(snippet), true) => format!("Related by meaning · “{snippet}”"),
+            (None, true) => "Related by meaning · approximate, no exact word match".to_owned(),
+            (Some(snippet), false) => format!("“{snippet}”"),
+            (None, false) if limited => "Content match · limited relevance; refine query".to_owned(),
+            (None, false) => "Content match".to_owned(),
+        };
+        (result.detail,result.detail_len)=leak_bytes(detail.as_bytes());
+        result
+    }
+
     /// A calculator row. No path, because there is nothing on disk to open, and a score
     /// of `u32::MAX` so it can never be sorted under a text match.
     fn calculated(text: &str) -> Self {
@@ -1724,6 +2885,8 @@ impl BsResult {
         let (path, path_len) = leak_bytes(&[]);
         Self {
             id: 0,
+            process_pid: 0,
+            network_port: 0,
             name,
             name_len,
             path,
@@ -1754,6 +2917,7 @@ impl BsResult {
             RowKind::Model => BS_KIND_AGENT_MODEL,
             RowKind::Running => BS_KIND_AGENT_RUNNING,
             RowKind::Past => BS_KIND_AGENT_PAST,
+            RowKind::Source => BS_KIND_FILE,
         };
         let (detail, detail_len) = leak_bytes(row.detail.as_bytes());
         Self {
@@ -1763,6 +2927,33 @@ impl BsResult {
             id: index,
             ..Self::calculated(&row.name)
         }
+    }
+
+    /// One listening process.
+    fn listener(found: &crate::ports::Listener) -> Self {
+        let (path, path_len) = leak_bytes(found.path.as_bytes());
+        let (detail, detail_len) =
+            leak_bytes(format!("PID {} · {} · {}", found.pid, found.protocol, found.address).as_bytes());
+        Self {
+            kind: BS_KIND_PORT,
+            id: found.stable_id(),
+            process_pid: found.pid,
+            network_port: found.port(),
+            timestamp: found.started,
+            path,
+            path_len,
+            detail,
+            detail_len,
+            ..Self::calculated(&found.command)
+        }
+    }
+
+    fn navigation(title: &str, target: &str, help: &str, kind: u8) -> Self {
+        let (path, path_len) = leak_bytes(target.as_bytes());
+        let (detail, detail_len) = leak_bytes(help.as_bytes());
+        Self { kind, path, path_len, detail, detail_len,
+            id: crate::index::fnv1a(&[b"blindspot:navigation:", &[kind], target.as_bytes()]),
+            ..Self::calculated(title) }
     }
 
     /// A welcome-screen section title.
@@ -1787,7 +2978,9 @@ impl BsResult {
     }
 
     fn clip(entry: &AppEntry, score: u32, kind: u8, info: &crate::clips::ClipInfo) -> Self {
+        let (detail,detail_len)=leak_bytes(if info.pinned {b"Pinned"} else {b""});
         Self {
+            detail,detail_len,
             timestamp: info.created,
             width: info.width,
             height: info.height,
@@ -1802,6 +2995,8 @@ impl BsResult {
         let (path, path_len) = leak_bytes(entry.path.as_os_str().as_bytes());
         Self {
             id: entry.id,
+            process_pid: 0,
+            network_port: 0,
             name,
             name_len,
             path,
@@ -1982,6 +3177,74 @@ unsafe fn cstr_to_string(ptr: *const c_char) -> Option<String> {
     Some(cstr.to_string_lossy().into_owned())
 }
 
+pub(crate) fn create_beneath(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+    directory: bool,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::path::Component;
+    fn open_at(fd: i32, name: &std::ffi::CStr, flags: i32) -> Result<OwnedFd, String> {
+        // SAFETY: name is NUL terminated, fd is borrowed for the call; mode is supplied for O_CREAT.
+        let raw = unsafe {
+            libc::openat(
+                fd,
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if raw < 0 {
+            return Err("File unavailable, already exists, or contains a symlink".into());
+        }
+        // SAFETY: a successful openat returns a new descriptor owned by this function.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    }
+    let mut fd = open_at(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY)?;
+    for component in root.components() {
+        if let Component::Normal(name) = component {
+            let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| "Invalid path")?;
+            fd = open_at(fd.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        }
+    }
+    let components: Vec<_> = relative
+        .components()
+        .filter(|c| *c != Component::CurDir)
+        .collect();
+    if components.is_empty() {
+        return Err("Name a new file or directory".into());
+    }
+    for (index, component) in components.iter().enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return Err("Cancelled".into());
+        }
+        let Component::Normal(name) = component else {
+            return Err("Invalid path".into());
+        };
+        let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| "Invalid path")?;
+        let last = index + 1 == components.len();
+        if last && !directory {
+            let _file = open_at(
+                fd.as_raw_fd(),
+                &name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            )?;
+        } else {
+            if directory {
+                // SAFETY: fd remains live, name is a single validated component, and mode is valid.
+                let made = unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o700) };
+                if made != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST)
+                {
+                    return Err("Could not create directory".into());
+                }
+            }
+            fd = open_at(fd.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2018,10 +3281,18 @@ mod tests {
             last_scan: Mutex::new(None),
             frecency: Mutex::new(Frecency::new(14.0)),
             files: FileSearch::new(),
+        content: crate::content_service::ContentService::new(None),
+            content_path: None,
+            content_stats: Arc::new(Mutex::new(ContentStats::default())),
+            content_stats_running: Arc::new(AtomicBool::new(false)),
+        resource_sample: Mutex::new(ResourceSample::default()),
+            ports: crate::ports::PortSearch::new(),
             home: None,
-            clips: Clips::in_memory().ok(),
+            clips: Clips::in_memory().ok().map(Arc::new),
+            clip_retention: crate::process_job::Latest::default(),
             store: None,
             agent: None,
+            shortcuts: crate::shortcuts::Library::open(None),
         }))
     }
 
@@ -2029,11 +3300,91 @@ mod tests {
     fn refusal(blob: BsBlob) -> String {
         // SAFETY: `blob` came straight from a setting call, so the pair is either NULL
         // with a zero length or one live allocation of exactly that length.
-        let text = String::from_utf8_lossy(unsafe { slice_or_empty(blob.data, blob.len) })
-            .into_owned();
+        let text =
+            String::from_utf8_lossy(unsafe { slice_or_empty(blob.data, blob.len) }).into_owned();
         // SAFETY: freed exactly once, and nothing reads it after.
         unsafe { bs_free_blob(blob) };
         text
+    }
+
+    #[test]
+    fn content_settings_index_and_search_share_the_production_abi() {
+        let directory=std::env::temp_dir().join(format!("blindspot-content-ffi-{}",std::process::id()));
+        std::fs::create_dir(&directory).expect("fixture");
+        let directory=directory.canonicalize().expect("canonical");
+        let root=directory.join("root");std::fs::create_dir(&root).expect("root");
+        let file=root.join("notes.txt");std::fs::write(&file,"zscontentfixture transactional migrations").expect("document");
+        let h=handle(&["zscontentfixture"]);
+        // SAFETY: this test exclusively owns the handle, before any content work is started.
+        unsafe {(*h).content=crate::content_service::ContentService::new(Some(directory.join("content.sqlite")));}
+        let set=|key:&str,value:&str| {
+            let key=CString::new(key).expect("key");
+            // SAFETY: the live handle and input buffers remain valid throughout the call.
+            assert!(refusal(unsafe {bs_setting_set(h,key.as_ptr(),value.as_ptr(),value.len())}).is_empty());
+        };
+        set("content.roots",root.to_str().expect("root path"));
+        set("content.enabled","true");
+        // SAFETY: h remains live until the final shutdown below.
+        unsafe {bs_content_pause(h,false,0);}
+        let started=Instant::now();
+        loop {
+            // SAFETY: h is owned by this test; snapshot uses internal synchronization.
+            let phase=unsafe {(*h).content.snapshot().phase};
+            if phase!=crate::content_service::Phase::Indexing {assert_eq!(phase,crate::content_service::Phase::Ready);break;}
+            assert!(started.elapsed()<Duration::from_secs(5));std::thread::sleep(Duration::from_millis(5));
+        }
+        let query=|text:&str| {
+            let text=CString::new(text).expect("query");let started=Instant::now();
+            loop {
+                // SAFETY: h and the terminated text remain live; each returned list is freed once.
+                let results=unsafe {bs_query(h,text.as_ptr(),20)};
+                let mut found=Vec::new();
+                if !results.items.is_null() {
+                    // SAFETY: bs_query returned the pointer/length pair, still live before free_results.
+                    for row in unsafe {std::slice::from_raw_parts(results.items,results.len)} {
+                        // SAFETY: row paths are owned by the live result list and have these lengths.
+                        let path=String::from_utf8_lossy(unsafe {slice_or_empty(row.path,row.path_len)}).into_owned();
+                        found.push((row.kind,path));
+                    }
+                }
+                let pending=results.pending;
+                // SAFETY: exactly this returned result list is freed, once, after copying fields.
+                unsafe {bs_free_results(results);}
+                if !pending {break found;}
+                assert!(started.elapsed()<Duration::from_secs(5));std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let content=query(":content zscontentfixture");
+        assert_eq!(content.len(),1);assert_eq!(content[0].0,BS_KIND_FILE);
+        assert_eq!(std::path::Path::new(&content[0].1),file);
+        let combined=query("zscontentfixture");
+        assert_eq!(combined.first().map(|row|row.0),Some(BS_KIND_APP));
+        assert!(combined.iter().any(|row|row.0==BS_KIND_FILE && std::path::Path::new(&row.1)==file));
+        for (suffix,relevant) in [("notes.txt",true),(".local/share/blindspot/content.sqlite-wal",false),("node_modules/cache.js",false)] {
+            let path=CString::new(root.join(suffix).to_str().expect("event path")).expect("path");
+            // SAFETY: the handle and path buffer outlive this call.
+            assert_eq!(unsafe {bs_content_event_relevant(h,path.as_ptr())},relevant);
+        }
+        set("content.enabled","false");
+        assert!(query(":content zscontentfixture").iter().all(|row|row.0!=BS_KIND_FILE));
+        // SAFETY: this test owns the live handle and frees each returned blob through refusal.
+        assert!(!refusal(unsafe {bs_content_erase(h,false)}).is_empty());
+        assert_eq!(crate::content::ContentStore::open_reader(&directory.join("content.sqlite")).expect("reader").count().expect("preserved"),1);
+        // SAFETY: confirmation is supplied only after the explicit refusal assertion, with indexing disabled.
+        assert!(refusal(unsafe {bs_content_erase(h,true)}).is_empty());
+        let started=Instant::now();
+        loop {
+            // SAFETY: this test retains h while the asynchronous worker completes.
+            if !unsafe {(*h).content.erasing()} { break; }
+            assert!(started.elapsed()<Duration::from_secs(5));std::thread::sleep(Duration::from_millis(5));
+        }
+        // SAFETY: h remains live until shutdown below.
+        assert_eq!(unsafe {(*h).content.snapshot().phase},crate::content_service::Phase::Erased);
+        assert_eq!(crate::content::ContentStore::open_reader(&directory.join("content.sqlite")).expect("reader").count().expect("erased"),0);
+        assert!(file.exists());
+        // SAFETY: h is exclusively owned by this test and is shut down exactly once.
+        unsafe {bs_shutdown(h);}
+        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 
     /// Reads the settings list back the way Swift does — key, value, source — then frees it.
@@ -2080,10 +3431,7 @@ mod tests {
         use crate::settings::Kind;
         assert_eq!(Kind::Flag.tag(), BS_SETTING_FLAG);
         assert_eq!(Kind::Count { min: 0, max: 1 }.tag(), BS_SETTING_COUNT);
-        assert_eq!(
-            Kind::Number { min: 0.0, max: 1.0 }.tag(),
-            BS_SETTING_NUMBER
-        );
+        assert_eq!(Kind::Number { min: 0.0, max: 1.0 }.tag(), BS_SETTING_NUMBER);
         assert_eq!(Kind::Text.tag(), BS_SETTING_TEXT);
         assert_eq!(Kind::Chord.tag(), BS_SETTING_CHORD);
         assert_eq!(Kind::Paths.tag(), BS_SETTING_PATHS);
@@ -2096,13 +3444,37 @@ mod tests {
     }
 
     #[test]
+    fn content_state_carries_the_index_overview() {
+        let h = handle(&["Safari"]);
+        // SAFETY: a live handle; the blob is copied before its single free.
+        let blob = unsafe { bs_content_state(h) };
+        // SAFETY: Rust allocated the blob with exactly this length and nothing has freed it yet.
+        let bytes = unsafe { slice_or_empty(blob.data, blob.len) }.to_vec();
+        // SAFETY: freed once, after the copy above.
+        unsafe { bs_free_blob(blob) };
+        let state: serde_json::Value = serde_json::from_slice(&bytes).expect("state JSON");
+        let overview = &state["overview"];
+        for key in ["state", "stage", "message", "pass", "roots", "semantic", "disk", "processes", "pacing", "busy", "sampled", "kinds", "folders", "attention", "recent"] {
+            assert!(!overview[key].is_null(), "overview.{key} missing");
+        }
+        assert!(overview["processes"].as_array().is_some_and(|rows| rows.iter().any(|row| row["name"] == "Blindspot")));
+        // Lets the shell's decoder be checked against what the core really emits.
+        if let Some(path) = std::env::var_os("BLINDSPOT_OVERVIEW_OUT") {
+            std::fs::write(path, &bytes).expect("overview fixture");
+        }
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
     fn every_setting_crosses_the_boundary_intact() {
         let h = handle(&["Safari"]);
         let rows = settings_of(h);
         // The schema, then the rows that can only be measured. A `status.` key is not in
         // the schema by design: nothing sets it, so there is nothing to validate or store.
-        let (measured, settable): (Vec<_>, Vec<_>) =
-            rows.iter().partition(|(key, _, _)| key.starts_with("status."));
+        let (measured, settable): (Vec<_>, Vec<_>) = rows
+            .iter()
+            .partition(|(key, _, _)| key.starts_with("status."));
         assert_eq!(settable.len(), crate::settings::SCHEMA.len());
         assert!(!measured.is_empty(), "the Status page should have rows");
         for (key, _, source) in &settable {
@@ -2129,7 +3501,10 @@ mod tests {
             refusal(unsafe { bs_setting_set(h, key.as_ptr(), b"12".as_ptr(), 2) }),
             ""
         );
-        assert_eq!(value_of(h, "max_results"), Some(("12".into(), BS_SOURCE_OVERRIDE)));
+        assert_eq!(
+            value_of(h, "max_results"),
+            Some(("12".into(), BS_SOURCE_OVERRIDE))
+        );
         // And the rest of the core sees it, not just the settings list.
         // SAFETY: a live handle.
         assert_eq!(unsafe { bs_max_results(h) }, 12);
@@ -2164,10 +3539,12 @@ mod tests {
         // A chord goes through the same parser config.toml is read with.
         let hotkey = CString::new("hotkey").expect("no interior NUL");
         // SAFETY: as above.
-        let why = refusal(unsafe {
-            bs_setting_set(h, hotkey.as_ptr(), b"shift+space".as_ptr(), 11)
-        });
-        assert!(!why.is_empty(), "a chord with no real modifier should be refused");
+        let why =
+            refusal(unsafe { bs_setting_set(h, hotkey.as_ptr(), b"shift+space".as_ptr(), 11) });
+        assert!(
+            !why.is_empty(),
+            "a chord with no real modifier should be refused"
+        );
         // SAFETY: one shutdown, no calls after it.
         unsafe { bs_shutdown(h) };
     }
@@ -2193,7 +3570,15 @@ mod tests {
                 refusal(bs_setting_reset(std::ptr::null_mut(), key.as_ptr())),
                 "no handle"
             );
-            assert_eq!(refusal(bs_setting_set(std::ptr::null_mut(), std::ptr::null(), b"".as_ptr(), 0)), "no handle");
+            assert_eq!(
+                refusal(bs_setting_set(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    b"".as_ptr(),
+                    0
+                )),
+                "no handle"
+            );
         }
     }
 
@@ -2239,6 +3624,75 @@ mod tests {
         let c = CString::new(q).expect("test query has no interior NUL");
         // SAFETY: `h` is live for the duration of each test and `c` outlives the call.
         drain(unsafe { bs_query(h, c.as_ptr(), limit) })
+    }
+
+    #[test]
+    fn system_fallback_and_ai_command_rows_come_from_the_core() {
+        let h = handle(&["Safari"]);
+        let rows = query(h, "sleep", 8);
+        assert!(rows.iter().any(|row| row.0 == "Sleep" && row.1 == "sleep"), "{rows:?}");
+        // Fallbacks wait for file search to settle, so poll until it has.
+        for _ in 0..200 {
+            if !query_pending(h, "zzqxw unmatched") { break; }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let rows = query(h, "zzqxw unmatched", 8);
+        assert!(rows.iter().any(|row| row.0 == "Search documents for “zzqxw unmatched”" && row.1 == ":content zzqxw unmatched"), "{rows:?}");
+        assert!(rows.iter().any(|row| row.1 == "https://duckduckgo.com/?q=zzqxw%20unmatched"), "{rows:?}");
+        assert!(query(h, ":system", 20).len() >= 10);
+        let resolve = |text: &str| {
+            let text = CString::new(text).unwrap();
+            // SAFETY: a live handle and a NUL-terminated string alive for the call.
+            blob_text(unsafe { bs_prompt_resolve(h, text.as_ptr()) })
+        };
+        assert!(resolve("fix grammar").contains("grammar"));
+        assert_eq!(resolve("mail"), "");
+        let save = CString::new(":prompt tldr Summarize in one sentence.").unwrap();
+        // SAFETY: as above.
+        assert_eq!(blob_text(unsafe { bs_shortcut_apply(h, save.as_ptr()) }), "");
+        assert_eq!(resolve("ai tldr"), "Summarize in one sentence.");
+        assert_eq!(resolve("tldr"), "");
+        assert!(query(h, ":prompts", 20).iter().any(|row| row.0 == "ai tldr"));
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
+    }
+
+    fn blob_text(blob: BsBlob) -> String {
+        // SAFETY: Rust allocated the blob with exactly this length; it is copied before its single free.
+        let text = String::from_utf8_lossy(unsafe { slice_or_empty(blob.data, blob.len) }).into_owned();
+        // SAFETY: freed once, after the copy above.
+        unsafe { bs_free_blob(blob) };
+        text
+    }
+
+    #[test]
+    fn quick_links_and_snippets_save_open_and_refuse_unsafe_targets() {
+        let h = handle(&["Safari"]);
+        let save = ":link gh https://x.test/search?q={query}";
+        let rows = query(h, save, 8);
+        assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("Save quick link “gh”", save));
+        let command = CString::new(save).unwrap();
+        // SAFETY: a live handle and a NUL-terminated command alive for the call.
+        assert_eq!(blob_text(unsafe { bs_shortcut_apply(h, command.as_ptr()) }), "");
+        let opened = query(h, "gh hello world", 8);
+        assert_eq!((opened[0].0.as_str(), opened[0].1.as_str()), ("gh · hello world", "https://x.test/search?q=hello%20world"));
+        let refused = query(h, ":link bad file:///etc/passwd", 8);
+        assert!(refused[0].0.contains("http") && refused[0].1.is_empty(), "{refused:?}");
+        let bad = CString::new(":link bad file:///etc/passwd").unwrap();
+        // SAFETY: as above.
+        assert!(!blob_text(unsafe { bs_shortcut_apply(h, bad.as_ptr()) }).is_empty());
+        let keyword = CString::new("sig").unwrap();
+        let text = "Best regards,\nSeif";
+        // SAFETY: a live handle, a NUL-terminated keyword and a buffer valid for its length.
+        assert_eq!(blob_text(unsafe { bs_snippet_save(h, keyword.as_ptr(), text.as_ptr(), text.len()) }), "");
+        let snippets = query(h, "!si", 8);
+        assert_eq!((snippets[0].0.as_str(), snippets[0].1.as_str()), ("sig", text));
+        let remove = CString::new(":unlink gh").unwrap();
+        // SAFETY: as above.
+        assert_eq!(blob_text(unsafe { bs_shortcut_apply(h, remove.as_ptr()) }), "");
+        assert!(query(h, "gh hello world", 8).iter().all(|row| !row.1.starts_with("https://x.test")));
+        // SAFETY: one shutdown, no calls after it.
+        unsafe { bs_shutdown(h) };
     }
 
     #[test]
@@ -2619,18 +4073,19 @@ mod tests {
     }
 
     #[test]
-    fn a_query_without_the_prefix_never_starts_a_file_search() {
-        // The whole promise of the explicit-prefix decision: no `mdfind` behind your back.
+    fn ordinary_text_starts_file_search_and_commands_cancel_it() {
         let h = handle(&["Safari", "Slack"]);
-        assert!(!query_pending(h, "saf"), "a plain query is never pending");
+        query(h, "saf", 8);
 
         // SAFETY: `h` is live.
         let files = unsafe { &(*h).files };
-        let (results, pending) = files.results("saf");
-        assert!(
-            results.is_empty() && !pending,
-            "nothing was ever searched for"
-        );
+        let started = std::time::Instant::now();
+        while files.results("saf").1 && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        query(h, ">help", 8);
+        assert!(files.results("saf").0.is_empty());
+        assert!(!files.results("saf").1);
 
         // SAFETY: one shutdown, no calls after it.
         unsafe { bs_shutdown(h) };
@@ -2647,6 +4102,13 @@ mod tests {
         // SAFETY: `h` is live and nothing else touches it during the test.
         unsafe { (*h).home = Some(home.clone()) };
 
+        // SAFETY: h remains live and this method only touches its synchronized cache.
+        let files = unsafe { &(*h).files };
+        let started = Instant::now();
+        while files.home_entries(&home).1 && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
         // The first call returns before `mdfind` finishes, so this is the direct listing
         // plus the app index alone — deterministic, and the path that must answer instantly.
         let names = |q: &str| -> Vec<String> { query(h, q, 8).into_iter().map(|r| r.0).collect() };
@@ -2658,10 +4120,23 @@ mod tests {
         );
         assert_eq!(names("?downloads")[0], "Downloads", "nor this one");
         assert_eq!(names("?blindspot")[0], "blindspot");
+        assert_eq!(names("documents")[0], "Documents", "plain search finds files too");
 
         // SAFETY: one shutdown, no calls after it.
         unsafe { bs_shutdown(h) };
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn filtered_file_queries_do_not_include_unfiltered_app_candidates() {
+        let h = handle(&["Synthetic-filter-bypass-pdf"]);
+        let rows = query(h, "?kind:pdf", 8);
+        assert!(rows.iter().all(|row| row.0 != "Synthetic-filter-bypass-pdf"));
+        let invalid = query(h, "?size:18446744073709551615GB", 8);
+        assert_eq!(invalid.first().map(|row| row.0.as_str()), Some("File size is too large"));
+        assert!(!query_pending(h, "?size:18446744073709551615GB"));
+        // SAFETY: exactly one shutdown, with no subsequent use of h.
+        unsafe { bs_shutdown(h) };
     }
 
     #[test]
@@ -2835,6 +4310,37 @@ mod tests {
     }
 
     #[test]
+    fn content_stats_is_explicitly_unavailable_without_a_database() {
+        let stats = content_stats(None, &[]);
+        assert!(!stats.sampled);
+        assert!(stats.database_bytes.is_none());
+        assert!(stats.documents.is_none());
+        assert!(stats.vector_catalog_bytes.is_none());
+    }
+
+    #[test]
+    fn content_stats_reads_records_and_extraction_outcomes_from_store() {
+        let root = std::env::temp_dir().join(format!("blindspot-content-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let database = root.join("content.sqlite");
+        let mut store = crate::content::ContentStore::open(&database).expect("content store");
+        let scan = store.begin_scan(&root).expect("scan");
+        store.put_batch(&scan, &[crate::content::Document {
+            identity: "fixture-id", path: &root.join("report.pdf"), title: "report.pdf", body: "",
+            modified_ns: 1, changed_ns: 1, bytes: 128, extraction: crate::content::Extraction::Oversized,
+        }]).expect("record");
+        drop(store);
+        let stats = content_stats(Some(&database), &[]);
+        assert!(stats.sampled);
+        assert!(stats.database_bytes.is_some());
+        assert_eq!(stats.documents, Some(1));
+        assert_eq!(stats.extraction_counts, Some([0, 0, 1, 0]));
+        assert_eq!(stats.vector_catalog_bytes, Some(0));
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
     fn a_non_utf8_bundle_path_survives_the_round_trip() {
         use std::ffi::OsString;
 
@@ -2860,10 +4366,18 @@ mod tests {
             last_scan: Mutex::new(None),
             frecency: Mutex::new(Frecency::new(14.0)),
             files: FileSearch::new(),
+        content: crate::content_service::ContentService::new(None),
+            content_path: None,
+            content_stats: Arc::new(Mutex::new(ContentStats::default())),
+            content_stats_running: Arc::new(AtomicBool::new(false)),
+        resource_sample: Mutex::new(ResourceSample::default()),
+            ports: crate::ports::PortSearch::new(),
             home: None,
-            clips: Clips::in_memory().ok(),
+            clips: Clips::in_memory().ok().map(Arc::new),
+            clip_retention: crate::process_job::Latest::default(),
             store: None,
             agent: None,
+            shortcuts: crate::shortcuts::Library::open(None),
         }));
 
         let got = query(h, "odd", 8);

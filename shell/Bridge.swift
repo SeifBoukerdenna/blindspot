@@ -14,6 +14,16 @@ enum MatchKind {
     case clipImage
     /// A welcome-screen section title. Never selected, never acted on.
     case header
+    /// A process listening on the port you asked about. `id` is its pid.
+    case port
+    case command
+    case setting
+    case shortcut
+    case quickLink
+    case snippet
+    case system
+    case prompt
+    case event
     /// The agent's "ask the local model" row. Enter submits the request.
     case agentPrompt
     /// A command the agent proposes. Enter runs the plan it belongs to.
@@ -63,6 +73,9 @@ struct Match: Identifiable, Equatable {
     /// Which characters of `name` the query matched, as Unicode scalar offsets. Empty
     /// for every row nothing was typed at.
     let highlights: [Int]
+    var processPID: UInt32 = 0
+    var portNumber: UInt16 = 0
+    var targetPID: UInt64 { processPID == 0 ? id : UInt64(processPID) }
 
     /// The containing folder, shown as the row's second line.
     ///
@@ -89,9 +102,13 @@ struct Match: Identifiable, Equatable {
             // Relative time, which `ResultRow` renders because the formatter is main-actor
             // state and this is a plain value type.
             return ""
+        case .port, .command, .setting, .shortcut, .quickLink, .snippet, .system, .prompt, .event:
+            // "pid 4821 · 127.0.0.1:3000" — written by the core, which knows both.
+            return detail
         case .app, .file:
             let parent = (path as NSString).deletingLastPathComponent
-            return (parent as NSString).abbreviatingWithTildeInPath
+            let folder = (parent as NSString).abbreviatingWithTildeInPath
+            return detail.isEmpty ? folder : "\(detail) · \(folder)"
         }
     }
 }
@@ -166,7 +183,7 @@ struct Setting: Identifiable, Equatable {
 /// symbol. Owns the `BsHandle` for the process lifetime.
 @MainActor
 final class Core {
-    private let handle: OpaquePointer
+    private var handle: OpaquePointer { clipSink.owner.handle }
 
     /// The one entry point safe to call off the main thread. See `ClipSink`.
     nonisolated let clipSink: ClipSink
@@ -182,18 +199,7 @@ final class Core {
                 bs_init(nil)
             }
         guard let created else { return nil }
-        handle = created
-        clipSink = ClipSink(handle: created)
-    }
-
-    /// `isolated` so this runs on the main actor: `handle` is an `OpaquePointer` and
-    /// therefore not `Sendable`, which a nonisolated deinit may not touch under Swift 6.
-    ///
-    /// A rescan thread inside Rust may still be walking when this fires. That is safe by
-    /// construction — it holds its own `Arc` clones — which is precisely why
-    /// `bs_shutdown` is documented as taking the handle away from Swift, not from Rust.
-    isolated deinit {
-        bs_shutdown(handle)
+        clipSink = ClipSink(owner: NativeCoreOwner(handle: created))
     }
 
     /// The configured row count, read from the core rather than hardcoded here so that
@@ -217,14 +223,62 @@ final class Core {
 
     /// The M3 frecency seam. A no-op in the core today; called anyway so that landing
     /// frecency needs no change on this side.
+    func cancelSearch() { bs_search_cancel(handle) }
+
+    var contentState: ContentRuntime? {
+        let blob = bs_content_state(handle)
+        defer { bs_free_blob(blob) }
+        guard let bytes = blob.data, blob.len > 0, blob.len <= 256 * 1024 else { return nil }
+        return try? JSONDecoder().decode(ContentRuntime.self, from: Data(bytes: bytes, count: blob.len))
+    }
+
+    func refreshContent() { bs_content_refresh(handle) }
+
+    /// Runs a `:link` / `:snippet` / `:unlink` / `:unsnippet` command; nil on success, else why not.
+    func applyShortcut(_ command: String) -> String? {
+        command.withCString { Self.message(bs_shortcut_apply(handle, $0)) }
+    }
+
+    func saveSnippet(keyword: String, text: String) -> String? {
+        let bytes = Array(text.utf8)
+        return keyword.withCString { name in
+            bytes.withUnsafeBufferPointer { Self.message(bs_snippet_save(handle, name, $0.baseAddress, $0.count)) }
+        }
+    }
+
+    func compactContent() -> String? { Self.message(bs_content_compact(handle)) }
+
+    /// The instruction an AI command such as `fix grammar` or `ai tldr` stands for, or nil.
+    func promptInstruction(for text: String) -> String? {
+        text.withCString { Self.message(bs_prompt_resolve(handle, $0)) }
+    }
+    func refreshContent(paths: [String]) {
+        guard let data = try? JSONEncoder().encode(paths), data.count <= 64 * 1024 else { refreshContent(); return }
+        data.withUnsafeBytes { bytes in
+            bs_content_refresh_paths(handle, bytes.bindMemory(to: UInt8.self).baseAddress, data.count)
+        }
+    }
+    func pauseContent(_ paused: Bool, reason: ContentPauseReason = .none) {
+        bs_content_pause(handle, paused, reason.rawValue)
+    }
+    func eraseContent(confirmed: Bool) -> String? { Self.message(bs_content_erase(handle, confirmed)) }
+    func cancelContentErasure() { bs_content_erase_cancel(handle) }
+    func contentEventRelevant(_ path: String) -> Bool {
+        path.withCString { bs_content_event_relevant(handle, $0) }
+    }
+
     func activate(_ id: UInt64) {
         bs_activate(handle, id)
     }
 
     /// Asks the local model about `request`. Returns at once: the answer arrives through the
     /// next `query`, whose `pending` stays true until the model has finished.
-    func agentSubmit(_ request: String) {
-        request.withCString { bs_agent_submit(handle, $0) }
+    func agentSubmit(_ request: String, selectedText: String? = nil) {
+        request.withCString { request in
+            if let selectedText {
+                selectedText.withCString { bs_agent_submit_context(handle, request, $0) }
+            } else { bs_agent_submit(handle, request) }
+        }
     }
 
     /// Runs the commands the agent proposed. Does nothing unless a plan is waiting and every
@@ -259,11 +313,19 @@ final class Core {
         bs_startup(handle)
     }
 
+    /// Asks the process with this pid to stop. `SIGTERM`, and never pid 0 or 1.
+    @discardableResult
+    func stopProcess(pid: UInt64, started: UInt64) -> Bool {
+        guard let pid = UInt32(exactly: pid) else { return false }
+        return bs_process_signal(pid, started, false)
+    }
+
     /// Forgets every clip, returning how many went. Clipboard history is its own file, so
     /// this cannot touch launch history.
     @discardableResult
-    func clearClips() -> Int {
-        Int(bs_clips_clear(handle))
+    func clearClips() async -> Bool {
+        let sink = clipSink
+        return await Task.detached(priority: .userInitiated) { sink.clear() }.value
     }
 
     /// Asks, on a thread inside Rust, whether the agent's host answers. The answer shows
@@ -288,7 +350,7 @@ final class Core {
         // `defer` so the Rust allocation is released on every path.
         defer { bs_free_settings(list) }
         guard let items = list.items, list.len > 0 else { return [] }
-        return UnsafeBufferPointer(start: items, count: list.len).map { row in
+        var result = UnsafeBufferPointer(start: items, count: list.len).map { row in
             Setting(
                 key: Self.string(row.key, row.key_len),
                 section: Self.string(row.section, row.section_len),
@@ -303,6 +365,13 @@ final class Core {
                 max: row.max
             )
         }
+        result.append(Setting(
+            key: "status.version", section: "Status", label: "Blindspot version",
+            help: "The version of this app build.",
+            value: (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "unknown",
+            fallback: "",
+            kind: .readonly, source: .builtIn, live: true, min: 0, max: 0))
+        return result
     }
 
     /// Sets `key`, returning why it was refused — or nil if it took.
@@ -368,7 +437,8 @@ final class Core {
                 width: Int(result.width),
                 height: Int(result.height),
                 detail: string(result.detail, result.detail_len),
-                highlights: offsets(result.highlights, result.highlights_len)
+                highlights: offsets(result.highlights, result.highlights_len),
+                processPID: result.process_pid, portNumber: result.network_port
             )
         }
     }
@@ -393,6 +463,14 @@ final class Core {
         case UInt8(BS_KIND_AGENT_PAST): return .agentPast
         case UInt8(BS_KIND_CLIP_TEXT): return .clipText
         case UInt8(BS_KIND_CLIP_IMAGE): return .clipImage
+        case UInt8(BS_KIND_PORT): return .port
+        case UInt8(BS_KIND_COMMAND): return .command
+        case UInt8(BS_KIND_SETTING): return .setting
+        case UInt8(BS_KIND_SHORTCUT): return .shortcut
+        case UInt8(BS_KIND_LINK): return .quickLink
+        case UInt8(BS_KIND_SNIPPET): return .snippet
+        case UInt8(BS_KIND_SYSTEM): return .system
+        case UInt8(BS_KIND_PROMPT): return .prompt
         default: return .app
         }
     }
@@ -416,6 +494,159 @@ enum ClipPart: UInt8 {
     case thumbnail = 1
 }
 
+struct ContentRuntime: Decodable, Sendable {
+    let enabled: Bool
+    let onBattery: Bool
+    let roots: [String]
+    let watchRoots: [String]
+    let indexing: Bool
+    let status: String
+    var erasing = false
+    var erased = false
+    var eraseFailed = false
+    var phase: String? = nil
+    var visited: UInt64? = nil
+    var indexed: UInt64? = nil
+    var unchanged: UInt64? = nil
+    var skipped: UInt64? = nil
+    var failed: UInt64? = nil
+    var removed: UInt64? = nil
+    var currentPath: String? = nil
+    var databaseBytes: UInt64? = nil
+    var walBytes: UInt64? = nil
+    var shmBytes: UInt64? = nil
+    var vectorCatalogBytes: UInt64? = nil
+    var documents: UInt64? = nil
+    var embeddings: UInt64? = nil
+    var statsSampled: Bool = false
+    var extractionCounts: [UInt64]? = nil
+    var overview: IndexOverview? = nil
+}
+
+/// Structured Index-page state from `bs_content_state`. Counts keep the core's meanings; the
+/// shell only formats them.
+struct IndexOverview: Decodable, Sendable, Equatable {
+    struct Pass: Decodable, Sendable, Equatable {
+        let checked, updated, sourceBytes, unchanged, skipped, unreadable, removed: UInt64
+    }
+    struct Semantic: Decodable, Sendable, Equatable {
+        let enabled: Bool
+        let embedded, eligible, passEmbedded, passFailed: UInt64?
+    }
+    struct Disk: Decodable, Sendable, Equatable {
+        let database: UInt64
+        let cache: UInt64?
+    }
+    struct Process: Decodable, Sendable, Equatable {
+        let name: String
+        let memory: UInt64
+        let cpu: Double?
+    }
+    struct Pacing: Decodable, Sendable, Equatable {
+        let lowImpact, battery, documents: Bool
+        let documentLimitMB: UInt64
+    }
+    struct Busy: Decodable, Sendable, Equatable {
+        let folder, path: String
+        let changes: UInt64
+    }
+    struct Share: Decodable, Sendable, Equatable {
+        let label: String
+        let count, bytes: UInt64
+    }
+    struct Folder: Decodable, Sendable, Equatable {
+        let folder, path: String
+        let count, bytes: UInt64
+    }
+    struct Attention: Decodable, Sendable, Equatable {
+        let name, folder, path, reason: String
+    }
+    struct Recent: Decodable, Sendable, Equatable {
+        let name, folder, path: String
+        let modified: Int64
+    }
+    struct Compact: Decodable, Sendable, Equatable {
+        let before, after, removed: UInt64
+    }
+    let state, stage, message: String
+    let compact: Compact?
+    let compactError: String?
+    let reclaimable: UInt64?
+    let stageSeconds, lastPassAgo: UInt64?
+    let lastPassSeconds: Double?
+    let currentFolder: String?
+    let pass: Pass
+    let roots: [String]
+    let semantic: Semantic
+    let documents, pdfText: UInt64?
+    let pdfIssues: [UInt64]?
+    let disk: Disk
+    let processes: [Process]
+    let pacing: Pacing
+    let busy: [Busy]
+    let sampled: Bool
+    let sampleAgo: UInt64?
+    let kinds: [Share]
+    let folders: [Folder]
+    let attention: [Attention]
+    let recent: [Recent]
+}
+
+enum ContentPauseReason: UInt8, Sendable {
+    case none = 0
+    case lowPower = 1
+    case thermal = 2
+    case battery = 3
+    case unavailable = 4
+}
+
+struct ProcessDetails: Decodable, Sendable {
+    let pid: UInt32
+    let parentPid: UInt32
+    let started: UInt64
+    let name: String
+    let executable: String
+    let workingDirectory: String?
+    let residentBytes: UInt64?
+    let cpuTimeNs: UInt64?
+    let userId: UInt32
+    let commandLine: String?
+    let children: [UInt32]
+
+    var description: String {
+        let memory = residentBytes.map { "\($0 / 1_048_576) MiB" } ?? "Unavailable"
+        let cpu = cpuTimeNs.map { String(format: "%.2f seconds", Double($0) / 1_000_000_000) } ?? "Unavailable"
+        let uptime = max(0, Date().timeIntervalSince1970 - Double(started) / 1_000_000)
+        return "PID: \(pid)\nParent PID: \(parentPid)\nUser ID: \(userId)\nUptime: \(Int(uptime)) seconds\nResident memory: \(memory)\nCPU time (total): \(cpu)\nExecutable: \(executable.isEmpty ? "Unavailable" : executable)\nWorking directory: \(workingDirectory ?? "Unavailable")\nCommand: \(commandLine ?? "Unavailable")\nChildren: \(children.map(String.init).joined(separator: ", "))"
+    }
+}
+
+enum NativeProcessBridge {
+    private enum Failure: Error { case unavailable }
+    static func inspect(pid: UInt64, started: UInt64) async throws -> ProcessDetails {
+        let worker = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            guard let pid = UInt32(exactly: pid) else { throw Failure.unavailable }
+            let blob = bs_process_inspect(pid, started)
+            defer { bs_free_blob(blob) }
+            guard let bytes = blob.data, blob.len > 0 else { throw Failure.unavailable }
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let details = try decoder.decode(ProcessDetails.self, from: Data(bytes: bytes, count: blob.len))
+            try Task.checkCancellation()
+            return details
+        }
+        return try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+    }
+
+    static func signal(pid: UInt64, started: UInt64, force: Bool) async throws {
+        try Task.checkCancellation()
+        guard let pid = UInt32(exactly: pid), bs_process_signal(pid, started, force) else {
+            throw Failure.unavailable
+        }
+    }
+}
+
 /// Hands clips to Rust from any thread.
 ///
 /// The only part of `Core` callable off the main actor, and deliberately narrow: recording
@@ -423,8 +654,33 @@ enum ClipPart: UInt8 {
 /// so it must not run on the thread that answers the hotkey. `@unchecked` because the
 /// pointer is only ever passed to `bs_clip_add`, which Rust documents as thread-safe: it
 /// locks brief in-memory sections and does its disk write outside them.
-struct ClipSink: @unchecked Sendable {
-    fileprivate let handle: OpaquePointer
+private final class NativeCoreOwner: @unchecked Sendable {
+    let handle: OpaquePointer
+    init(handle: OpaquePointer) { self.handle = handle }
+    deinit { bs_shutdown(handle) }
+}
+
+struct ClipSink: Sendable {
+    fileprivate let owner: NativeCoreOwner
+    private func withHandle<T>(_ body: (OpaquePointer) -> T) -> T {
+        withExtendedLifetime(owner) { body(owner.handle) }
+    }
+
+    func content(_ id: UInt64) -> Data? {
+        withHandle { handle in
+            let blob = bs_clip_content(handle, id, 0)
+            defer { bs_free_blob(blob) }
+            guard let bytes = blob.data, blob.len > 0, blob.len <= 25 * 1024 * 1024 else { return nil }
+            return Data(bytes: bytes, count: blob.len)
+        }
+    }
+
+    func remove(_ id: UInt64) -> Bool { withHandle { bs_clip_remove($0, id) } }
+    func pinned(_ id: UInt64) -> Bool { withHandle { bs_clip_pinned($0, id) } }
+    func pin(_ id: UInt64, _ pinned: Bool) -> Bool { withHandle { bs_clip_pin($0, id, pinned) } }
+    func clear() -> Bool { withHandle { bs_clips_clear_checked($0) } }
+
+    func touch(_ id: UInt64) { withHandle { _ = bs_clip_touch($0, id) } }
 
     func add(
         image: Bool, content: Data, thumbnail: Data = Data(), text: Data = Data(),
@@ -445,7 +701,7 @@ struct ClipSink: @unchecked Sendable {
                         text_len: words.count,
                         width: UInt32(clamping: width),
                         height: UInt32(clamping: height))
-                    bs_clip_add(handle, &clip)
+                    withHandle { bs_clip_add($0, &clip) }
                 }
             }
         }

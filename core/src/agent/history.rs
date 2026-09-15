@@ -57,6 +57,9 @@ fn path() -> Option<PathBuf> {
 
 /// Appends one entry, best effort: a launcher must not fail a task because its diary is full.
 pub fn record(entry: &Entry) {
+    if cfg!(test) {
+        return;
+    }
     let Some(path) = path() else { return };
     append(&path, entry);
 }
@@ -97,6 +100,9 @@ fn trim(path: &std::path::Path) {
 
 /// The most recent entries, newest first.
 pub fn recent(limit: usize) -> Vec<Entry> {
+    if cfg!(test) {
+        return Vec::new();
+    }
     let Some(path) = path() else {
         return Vec::new();
     };

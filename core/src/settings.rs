@@ -10,6 +10,7 @@
 //! `agent-model` already follows — see `crate::agent::session::model_file`.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use crate::config::Config;
@@ -22,6 +23,7 @@ use crate::config::Config;
 pub enum Section {
     General,
     Ranking,
+    Content,
     Clipboard,
     Agent,
     /// Read-only rows: what is indexed, what is reachable, what is on disk.
@@ -33,6 +35,7 @@ impl Section {
         match self {
             Self::General => "General",
             Self::Ranking => "Ranking",
+            Self::Content => "Content",
             Self::Clipboard => "Clipboard",
             Self::Agent => "Agent",
             Self::Status => "Status",
@@ -45,8 +48,14 @@ impl Section {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kind {
     Flag,
-    Count { min: u64, max: u64 },
-    Number { min: f64, max: f64 },
+    Count {
+        min: u64,
+        max: u64,
+    },
+    Number {
+        min: f64,
+        max: f64,
+    },
     Text,
     /// A hotkey, validated through [`crate::hotkey::parse`] so the window's recorder can
     /// never disagree with the config file's parser.
@@ -127,6 +136,14 @@ pub static SCHEMA: &[SettingDef] = &[
         live: true,
     },
     SettingDef {
+        key: "fallback_search",
+        section: Section::General,
+        label: "Fallback web search",
+        help: "Offered when a search finds little. An http or https address with {query} where the text goes; leave empty to hide it.",
+        kind: Kind::Text,
+        live: true,
+    },
+    SettingDef {
         key: "max_results",
         section: Section::General,
         label: "Results shown",
@@ -151,6 +168,78 @@ pub static SCHEMA: &[SettingDef] = &[
             min: 0.0,
             max: 365.0,
         },
+        live: true,
+    },
+    SettingDef {
+        key: "content.enabled",
+        section: Section::Content,
+        label: "Local content search",
+        help: "Index text in Desktop and Downloads by default. Off stops indexing and hides results; stored excerpts are retained.",
+        kind: Kind::Flag,
+        live: true,
+    },
+    SettingDef {
+        key: "content.semantic",
+        section: Section::Content,
+        label: "Search by meaning",
+        help: "Add on-device semantic matches for indexed English text. Uses an installed local model; ordinary text search remains available. Off retains vectors until Erase index.",
+        kind: Kind::Flag,
+        live: true,
+    },
+    SettingDef {
+        key: "content.roots",
+        section: Section::Content,
+        label: "Indexed folders",
+        help: "Choose up to 32 local folders. Use Add folder to open the macOS folder picker.",
+        kind: Kind::Paths,
+        live: true,
+    },
+    SettingDef {
+        key: "content.excluded_paths",
+        section: Section::Content,
+        label: "Excluded paths",
+        help: "These paths, hidden folders, common credentials and generated dependencies are excluded.",
+        kind: Kind::Paths,
+        live: true,
+    },
+    SettingDef {
+        key: "content.max_file_mb",
+        section: Section::Content,
+        label: "Maximum source size (MiB)",
+        help: "Larger files are skipped. At most 64 KiB of text is indexed from each supported file.",
+        kind: Kind::Count { min: 1, max: 16 },
+        live: true,
+    },
+    SettingDef {
+        key: "content.on_battery",
+        section: Section::Content,
+        label: "Index on battery",
+        help: "Allow background indexing on battery. Low Power Mode and serious thermal pressure still pause work.",
+        kind: Kind::Flag,
+        live: true,
+    },
+    SettingDef {
+        key: "content.documents",
+        section: Section::Content,
+        label: "Index PDF and Word documents",
+        help: "Extract text from PDF, DOCX, DOC, RTF and ODT files in the indexed folders using an isolated local helper with no network access. Scanned, locked and oversized documents are counted but have no searchable body.",
+        kind: Kind::Flag,
+        live: true,
+    },
+    SettingDef {
+        key: "content.max_document_mb",
+        section: Section::Content,
+        label: "Maximum document size (MiB)",
+        help: "PDF files larger than this are listed by filename only. At most 64 KiB of text and 100 pages are indexed per document.",
+        kind: Kind::Count { min: 1, max: 128 },
+        live: true,
+    },
+    SettingDef {
+        key: "content.low_impact",
+        section: Section::Content,
+        label: "Low-impact indexing",
+        help: "Pause longer between batches so indexing uses less sustained CPU and disk. Passes take longer. This is pacing, not an operating-system CPU or memory quota.",
+        kind: Kind::Flag,
         live: true,
     },
     SettingDef {
@@ -302,6 +391,7 @@ fn split(value: &str) -> Vec<String> {
 pub fn read(config: &Config, key: &str) -> Option<String> {
     Some(match key {
         "hotkey" => config.hotkey.clone(),
+        "fallback_search" => config.fallback_search.clone(),
         "agent_hotkey" => config.agent_hotkey.clone(),
         "launch_at_login" => config.launch_at_login.to_string(),
         "max_results" => config.max_results.to_string(),
@@ -318,6 +408,15 @@ pub fn read(config: &Config, key: &str) -> Option<String> {
         "clips.keep" => config.clips.keep.to_string(),
         "clips.images" => config.clips.images.to_string(),
         "clips.ocr" => config.clips.ocr.to_string(),
+        "content.enabled" => config.content.enabled.to_string(),
+        "content.semantic" => config.content.semantic.to_string(),
+        "content.roots" => join(&config.content.roots),
+        "content.excluded_paths" => join(&config.content.excluded_paths),
+        "content.max_file_mb" => config.content.max_file_mb.to_string(),
+        "content.on_battery" => config.content.on_battery.to_string(),
+        "content.documents" => config.content.documents.to_string(),
+        "content.max_document_mb" => config.content.max_document_mb.to_string(),
+        "content.low_impact" => config.content.low_impact.to_string(),
         _ => return None,
     })
 }
@@ -327,6 +426,7 @@ pub fn read(config: &Config, key: &str) -> Option<String> {
 fn write(config: &mut Config, key: &str, value: &str) -> bool {
     match key {
         "hotkey" => config.hotkey = value.to_owned(),
+        "fallback_search" => config.fallback_search = value.trim().to_owned(),
         "agent_hotkey" => config.agent_hotkey = value.to_owned(),
         "launch_at_login" => config.launch_at_login = value == "true",
         "max_results" => match value.parse() {
@@ -355,6 +455,21 @@ fn write(config: &mut Config, key: &str, value: &str) -> bool {
         },
         "clips.images" => config.clips.images = value == "true",
         "clips.ocr" => config.clips.ocr = value == "true",
+        "content.enabled" => config.content.enabled = value == "true",
+        "content.semantic" => config.content.semantic = value == "true",
+        "content.roots" => config.content.roots = split(value),
+        "content.excluded_paths" => config.content.excluded_paths = split(value),
+        "content.max_file_mb" => match value.parse() {
+            Ok(n) => config.content.max_file_mb = n,
+            Err(_) => return false,
+        },
+        "content.on_battery" => config.content.on_battery = value == "true",
+        "content.documents" => config.content.documents = value == "true",
+        "content.max_document_mb" => match value.parse() {
+            Ok(megabytes) => config.content.max_document_mb = megabytes,
+            Err(_) => return false,
+        },
+        "content.low_impact" => config.content.low_impact = value == "true",
         _ => return false,
     }
     true
@@ -398,7 +513,34 @@ pub fn validate(def: &SettingDef, value: &str) -> Result<(), String> {
                 Err(format!("must be loopback, not {value:?}"))
             }
         }
+        Kind::Text if def.key == "fallback_search" => {
+            let value = value.trim();
+            if value.is_empty() || (crate::shortcuts::valid_url(value) && value.contains("{query}")) {
+                Ok(())
+            } else {
+                Err("must be an http or https address containing {query}, or empty".to_owned())
+            }
+        }
         Kind::Text => Ok(()),
+        Kind::Paths if def.key.starts_with("content.") => {
+            let paths = split(value);
+            let limit = if def.key == "content.roots" { 32 } else { 128 };
+            if paths.len() > limit
+                || paths.iter().any(|path| {
+                    path.len() > 4096
+                        || !(path.starts_with('/') || path == "~" || path.starts_with("~/"))
+                        || std::path::Path::new(path)
+                            .components()
+                            .any(|part| matches!(part, std::path::Component::ParentDir))
+                })
+            {
+                Err(format!(
+                    "Choose at most {limit} absolute or ~/ paths without parent traversal"
+                ))
+            } else {
+                Ok(())
+            }
+        }
         Kind::Paths => {
             if split(value)
                 .iter()
@@ -430,29 +572,55 @@ pub struct Overrides {
     /// A field rather than a constant so tests never write to the real state directory —
     /// the same reason `Session::model_path` is one.
     path: Option<PathBuf>,
+    damaged: bool,
 }
 
 impl Overrides {
     pub fn default_path() -> Option<PathBuf> {
-        crate::store::data_dir().ok().map(|d| d.join("overrides.toml"))
+        crate::store::data_dir()
+            .ok()
+            .map(|d| d.join("overrides.toml"))
     }
 
-    /// Loads the file at `path`, or an empty set. A file that will not parse is an empty
-    /// set and a line on stderr: losing what you set in the window is survivable, refusing
-    /// to start is not.
+    /// Invalid files leave defaults usable and block writes until the file is repaired.
     pub fn load(path: Option<PathBuf>) -> Self {
-        let values = path
-            .as_deref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|text| match toml::from_str::<toml::Table>(&text) {
-                Ok(table) => Self::decode(&table),
-                Err(e) => {
-                    eprintln!("blindspot: could not parse overrides: {e}; ignoring them");
-                    BTreeMap::new()
+        let loaded = (|| -> std::io::Result<BTreeMap<String, String>> {
+            let Some(path) = &path else {
+                return Ok(BTreeMap::new());
+            };
+            let file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(BTreeMap::new());
                 }
-            })
-            .unwrap_or_default();
-        Self { values, path }
+                Err(error) => return Err(error),
+            };
+            let mut text = String::new();
+            file.take(262_145).read_to_string(&mut text)?;
+            if text.len() > 262_144 {
+                return Err(std::io::Error::other("Settings file exceeds limit"));
+            }
+            let table = toml::from_str::<toml::Table>(&text)
+                .map_err(|_| std::io::Error::other("Invalid settings file"))?;
+            Ok(Self::decode(&table))
+        })();
+        match loaded {
+            Ok(values) => Self {
+                values,
+                path,
+                damaged: false,
+            },
+            Err(_) => {
+                eprintln!(
+                    "blindspot: settings overrides unavailable; preserving the file and using defaults"
+                );
+                Self {
+                    values: BTreeMap::new(),
+                    path,
+                    damaged: true,
+                }
+            }
+        }
     }
 
     fn decode(table: &toml::Table) -> BTreeMap<String, String> {
@@ -461,13 +629,16 @@ impl Overrides {
             .filter_map(|(key, value)| {
                 let def = def(key)?;
                 let text = match (def.kind, value) {
-                    (Kind::Paths, toml::Value::Array(items)) => join(&items
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect::<Vec<_>>()),
+                    (Kind::Paths, toml::Value::Array(items)) => join(
+                        &items
+                            .iter()
+                            .map(|v| v.as_str().map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()?,
+                    ),
                     (_, toml::Value::String(s)) => s.clone(),
                     _ => return None,
                 };
+                validate(def, &text).ok()?;
                 Some((key.clone(), text))
             })
             .collect()
@@ -479,9 +650,7 @@ impl Overrides {
             .filter_map(|(key, value)| {
                 let def = def(key)?;
                 let encoded = if def.kind == Kind::Paths {
-                    toml::Value::Array(
-                        split(value).into_iter().map(toml::Value::String).collect(),
-                    )
+                    toml::Value::Array(split(value).into_iter().map(toml::Value::String).collect())
                 } else {
                     toml::Value::String(value.clone())
                 };
@@ -490,17 +659,63 @@ impl Overrides {
             .collect()
     }
 
-    /// Best effort, like every other thing blindspot writes: a launcher must not fail a
-    /// task because it could not record a preference.
-    fn save(&self) {
-        let Some(path) = &self.path else { return };
-        let Ok(text) = toml::to_string_pretty(&self.encode()) else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    fn save(&self) -> Result<(), &'static str> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        if self.damaged {
+            return Err(
+                "Existing settings could not be read; repair overrides.toml before saving changes",
+            );
         }
-        let _ = std::fs::write(path, text);
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let text =
+            toml::to_string_pretty(&self.encode()).map_err(|_| "Settings could not be encoded")?;
+        if text.len() > 262_144 {
+            return Err("Settings exceed the storage limit");
+        }
+        let parent = path.parent().ok_or("Settings directory unavailable")?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|_| "Settings directory unavailable")?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "Settings clock unavailable")?
+            .as_nanos();
+        for attempt in 0..8 {
+            let temporary = parent.join(format!(
+                ".blindspot-overrides-{}-{nonce}-{attempt}.tmp",
+                std::process::id()
+            ));
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {
+                    return Err("Settings could not be saved; the previous values are unchanged");
+                }
+            };
+            let result = file
+                .write_all(text.as_bytes())
+                .and_then(|()| file.sync_all())
+                .and_then(|()| std::fs::rename(&temporary, path));
+            drop(file);
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temporary);
+                return Err("Settings could not be saved; the previous values are unchanged");
+            }
+            if let Ok(directory) = std::fs::File::open(parent) {
+                let _ = directory.sync_all();
+            }
+            return Ok(());
+        }
+        Err("Settings temporary file unavailable; try again")
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -508,15 +723,21 @@ impl Overrides {
     }
 
     /// Records `value` for `key` and writes the file. The caller has already validated.
-    pub fn set(&mut self, key: &str, value: &str) {
-        self.values.insert(key.to_owned(), value.to_owned());
-        self.save();
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), &'static str> {
+        let mut next = self.clone();
+        next.values.insert(key.to_owned(), value.to_owned());
+        next.save()?;
+        *self = next;
+        Ok(())
     }
 
     /// Forgets `key`, so its value falls back to config.toml and then to the built-in.
-    pub fn reset(&mut self, key: &str) {
-        self.values.remove(key);
-        self.save();
+    pub fn reset(&mut self, key: &str) -> Result<(), &'static str> {
+        let mut next = self.clone();
+        next.values.remove(key);
+        next.save()?;
+        *self = next;
+        Ok(())
     }
 
     /// Lays the overrides over a config parsed from config.toml.
@@ -649,9 +870,11 @@ mod tests {
     fn overrides_round_trip_through_the_file() {
         let path = scratch("round-trip");
         let mut overrides = Overrides::load(Some(path.clone()));
-        overrides.set("max_results", "11");
-        overrides.set("agent.roots", "~/dev\0/tmp");
-        overrides.set("agent.model", "qwen3.5:9b-mlx");
+        overrides.set("max_results", "11").expect("saved");
+        overrides.set("agent.roots", "~/dev\0/tmp").expect("saved");
+        overrides
+            .set("agent.model", "qwen3.5:9b-mlx")
+            .expect("saved");
 
         let reloaded = Overrides::load(Some(path));
         assert_eq!(reloaded.get("max_results"), Some("11"));
@@ -665,8 +888,8 @@ mod tests {
     fn resetting_forgets_the_key() {
         let path = scratch("reset");
         let mut overrides = Overrides::load(Some(path.clone()));
-        overrides.set("max_results", "11");
-        overrides.reset("max_results");
+        overrides.set("max_results", "11").expect("saved");
+        overrides.reset("max_results").expect("saved");
         assert!(Overrides::load(Some(path)).is_empty());
     }
 
@@ -680,11 +903,84 @@ mod tests {
     #[test]
     fn an_unknown_key_in_the_file_is_dropped() {
         let path = scratch("unknown");
-        std::fs::write(&path, "\"not.a.setting\" = \"1\"\n\"max_results\" = \"4\"\n")
-            .expect("write");
+        std::fs::write(
+            &path,
+            "\"not.a.setting\" = \"1\"\n\"max_results\" = \"4\"\n",
+        )
+        .expect("write");
         let overrides = Overrides::load(Some(path));
         assert_eq!(overrides.len(), 1);
         assert_eq!(overrides.get("max_results"), Some("4"));
+    }
+
+    #[test]
+    fn failed_save_preserves_effective_values_and_previous_file() {
+        let path = scratch("failed-save");
+        let mut overrides = Overrides::load(Some(path.clone()));
+        overrides.set("content.enabled", "true").expect("saved");
+        let previous = std::fs::read(&path).expect("previous");
+        let backup = path.with_extension("backup");
+        std::fs::rename(&path, &backup).expect("preserve fixture");
+        std::fs::create_dir(&path).expect("block replacement");
+        assert!(overrides.set("content.enabled", "false").is_err());
+        assert!(overrides.reset("content.enabled").is_err());
+        assert_eq!(overrides.get("content.enabled"), Some("true"));
+        assert_eq!(std::fs::read(&backup).expect("retained"), previous);
+        std::fs::remove_dir(&path).expect("unblock");
+        std::fs::rename(backup, &path).expect("restore fixture");
+        overrides.set("content.enabled", "false").expect("retry");
+        assert_eq!(
+            Overrides::load(Some(path.clone())).get("content.enabled"),
+            Some("false")
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().expect("parent"))
+                .expect("entries")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_or_oversized_settings_are_preserved_and_invalid_values_are_ignored() {
+        let path = scratch("preserved-invalid");
+        for bytes in ["private malformed {{{".to_owned(), "x".repeat(262_145)] {
+            std::fs::write(&path, &bytes).expect("fixture");
+            let mut overrides = Overrides::load(Some(path.clone()));
+            assert!(overrides.set("content.enabled", "false").is_err());
+            assert_eq!(std::fs::read_to_string(&path).expect("preserved"), bytes);
+        }
+        std::fs::write(&path, "\"max_results\" = \"99999999\"\n\"agent.host\" = \"external.invalid:11434\"\n\"content.enabled\" = \"true\"\n").expect("values");
+        let overrides = Overrides::load(Some(path));
+        assert_eq!(overrides.len(), 1);
+        let mut config = Config::default();
+        overrides.apply(&mut config);
+        assert!(config.content.enabled);
+        assert_eq!(config.max_results, Config::default().max_results);
+        assert_eq!(config.agent.host, Config::default().agent.host);
+    }
+
+    #[test]
+    fn semantic_setting_round_trips_and_mixed_path_arrays_are_rejected_as_a_whole() {
+        let path = scratch("semantic-paths");
+        let mut overrides = Overrides::load(Some(path.clone()));
+        overrides.set("content.semantic", "true").unwrap();
+        let mut config = Config::default();
+        Overrides::load(Some(path.clone())).apply(&mut config);
+        assert!(config.content.semantic);
+        assert!(config.content.enabled);
+        std::fs::write(&path, "\"content.excluded_paths\" = [\"/private\", 123]\n").unwrap();
+        let invalid = Overrides::load(Some(path));
+        assert!(invalid.get("content.excluded_paths").is_none());
     }
 
     #[test]
@@ -696,11 +992,17 @@ mod tests {
         assert_eq!(validate(count, "8"), Ok(()));
 
         let chord = def("hotkey").expect("in schema");
-        assert!(validate(chord, "shift+space").is_err(), "needs a real modifier");
+        assert!(
+            validate(chord, "shift+space").is_err(),
+            "needs a real modifier"
+        );
         assert_eq!(validate(chord, "cmd+shift+space"), Ok(()));
         // An empty hotkey is not a hotkey; an empty *agent* hotkey is "none configured".
         assert!(validate(chord, "").is_err());
-        assert_eq!(validate(def("agent_hotkey").expect("in schema"), ""), Ok(()));
+        assert_eq!(
+            validate(def("agent_hotkey").expect("in schema"), ""),
+            Ok(())
+        );
 
         let host = def("agent.host").expect("in schema");
         assert!(validate(host, "example.com:11434").is_err(), "not loopback");

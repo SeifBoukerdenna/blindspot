@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use std::sync::{Arc, RwLock};
 
@@ -48,17 +49,13 @@ pub const RECENT_SCORE: f64 = 0.25;
 /// Runs the query and scores the result. Blocks for the query — about 84ms on this machine
 /// — so it is only ever called off the main thread.
 pub fn fetch_scores(now: u64, half_life_days: f64) -> HashMap<u64, f64> {
-    let output = Command::new("mdfind")
-        .args(["-attr", ATTRIBUTE, QUERY])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
+    let output = crate::process_job::capture_prefix(
+        Command::new("/usr/bin/mdfind").args(["-attr", ATTRIBUTE, QUERY]),
+        &AtomicBool::new(false),
+        8 << 20,
+    );
     match output {
-        Ok(out) => scores(
-            &parse(&String::from_utf8_lossy(&out.stdout)),
-            now,
-            half_life_days,
-        ),
+        Ok(out) => scores(&parse(&String::from_utf8_lossy(&out)), now, half_life_days),
         // No Spotlight, no usage history: ranking falls back to blindspot's own, which is
         // exactly what it was before this module existed.
         Err(_) => HashMap::new(),

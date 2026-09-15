@@ -35,9 +35,72 @@ pub struct Config {
     /// Register blindspot as a login item. On by default: a launcher that is not running
     /// after a reboot is not a launcher.
     pub launch_at_login: bool,
+    /// Web search offered as a fallback when a launcher search finds little; `{query}` is filled
+    /// with the typed text. Empty hides the row. Only opened when chosen.
+    pub fallback_search: String,
     pub frecency: Frecency,
     pub agent: Agent,
     pub clips: Clips,
+    pub content: Content,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Content {
+    pub enabled: bool,
+    pub semantic: bool,
+    pub roots: Vec<String>,
+    pub excluded_paths: Vec<String>,
+    pub max_file_mb: u64,
+    pub on_battery: bool,
+    /// Extract text from PDF documents in the chosen folders through the isolated helper.
+    pub documents: bool,
+    pub max_document_mb: u64,
+    /// Longer pauses between batches. Slower passes in exchange for less sustained CPU and I/O;
+    /// macOS offers no per-app CPU quota to enforce instead.
+    pub low_impact: bool,
+}
+
+impl Default for Content {
+    fn default() -> Self {
+        let roots = crate::files::home_dir()
+            .map(|home| {
+                vec![
+                    home.join("Desktop").to_string_lossy().into_owned(),
+                    home.join("Downloads").to_string_lossy().into_owned(),
+                ]
+            })
+            .unwrap_or_default();
+        Self {
+            enabled: true,
+            semantic: false,
+            roots,
+            excluded_paths: vec!["~/Library".into(), "~/.ssh".into(), "~/.gnupg".into()],
+            max_file_mb: 1,
+            on_battery: false,
+            documents: true,
+            max_document_mb: 32,
+            low_impact: false,
+        }
+    }
+}
+
+impl Content {
+    pub fn expanded_roots(&self) -> Vec<PathBuf> {
+        self.roots
+            .iter()
+            .take(32)
+            .filter_map(|path| expand_tilde(path))
+            .collect()
+    }
+
+    pub fn expanded_exclusions(&self) -> Vec<PathBuf> {
+        self.excluded_paths
+            .iter()
+            .take(128)
+            .filter_map(|path| expand_tilde(path))
+            .collect()
+    }
 }
 
 /// Clipboard history (M5).
@@ -147,9 +210,11 @@ impl Default for Config {
             hotkey: "cmd+shift+space".to_owned(),
             agent_hotkey: String::new(),
             launch_at_login: true,
+            fallback_search: "https://duckduckgo.com/?q={query}".to_owned(),
             frecency: Frecency::default(),
             agent: Agent::default(),
             clips: Clips::default(),
+            content: Content::default(),
         }
     }
 }

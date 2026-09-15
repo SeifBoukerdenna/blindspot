@@ -31,6 +31,15 @@ final class ClipboardWatcher {
     /// The `changeCount` of blindspot's own most recent write, so it is not re-ingested.
     private var ownWrite: Int?
     private var task: Task<Void, Never>?
+    private struct PendingClip: Sendable {
+        let data: Data
+        let image: Bool
+        let readingText: Bool
+    }
+    private var pending: [PendingClip] = []
+    private var ingestion: Task<Void, Never>?
+    private var pendingBytes = 0
+    private var clearing = false
     /// Whether to record images at all, and whether to read the text in one. Both are
     /// settings, and both are read here rather than in Rust because the pasteboard and
     /// Vision are AppKit's.
@@ -48,7 +57,7 @@ final class ClipboardWatcher {
     }
 
     func start() {
-        guard task == nil else { return }
+        guard task == nil, !clearing else { return }
         task = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -61,6 +70,21 @@ final class ClipboardWatcher {
     func stop() {
         task?.cancel()
         task = nil
+        ingestion?.cancel()
+        pending.removeAll()
+        pendingBytes = 0
+    }
+
+    func prepareToClear() async {
+        clearing = true
+        stop()
+        await ingestion?.value
+        lastSeen = pasteboard.changeCount
+    }
+
+    func finishClearing() {
+        lastSeen = pasteboard.changeCount
+        clearing = false
     }
 
     /// Puts something on the pasteboard without it coming straight back into history.
@@ -68,6 +92,24 @@ final class ClipboardWatcher {
     /// Re-pasting a clip is recorded by bumping it through `bs_activate` instead. Letting
     /// the watcher re-read it would duplicate images outright: an image goes back on the
     /// pasteboard as TIFF, re-encodes to different PNG bytes, and hashes to a new id.
+    /// Puts something on the pasteboard, and lets the poller record it like any other copy.
+    ///
+    /// Which is the point: pressing ↩ on a figure, a path, a pid or the model's answer *is*
+    /// copying something, and a history that omits everything you deliberately copied out
+    /// of the launcher is a history with a hole in it. Re-copying something already in
+    /// history dedups to a bump rather than a duplicate, so this is safe even then.
+    func copy(_ body: (NSPasteboard) -> Void) {
+        pasteboard.clearContents()
+        body(pasteboard)
+    }
+
+    /// As [`copy`], but the poller skips what this writes.
+    ///
+    /// One case needs it: putting an *image* clip back. `writeObjects` offers several
+    /// representations and the bytes are not the PNG that was stored, so the content hash
+    /// differs and history would gain a near-duplicate of the thing you just pasted. A clip
+    /// is already in history by definition — `bs_activate` bumps it — so there is nothing
+    /// to record.
     func writeOwn(_ body: (NSPasteboard) -> Void) {
         pasteboard.clearContents()
         body(pasteboard)
@@ -91,26 +133,47 @@ final class ClipboardWatcher {
         let types = pasteboard.types?.map(\.rawValue) ?? []
         guard !Self.shouldSkip(types: types) else { return }
 
-        let sink = self.sink
-        // Image data wins when both are present: copying an image in a browser also puts
-        // its URL on the pasteboard as text, and the image is what the user meant.
         let image = recordsImages
             ? pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff)
             : nil
         if let data = image {
-            // Encoding a 5K screenshot takes long enough that doing it here would stall the
-            // hotkey, so it happens off the main actor, and so does the write to Rust.
-            let reading = readsImageText
-            Task.detached(priority: .utility) {
-                guard let clip = ImageClip.encode(data, readingText: reading) else { return }
-                sink.add(
-                    image: true, content: clip.png, thumbnail: clip.thumbnail,
-                    text: Data(clip.text.utf8), width: clip.width, height: clip.height)
-            }
+            enqueue(PendingClip(data: data, image: true, readingText: readsImageText))
         } else if let text = pasteboard.string(forType: .string) {
-            let data = Data(text.utf8)
-            // Off the main actor too: even a small clip is a redb commit, which is an fsync.
-            Task.detached(priority: .utility) { sink.add(image: false, content: data) }
+            enqueue(PendingClip(data: Data(text.utf8), image: false, readingText: false))
+        }
+    }
+
+    private func enqueue(_ clip: PendingClip) {
+        guard clip.data.count <= (clip.image ? 25 * 1024 * 1024 : 1024 * 1024) else { return }
+        while !pending.isEmpty && (pending.count >= 16 || pendingBytes + clip.data.count > 32 * 1024 * 1024) {
+            pendingBytes -= pending.removeFirst().data.count
+        }
+        pending.append(clip)
+        pendingBytes += clip.data.count
+        drain()
+    }
+
+    private func drain() {
+        guard ingestion == nil, !pending.isEmpty else { return }
+        let clip = pending.removeFirst()
+        pendingBytes -= clip.data.count
+        let sink = self.sink
+        ingestion = Task { [weak self] in
+            let worker = Task.detached(priority: .utility) {
+                guard !Task.isCancelled else { return }
+                if clip.image {
+                    guard let encoded = ImageClip.encode(clip.data, readingText: clip.readingText),
+                          !Task.isCancelled else { return }
+                    sink.add(image: true, content: encoded.png, thumbnail: encoded.thumbnail,
+                             text: Data(encoded.text.utf8), width: encoded.width, height: encoded.height)
+                } else {
+                    sink.add(image: false, content: clip.data)
+                }
+            }
+            await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+            guard let self else { return }
+            self.ingestion = nil
+            self.drain()
         }
     }
 }
@@ -133,8 +196,13 @@ enum ImageClip {
     /// `readingText` off skips the Vision pass — about 99ms on a full-screen capture —
     /// and the clip is then named by its size rather than by what it says.
     static func encode(_ data: Data, readingText: Bool = true) -> Encoded? {
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-            let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        guard data.count <= 25 * 1024 * 1024,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0, height > 0, width <= 50_000_000 / height,
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else { return nil }
 
         // Already a PNG: keep the original bytes rather than paying to re-encode them.

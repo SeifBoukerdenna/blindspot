@@ -7,7 +7,11 @@ pub mod agent;
 pub mod calc;
 pub mod civil;
 pub mod clips;
+pub mod commands;
 pub mod config;
+pub mod content;
+pub mod content_indexer;
+pub mod content_service;
 pub mod exec;
 pub mod ffi;
 pub mod files;
@@ -17,9 +21,15 @@ pub mod index;
 // `match` is a keyword; the file is named `match.rs` to match the layout in CLAUDE.md.
 #[path = "match.rs"]
 pub mod matching;
+pub mod ports;
+pub mod process_job;
+pub mod query;
 pub mod recent;
 pub mod relevance;
 pub mod settings;
+pub mod shortcuts;
+pub mod system;
+pub mod semantic;
 pub mod store;
 pub mod tools;
 pub mod usage;

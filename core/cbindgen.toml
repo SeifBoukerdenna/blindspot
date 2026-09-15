@@ -16,3 +16,6 @@ usize_is_size_t = true
 
 [parse]
 parse_deps = false
+
+[export]
+exclude = ["PREFIX", "SHARD_CAPACITY", "MAX_SHARDS"]

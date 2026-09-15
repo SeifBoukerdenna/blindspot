@@ -6,7 +6,7 @@
 //! the streaming-with-cancellation behaviour below would still have to be written by hand.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -86,14 +86,25 @@ fn send(
     cancel: &AtomicBool,
     mut on_line: impl FnMut(&str),
 ) -> Result<(), HttpError> {
-    let address = host
-        .to_socket_addrs()
-        .map_err(HttpError::Connect)?
-        .next()
-        .ok_or(HttpError::Malformed("host resolves to nothing"))?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(HttpError::Cancelled);
+    }
+    let host = host
+        .strip_prefix("localhost:")
+        .map(|port| format!("127.0.0.1:{port}"))
+        .unwrap_or_else(|| host.to_owned());
+    let address: SocketAddr = host
+        .parse()
+        .map_err(|_| HttpError::Malformed("invalid local address"))?;
+    if !address.ip().is_loopback() {
+        return Err(HttpError::Malformed("host must be loopback"));
+    }
     let mut stream =
         TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(HttpError::Connect)?;
     stream.set_read_timeout(Some(POLL)).map_err(HttpError::Io)?;
+    stream
+        .set_write_timeout(Some(CONNECT_TIMEOUT))
+        .map_err(HttpError::Io)?;
     // Small writes are the whole conversation here, so waiting to coalesce them only adds delay.
     let _ = stream.set_nodelay(true);
 
@@ -114,6 +125,8 @@ struct Reader<'a> {
     /// De-chunked body bytes not yet split into a complete line.
     body: Vec<u8>,
     last_progress: Instant,
+    received: usize,
+    started: Instant,
 }
 
 impl<'a> Reader<'a> {
@@ -124,6 +137,8 @@ impl<'a> Reader<'a> {
             raw: Vec::new(),
             body: Vec::new(),
             last_progress: Instant::now(),
+            received: 0,
+            started: Instant::now(),
         }
     }
 
@@ -135,7 +150,7 @@ impl<'a> Reader<'a> {
             while self.fill()? {}
             let rest = std::mem::take(&mut self.raw);
             let mut reason = String::from_utf8_lossy(&rest).into_owned();
-            reason.truncate(200);
+            reason = reason.chars().take(200).collect();
             return Err(HttpError::Status(status, reason.trim().to_owned()));
         }
 
@@ -169,10 +184,14 @@ impl<'a> Reader<'a> {
             if self.cancel.load(Ordering::Acquire) {
                 return Err(HttpError::Cancelled);
             }
+            if self.started.elapsed() > Duration::from_secs(120) {
+                return Err(HttpError::Malformed("request deadline exceeded"));
+            }
             match self.stream.read(&mut chunk) {
                 Ok(0) => return Ok(false),
                 Ok(read) => {
-                    if self.raw.len() + read > MAX_BODY {
+                    self.received = self.received.saturating_add(read);
+                    if self.received > MAX_BODY {
                         return Err(HttpError::Malformed("reply too large"));
                     }
                     self.raw.extend_from_slice(&chunk[..read]);
@@ -241,11 +260,17 @@ impl<'a> Reader<'a> {
             if size == 0 {
                 return Ok(true);
             }
+            if size > MAX_BODY {
+                return Err(HttpError::Malformed("chunk too large"));
+            }
             // The chunk, plus the CRLF that follows it.
             if self.raw.len() < header_end + 2 + size + 2 {
                 return Ok(false);
             }
             let start = header_end + 2;
+            if &self.raw[start + size..start + size + 2] != b"\r\n" {
+                return Err(HttpError::Malformed("invalid chunk terminator"));
+            }
             self.body.extend_from_slice(&self.raw[start..start + size]);
             self.raw.drain(..start + size + 2);
         }
@@ -340,6 +365,30 @@ mod tests {
             lines.push(line.to_owned())
         });
         (result, lines)
+    }
+
+    #[test]
+    fn hostile_chunk_sizes_and_unicode_errors_do_not_panic() {
+        for body in ["ffffffffffffffff\r\n", "1\r\nxXX"] {
+            let (host, _) = serve(
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}").into_bytes(),
+            );
+            assert!(collect(&host, &AtomicBool::new(false)).0.is_err());
+        }
+        let (host, _) =
+            serve(format!("HTTP/1.1 500 Error\r\n\r\n{}", "é".repeat(150)).into_bytes());
+        assert!(matches!(
+            collect(&host, &AtomicBool::new(false)).0,
+            Err(HttpError::Status(500, _))
+        ));
+    }
+
+    #[test]
+    fn transport_itself_refuses_non_loopback() {
+        assert!(matches!(
+            get("192.0.2.1:80", "/", &AtomicBool::new(false)),
+            Err(HttpError::Malformed(_))
+        ));
     }
 
     #[test]

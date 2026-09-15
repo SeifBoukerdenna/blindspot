@@ -14,13 +14,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKey: HotKey?
     /// The optional second hotkey, which opens the agent directly.
     private var agentHotKey: HotKey?
+    private var settingsHotKey: HotKey?
     private var watcher: ClipboardWatcher?
+    private var contentWatcher: ContentWatcher?
     /// Built once and reused: re-reading the settings is cheap, rebuilding a window is not.
     private var settingsWindow: SettingsWindow?
     /// The way in that cannot break. See `StatusItem`.
     private var statusItem: StatusItem?
     /// Live only while the configured hotkey is one Spotlight is holding.
     private var conflictWatcher: Task<Void, Never>?
+    private var panelShortcutMonitor: Any?
 
     static func main() {
         let app = NSApplication.shared
@@ -32,7 +35,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         app.run()
     }
 
+    /// Two copies would index the same folders into the same database and compete for it — the
+    /// cause of back-to-back passes when an unzipped build ran beside the installed one — and the
+    /// second copy's hotkeys cannot register. Asks which copy to keep; returns true when this one quits.
+    private func quitIfDuplicate() -> Bool {
+        guard let identifier = Bundle.main.bundleIdentifier else { return false }
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+            .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier && !$0.isTerminated }
+        guard let other = others.first else { return false }
+        NSApp.activate()
+        let alert = NSAlert()
+        alert.messageText = "Blindspot is already running"
+        alert.informativeText = "Another copy is running from \(other.bundleURL?.deletingLastPathComponent().path ?? "another location"). Two copies would index the same folders twice and compete for the same index."
+        alert.addButton(withTitle: "Quit the other copy")
+        alert.addButton(withTitle: "Quit this copy")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            NSApp.terminate(nil)
+            return true
+        }
+        others.forEach { $0.terminate() }
+        let deadline = Date().addingTimeInterval(5)
+        while others.contains(where: { !$0.isTerminated }), Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        // The user chose to replace it; a copy that ignores a normal quit for five seconds is stopped.
+        others.filter { !$0.isTerminated }.forEach { $0.forceTerminate() }
+        return false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if quitIfDuplicate() { return }
         guard let core = Core() else {
             die(
                 "blindspot could not start.",
@@ -48,15 +80,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Built here, once, and never on the hotkey path. The initial scan already
         // happened inside `Core()`, so the first invocation has a populated index.
         let panel = Panel(core: core, watcher: watcher)
+        panel.onSettings = { [weak self] in self?.openSettings() }
+        panel.onOpenSetting = { [weak self] key in self?.settingsWindow?.show(settingKey: key) }
         self.panel = panel
+        panelShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self, self.panel?.isVisible == true else { return event }
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                .subtracting([.numericPad, .function, .capsLock])
+            guard event.keyCode == UInt16(kVK_ANSI_Comma), flags == .command else { return event }
+            self.openSettings()
+            return nil
+        }
 
         let window = SettingsWindow(core: core)
+        window.beforeClearClips = { [weak watcher] in await watcher?.prepareToClear() }
+        window.afterClearClips = { [weak self, weak watcher] in
+            watcher?.finishClearing()
+            self?.applySettings()
+        }
         window.onChange = { [weak self] in self?.applySettings() }
         window.onPalette = { [weak self] in self?.rebuildPanel() }
         settingsWindow = window
         statusItem = StatusItem(
             onSettings: { [weak self] in self?.openSettings() },
-            onReindex: { [weak core] in core?.reindex() })
+            onReindex: { [weak core] in core?.reindex(); core?.refreshContent() })
 
         let settings = core.startup
         reconcileLoginItem(wanted: settings.launch_at_login)
@@ -97,6 +144,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        let settingsHotKey = HotKey(
+            keyCode: UInt32(kVK_ANSI_Comma), modifiers: UInt32(cmdKey | shiftKey), id: 3
+        ) { [weak self] in self?.openSettings() }
+        self.settingsHotKey = settingsHotKey
+        if !settingsHotKey.register() {
+            NSLog("blindspot: could not register the global Settings hotkey")
+        }
+
         // Deferred one main-loop turn so `applicationDidFinishLaunching` returns and the
         // hotkey is live before this spends ~40ms loading and flattening icons. Doing it
         // at all is what removes the 108ms stall the first panel used to pay.
@@ -109,6 +164,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // it would appear then rather than at login. And only if history is on — off means
         // the poller never starts, not that it records and discards.
         applyClipSettings(settings)
+
+        let contentWatcher = ContentWatcher(core: core)
+        contentWatcher.onIndexChanged = { [weak self] in self?.panel?.refreshContentResults() }
+        self.contentWatcher = contentWatcher
+        contentWatcher.configure()
 
         // Registered regardless — Carbon accepts a chord Spotlight holds and then never
         // delivers it — so this only explains the silence, and watches for it to end.
@@ -125,13 +185,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        contentWatcher?.stop()
         watcher?.stop()
-        // `core` is deliberately *not* released. Its deinit runs `bs_shutdown`, which frees
-        // the handle, while a detached task may still be encoding a screenshot it is about
-        // to hand to `bs_clip_add` — a use-after-free with nothing to order the two. The
-        // process is exiting and the kernel reclaims everything; the FFI tests already
-        // prove `bs_shutdown` frees correctly, which is what the explicit teardown was for.
         panel?.close()
+        if let panelShortcutMonitor { NSEvent.removeMonitor(panelShortcutMonitor) }
+        panelShortcutMonitor = nil
         hotKey = nil
     }
 
@@ -150,6 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebindAgentHotKey(to: settings)
         reconcileLoginItem(wanted: settings.launch_at_login)
         applyClipSettings(settings)
+        contentWatcher?.configure()
         panel?.applySettings()
     }
 
@@ -164,7 +223,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildPanel() {
         guard let core, let watcher else { return }
         panel?.orderOut(nil)
-        panel = Panel(core: core, watcher: watcher)
+        let rebuilt = Panel(core: core, watcher: watcher)
+        rebuilt.onSettings = { [weak self] in self?.openSettings() }
+        rebuilt.onOpenSetting = { [weak self] key in self?.settingsWindow?.show(settingKey: key) }
+        panel = rebuilt
         // Icons are cached in their palette-independent colour and a drained copy, so the
         // cache survives — nothing in `IconCache` reads `Theme`.
     }

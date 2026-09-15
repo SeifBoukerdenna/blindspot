@@ -21,6 +21,12 @@
 	     make blindspot the active app, and an agent cannot become one by accident. -->
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Read the selected Finder item, browser URL, or terminal session when you use a contextual command. Data stays on this Mac.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Show today's and tomorrow's events and their meeting links when you ask for your schedule. Calendar data stays on this Mac.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Show today's and tomorrow's events and their meeting links when you ask for your schedule. Calendar data stays on this Mac.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>
