@@ -190,6 +190,12 @@ CI and GitHub releases (docs/releasing.md):
   - Signing trust: same team installs directly; ad hoc asks with a warning; a different team is refused.
   - Swaps via replaceItemAt beside the app and relaunches after exit.
   - Tests: `make test-updater` (offline fixture apps; in CI and release).
+- **App icon:** scripts/make-icon.sh draws scripts/make-icon.swift and packs shell/AppIcon.icns and
+  media/icon.png, both committed. It uses the Ember palette on Apple's icon template; Info.plist
+  CFBundleIconFile is AppIcon.
+- **Calendar questions:** LocalRequest.asksAboutCalendar routes everyday calendar questions, plain or
+  after `>`, to the EventKit schedule, because the model has no calendar access. Create, move and
+  notes requests are excluded. The agent SYSTEM prompt points to `my schedule`.
 - **No Apple services:** releases are GitHub Releases only; the user does not want notarization,
   App Store Connect or Apple-server steps. Signing keeps --timestamp=none and no hardened runtime.
 - **The user does all of these, never Claude:** commits, pushes, tags, secrets, repository

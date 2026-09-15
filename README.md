@@ -1,3 +1,5 @@
+<p align="center"><img src="media/icon.png" width="128" alt="Blindspot icon"></p>
+
 # Blindspot
 
 **A keyboard launcher for your Mac that also finds what's inside your files, and keeps everything on your Mac.**

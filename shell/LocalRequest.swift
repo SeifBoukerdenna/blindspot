@@ -10,6 +10,9 @@ enum LocalRequest: Equatable {
     static func parse(_ text: String) -> LocalRequest? {
         let normalized = text.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         if [":schedule", ":today", ":calendar"].contains(normalized) { return .schedule }
+        if !text.hasPrefix(":"), !text.hasPrefix("?"), !text.hasPrefix(";"), asksAboutCalendar(normalized) {
+            return .schedule
+        }
         guard !text.hasPrefix(":"), !text.hasPrefix(">"), !text.hasPrefix("?"), !text.hasPrefix(";") else { return nil }
         for prefix in ["kill the process using port ", "close whatever is using port ", "terminate the process using port ", "kill process on port "] {
             if normalized.hasPrefix(prefix), let port = UInt16(normalized.dropFirst(prefix.count)), port > 0 {
@@ -49,6 +52,30 @@ enum LocalRequest: Equatable {
             }
         }
         return nil
+    }
+
+    /// A calendar question in everyday words, typed plainly or after `>`. The local model has no
+    /// calendar access and would only say so, so the question is answered from EventKit instead.
+    ///
+    /// It needs a calendar word and a question or time cue. Requests to create or change events,
+    /// and anything about notes, files or summaries, are left to search and the model.
+    static func asksAboutCalendar(_ normalized: String) -> Bool {
+        var text = normalized.replacingOccurrences(of: "\u{2019}", with: "'")
+        if text.hasPrefix(">") { text = text.dropFirst().trimmingCharacters(in: .whitespaces) }
+        guard !text.isEmpty, text.utf8.count <= 160 else { return false }
+        let words = Set(text.split { !$0.isLetter && !$0.isNumber && $0 != "'" }.map(String.init))
+        let subjects: Set = ["calendar", "calendars", "schedule", "agenda", "meeting", "meetings", "appointment", "appointments", "events"]
+        let excluded: Set = [
+            "notes", "note", "file", "files", "document", "documents", "doc", "docs", "pdf", "transcript", "recording",
+            "email", "summarize", "summary", "create", "add", "book", "cancel", "delete", "move", "reschedule",
+            "invite", "remind", "reminder", "set", "port",
+        ]
+        let cues: Set = [
+            "today", "tomorrow", "tonight", "morning", "afternoon", "evening", "next", "upcoming", "now", "left",
+            "anything", "something", "smth", "any", "have", "got", "what's", "whats", "when", "busy", "free", "my",
+        ]
+        guard !words.isDisjoint(with: subjects), words.isDisjoint(with: excluded), !words.isDisjoint(with: cues) else { return false }
+        return !["schedule a ", "schedule an ", "schedule the ", "schedule time", "schedule with "].contains { text.hasPrefix($0) }
     }
 
     var query: String? {

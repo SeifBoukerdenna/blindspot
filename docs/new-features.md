@@ -425,7 +425,11 @@ Automation**.
 
 ## 10. Calendar: my schedule and joining meetings
 
-Type `my schedule`, `:schedule`, `next meeting` or `join my next meeting`.
+Type `my schedule`, `:schedule`, `next meeting` or `join my next meeting`. Everyday questions work too, typed plainly
+or after `>`: `do I have anything on my calendar today`, `when is my next meeting`,
+`> any meetings this afternoon`. The local AI cannot read your calendar, so these show the
+schedule instead of asking it. Requests to create or move events, and searches for meeting notes
+or documents, are not captured.
 
 - **First use:** a row asks for Calendar access. Press Return and macOS shows its permission
   prompt. If access was declined, the row opens **Privacy & Security → Calendars** instead.

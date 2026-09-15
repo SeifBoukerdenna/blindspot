@@ -49,6 +49,14 @@ enum ActionTests {
         precondition(LocalRequest.parse("documents about genetec")?.query == ":content kind:documents genetec")
         precondition(LocalRequest.parse("my schedule") == .schedule && LocalRequest.parse(":schedule") == .schedule)
         precondition(LocalRequest.parse("join my next meeting") == .schedule && LocalRequest.parse("schedule a meeting") == nil)
+        for question in [">do i have smth on my calendar today", "Do I have anything on my calendar tomorrow?",
+                         "when is my next meeting", "> any meetings this afternoon", "what\u{2019}s on my agenda today"] {
+            precondition(LocalRequest.parse(question) == .schedule, question)
+        }
+        for other in ["schedule a meeting with alex tomorrow", "find my meeting notes", ">summarize the meeting transcript",
+                      ">docs what did the meeting decide", "move my meeting to friday", "meeting", "?calendar today"] {
+            precondition(LocalRequest.parse(other) != .schedule, other)
+        }
         precondition(ScheduleProvider.meetingURL(in: ["Dial in: us02web.zoom.us/j/123?pwd=abc"])?.absoluteString == "https://us02web.zoom.us/j/123?pwd=abc")
         precondition(ScheduleProvider.meetingURL(in: ["https://evil.example/zoom.us/j/1", "notes https://example.com"]) == nil)
         precondition(ScheduleProvider.service(for: URL(string: "https://meet.google.com/abc-defg-hij")!) == "Google Meet")

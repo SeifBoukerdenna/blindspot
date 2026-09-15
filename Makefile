@@ -88,10 +88,11 @@ $(BINARY): $(SWIFT_SRC) $(CORE_LIB) $(HEADER) shell/Info.plist Makefile
 
 RESOURCE_FILES := $(shell find docs/licenses -type f -print 2>/dev/null)
 $(RESOURCE_STAMP): scripts/package-resources.py core/Cargo.lock helpers/vector-worker/Cargo.lock \
-		docs/new-features.md $(RESOURCE_FILES)
+		docs/new-features.md shell/AppIcon.icns $(RESOURCE_FILES)
 	python3 scripts/package-resources.py --root . --output $(BUILD)/release-licenses
 	@mkdir -p $(CONTENTS)/Resources/ThirdPartyLicenses
 	cp docs/new-features.md $(CONTENTS)/Resources/README.md
+	cp shell/AppIcon.icns $(CONTENTS)/Resources/AppIcon.icns
 	cp -R $(BUILD)/release-licenses/. $(CONTENTS)/Resources/ThirdPartyLicenses/
 	@touch $@
 

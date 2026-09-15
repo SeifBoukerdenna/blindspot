@@ -8,6 +8,8 @@
 	<string>@RELEASE_REPO@</string>
 	<key>CFBundleExecutable</key>
 	<string>blindspot</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>@BUNDLE_ID@</string>
 	<key>CFBundleName</key>
