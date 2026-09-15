@@ -1,0 +1,11 @@
+# Actions are pinned to commit SHAs; this proposes updates to those pins as pull requests,
+# which are reviewed and merged by hand like any other change.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

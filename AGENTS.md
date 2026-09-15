@@ -168,12 +168,25 @@ Distinguish sandbox/TCC failures from product failures. Request necessary tool p
 honestly. Signing uses the existing Developer ID and explicitly signs nested helpers. Keep
 bundle ID stable. This is a locally signed build, not a notarized distribution.
 
-For the next completed release, normally use 0.2.5 in Makefile. Update docs/new-features.md,
-build/sign, package the app plus START-HERE.md into build/Blindspot-<version>.zip. Stop the old
-Blindspot process, retain a timestamped app backup, install into ~/Applications/Blindspot.app,
-and launch. Verify installed version/process/signature and preserved index. Copy zip and
-versioned cheatsheet into Downloads. Preserve all user state. Do not claim delivered until
-artifacts exist and installed until the actual installation succeeds.
+Releases: the user runs `scripts/release.sh`, which sets VERSION, adds a `**X.Y.Z changes**`
+entry to docs/new-features.md from commit messages when missing, runs check-header/check/test/
+test-actions, asks once, then commits, tags vX.Y.Z and pushes. `make install` builds, signs,
+moves the bundle to ~/Applications/Blindspot.app (single copy, build path unregistered) and
+relaunches. Verify installed version/process/signature and preserved index. Preserve all user
+state. Do not claim delivered or installed until it actually happened.
+
+CI and GitHub releases (docs/releasing.md):
+- **CI:** .github/workflows/ci.yml runs on push/PR on `macos-26` with Rust 1.95.0 and
+  Xcode 26.6: check-header, clippy, tests, ad-hoc build, action/content/helper/smoke tests, and
+  the package step.
+- **Release:** .github/workflows/release.yml runs on a `vX.Y.Z` tag. It verifies tag = VERSION
+  and that the commit is on main, runs the tests, signs, and publishes the release.
+  - Signing uses a Developer ID only if the optional MACOS_CERTIFICATE_P12_BASE64 and
+    MACOS_CERTIFICATE_PASSWORD secrets exist; otherwise ad hoc.
+- **No Apple services:** releases are GitHub Releases only; the user does not want notarization,
+  App Store Connect or Apple-server steps. Signing keeps --timestamp=none and no hardened runtime.
+- **The user does all of these, never Claude:** commits, pushes, tags, secrets, repository
+  settings and releases. Scripts they run may do them.
 
 Finish with concise changes, actual validation, artifact/guide paths and remaining limitations.
 Keep the cheatsheet comprehensive and honest, with real workflows for major new capabilities.

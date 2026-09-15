@@ -1,0 +1,153 @@
+name: Release
+
+# Runs when a version tag is pushed (scripts/release.sh does that after you confirm). It builds
+# that exact commit, signs it, and publishes a GitHub release with the zip, the cheatsheet and
+# checksums. Nothing is sent to Apple: releases are not notarized.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.95.0"
+  CBINDGEN_VERSION: "0.29.4"
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      # No caches in this job: what it publishes should come only from the tagged commit.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check tag, version, branch and notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(make -s version)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match VERSION $version in the Makefile"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG points at a commit that is not on main"
+            exit 1
+          fi
+          mkdir -p build
+          python3 scripts/release-notes.py docs/new-features.md "$version" > build/release-notes.md
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }} and cbindgen
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          cargo install cbindgen --version "$CBINDGEN_VERSION" --locked
+          cargo fetch --locked --manifest-path core/Cargo.toml
+          cargo fetch --locked --manifest-path helpers/vector-worker/Cargo.toml
+
+      - name: Verify before building the release
+        run: |
+          make check-header
+          make check
+          make test
+          make test-actions
+
+      # Optional. Without the certificate secret the app is signed ad hoc, which works, but an ad
+      # hoc identity changes with every build, so macOS asks for Accessibility again after each
+      # update. With your Developer ID the identity is stable and permissions carry over.
+      - name: Choose the signing identity
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$CERTIFICATE_P12_BASE64" ]; then
+            echo "::notice::No MACOS_CERTIFICATE_P12_BASE64 secret: signing ad hoc (see docs/releasing.md to keep permissions across updates)"
+            echo "SIGN_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(uuidgen)
+          certificate="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$certificate"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')
+          if [ -z "$identity" ]; then
+            echo "::error::MACOS_CERTIFICATE_P12_BASE64 holds no Developer ID Application identity"
+            exit 1
+          fi
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Build and sign
+        run: make sign SIGN_ID="$SIGN_IDENTITY"
+
+      - name: Package and check the download
+        run: |
+          make package
+          cd build
+          shasum -a 256 "Blindspot-$VERSION.zip" "Blindspot-$VERSION-Cheatsheet.md" > "Blindspot-$VERSION-SHA256SUMS.txt"
+          check="$RUNNER_TEMP/unzipped"
+          rm -rf "$check" && mkdir -p "$check"
+          ditto -x -k "Blindspot-$VERSION.zip" "$check"
+          app="$check/Blindspot-$VERSION/Blindspot.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION"
+          codesign --verify --deep --strict "$app"
+          test -f "$check/Blindspot-$VERSION/START-HERE.md"
+          rm -rf "$check"
+
+      - name: Keep the release files with the run
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Blindspot-${{ env.VERSION }}
+          path: |
+            build/Blindspot-${{ env.VERSION }}.zip
+            build/Blindspot-${{ env.VERSION }}-Cheatsheet.md
+            build/Blindspot-${{ env.VERSION }}-SHA256SUMS.txt
+            build/release-notes.md
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --latest \
+            --title "Blindspot $VERSION" \
+            --notes-file build/release-notes.md \
+            "build/Blindspot-$VERSION.zip" \
+            "build/Blindspot-$VERSION-Cheatsheet.md" \
+            "build/Blindspot-$VERSION-SHA256SUMS.txt"
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/certificate.p12"

@@ -46,14 +46,14 @@ SWIFTFLAGS := -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
               -framework Quartz -framework EventKit \
               -L $(CORE_DIR)/target/release -lblindspot_core
 
-.PHONY: all core header app sign run clean test test-actions test-content test-semantic test-vectors smoke-panel bench bench-shell check
+.PHONY: all core header app sign package install version run clean test test-actions test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
 
 all: sign
 
 core: $(CORE_LIB)
 
 $(CORE_LIB): $(CORE_SRC) $(CORE_DIR)/Cargo.toml $(CORE_DIR)/Cargo.lock Makefile
-	MACOSX_DEPLOYMENT_TARGET=$(DEPLOY) cargo build --release --manifest-path $(CORE_DIR)/Cargo.toml
+	MACOSX_DEPLOYMENT_TARGET=$(DEPLOY) cargo build --release --locked --manifest-path $(CORE_DIR)/Cargo.toml
 
 header: $(HEADER)
 
@@ -101,7 +101,8 @@ $(RESOURCE_STAMP): scripts/package-resources.py core/Cargo.lock helpers/vector-w
 #
 # --timestamp=none because Developer ID signing otherwise contacts Apple's timestamp
 # server on every build: a network call CLAUDE.md rules out, and a build that fails
-# offline. A secure timestamp only matters for notarization, which this is not.
+# offline. A secure timestamp only matters for notarization, and releases are not
+# notarized: they are published through GitHub Releases alone.
 #
 # No --deep: sign the nested helpers explicitly before their enclosing bundle. Not
 # conditional on the binary being newer, because a stale signature is a confusing way
@@ -114,12 +115,36 @@ sign: app
 	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID).vectors $(VECTORS)
 	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID) $(BUNDLE)
 
+# The download: the signed app with the feature guide as START-HERE.md, plus the guide as a
+# standalone cheatsheet. Not dependent on `sign`, so the Release workflow packages exactly the
+# bundle it verified. The staging copy is removed so no second Blindspot.app lingers for
+# LaunchServices to register.
+DIST := $(BUILD)/$(APP)-$(VERSION)
+
+package:
+	@test -d $(BUNDLE) || { echo "error: $(BUNDLE) is missing; run make sign first" >&2; exit 1; }
+	codesign --verify --deep --strict $(BUNDLE)
+	rm -rf $(DIST) $(DIST).zip
+	mkdir -p $(DIST)
+	ditto $(BUNDLE) $(DIST)/$(APP).app
+	cp docs/new-features.md $(DIST)/START-HERE.md
+	cd $(BUILD) && ditto -c -k --sequesterRsrc --keepParent $(APP)-$(VERSION) $(APP)-$(VERSION).zip
+	rm -rf $(DIST)
+	cp docs/new-features.md $(DIST)-Cheatsheet.md
+
+# Replaces ~/Applications/Blindspot.app with this build and relaunches it (scripts/install.sh).
+install: sign
+	scripts/install.sh $(BUNDLE)
+
+version:
+	@echo $(VERSION)
+
 run: sign
 	@pkill -x blindspot 2>/dev/null || true
 	open $(BUNDLE)
 
 test:
-	cargo test --manifest-path $(CORE_DIR)/Cargo.toml
+	cargo test --locked --manifest-path $(CORE_DIR)/Cargo.toml
 
 test-actions: $(CORE_LIB) $(HEADER)
 	@mkdir -p $(BUILD)
@@ -146,7 +171,15 @@ $(BUILD)/content-tests: bench/ContentWatcherTests.swift shell/ContentWatcher.swi
 	swiftc $(SWIFTFLAGS) -o $@ bench/ContentWatcherTests.swift shell/ContentWatcher.swift shell/Bridge.swift
 
 check:
-	cargo clippy --manifest-path $(CORE_DIR)/Cargo.toml --all-targets -- -D warnings
+	cargo clippy --locked --manifest-path $(CORE_DIR)/Cargo.toml --all-targets -- -D warnings
+
+# Regenerates the header beside the committed one and fails on any difference, so an ffi.rs
+# change cannot land with a stale C view of the ABI. The `$(HEADER)` rule would instead rewrite
+# it silently, and only when checkout happened to leave ffi.rs with the newer mtime.
+check-header:
+	@mkdir -p $(BUILD)
+	cbindgen --config $(CORE_DIR)/cbindgen.toml --crate blindspot_core --output $(BUILD)/blindspot.h $(CORE_DIR)
+	diff -u $(HEADER) $(BUILD)/blindspot.h
 
 bench:
 	cargo bench --manifest-path $(CORE_DIR)/Cargo.toml

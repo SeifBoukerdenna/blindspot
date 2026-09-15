@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned to the toolchain the project is developed with, so a new stable release's clippy
+  # lints cannot turn `-D warnings` red on an unchanged commit. Bump deliberately.
+  RUST_TOOLCHAIN: "1.95.0"
+  CBINDGEN_VERSION: "0.29.4"
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build-and-test:
+    name: Build and test (macOS 26, arm64)
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+          swiftc --version
+
+      - name: Cache Cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'helpers/vector-worker/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+
+      - name: Cache cbindgen
+        id: cbindgen
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cbindgen
+          key: cbindgen-${{ runner.os }}-${{ runner.arch }}-${{ env.CBINDGEN_VERSION }}-${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install cbindgen
+        if: steps.cbindgen.outputs.cache-hit != 'true'
+        run: cargo install cbindgen --version "$CBINDGEN_VERSION" --locked
+
+      - name: Fetch locked dependencies
+        run: |
+          cargo fetch --locked --manifest-path core/Cargo.toml
+          cargo fetch --locked --manifest-path helpers/vector-worker/Cargo.toml
+
+      - name: C header matches ffi.rs
+        run: make check-header
+
+      - name: Clippy
+        run: make check
+
+      - name: Core tests
+        run: make test
+
+      - name: Build and sign the app (ad hoc)
+        run: make sign SIGN_ID=-
+
+      - name: Shell action tests
+        run: make test-actions
+
+      - name: Content watcher tests
+        run: make test-content
+
+      - name: Helper protocol tests
+        run: make test-semantic test-vectors
+
+      - name: Panel smoke test
+        run: make smoke-panel
+
+      - name: Build left tracked files unchanged
+        run: git diff --exit-code
+
+      - name: Package
+        run: make package
+
+      - name: Upload ad hoc build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Blindspot-adhoc-${{ github.sha }}
+          path: build/Blindspot-*.zip
+          if-no-files-found: error
+          retention-days: 7
