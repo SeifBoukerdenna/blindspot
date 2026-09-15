@@ -763,6 +763,7 @@ private final class SettingRow: NSView, NSTextFieldDelegate, NSTextViewDelegate 
 private final class ActionRow: NSView {
     private let act: () -> Void
     private let note = NSTextField(labelWithString: "")
+    private var press: NSButton?
 
     init(label: String, help: String, button: String, lines: Int = 2, width: CGFloat = 320, act: @escaping () -> Void) {
         self.act = act
@@ -781,8 +782,8 @@ private final class ActionRow: NSView {
 
         let press = NSButton(title: button, target: self, action: #selector(fire))
         press.isBordered = false
-        press.attributedTitle = Theme.label(
-            button.uppercased(), size: 10, tracking: 0.1, color: Theme.danger)
+        self.press = press
+        showButton(button)
 
         let text = NSStackView(views: [title, note])
         text.orientation = .vertical
@@ -814,6 +815,11 @@ private final class ActionRow: NSView {
         note.attributedStringValue = NSAttributedString(
             string: message,
             attributes: [.font: Theme.text(11), .foregroundColor: Theme.faint])
+    }
+
+    func showButton(_ title: String) {
+        press?.attributedTitle = Theme.label(
+            title.uppercased(), size: 10, tracking: 0.1, color: Theme.danger)
     }
 
     @objc private func fire() { act() }
@@ -923,6 +929,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private var settings: [Setting] = []
     private var eraseRow: ActionRow?
     private var statusRow: ActionRow?
+    private var updatesRow: ActionRow?
+    private let updater = Updater.shared
     private var dashboard: IndexDashboardView?
     private var statusTask: Task<Void, Never>?
     private var erasureTask: Task<Void, Never>?
@@ -1280,6 +1288,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
         // Not a setting, so not in the schema — it is hardcoded onto the page it belongs
         // to, which is what CLAUDE.md's non-goals ask for in a single-user app.
+        if section == Self.status {
+            addUpdatesRow()
+        }
         if section == Self.clipboard {
             let clear = ActionRow(
                 label: "Clear history now",
@@ -1316,6 +1327,74 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         // What the tab bar's right-hand slot is for: how much of this page is yours.
         let set = settings.filter { $0.section == section && $0.source == .window }.count
         tabs.show(status: set == 0 ? "" : "\(set) SET HERE")
+    }
+
+    // MARK: - Updates
+
+    /// Beside the version it replaces. Built from the updater's state, so the Status page's own
+    /// redraws after a probe show the same step.
+    private func addUpdatesRow() {
+        let row = ActionRow(label: "Updates", help: updater.summary, button: updater.buttonTitle, lines: 4, width: 380) { [weak self] in
+            self?.updateAction()
+        }
+        row.identifier = NSUserInterfaceItemIdentifier("updates")
+        updatesRow = row
+        updater.onChange = { [weak self] in self?.showUpdateState() }
+        rows.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
+    }
+
+    private func updateAction() {
+        switch updater.state {
+        case .checking, .installing: break
+        case .downloading: updater.cancel()
+        case .available(let release): updater.download(release)
+        case .ready(let prepared): confirmInstall(prepared)
+        case .idle, .current, .failed: updater.check()
+        }
+    }
+
+    private func showUpdateState() {
+        updatesRow?.showHelp(updater.summary)
+        updatesRow?.showButton(updater.buttonTitle)
+        if case .ready(let prepared) = updater.state, window.isVisible {
+            confirmInstall(prepared)
+        }
+    }
+
+    /// The last step before anything on disk changes, so it says what will happen and, when the
+    /// download is not signed by the installed copy's developer, what that costs.
+    private func confirmInstall(_ prepared: Updater.Prepared) {
+        guard window.attachedSheet == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = "Install Blindspot \(prepared.release.version)?"
+        var text = "The download matches its published checksum and its code signature is valid. Blindspot will quit, replace itself and reopen."
+        switch prepared.trust {
+        case .sameDeveloper:
+            alert.addButton(withTitle: "Install and Relaunch")
+        case .unverified(let installedTeam):
+            alert.alertStyle = .warning
+            if let installedTeam {
+                text += "\n\nThis download is not signed with the Developer ID of the copy you have (team \(installedTeam)). macOS will treat it as a different app, so permissions such as Accessibility must be granted again, and its origin rests on GitHub and the release checksum alone."
+            } else {
+                text += "\n\nThis copy and the download are not signed with a Developer ID, so macOS may ask again for permissions such as Accessibility."
+            }
+            alert.addButton(withTitle: "Install Anyway")
+        }
+        let notes = prepared.release.notesExcerpt
+        if !notes.isEmpty { text += "\n\n" + notes }
+        alert.informativeText = text
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if response == .alertFirstButtonReturn {
+                    self.updater.install(prepared)
+                } else {
+                    self.updater.discard(prepared)
+                }
+            }
+        }
     }
 
     private static func contentStatus(_ state: ContentRuntime?) -> String {

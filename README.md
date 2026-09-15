@@ -19,6 +19,13 @@ question. Nothing is sent to the cloud.
 Blindspot needs **macOS 26 (Tahoe) or later on an Apple silicon Mac**. There's no Dock icon:
 press **⌘⇧Space** to open it.
 
+### Updating
+
+Open **Settings → Status → Updates** and press **Check for updates**. If there's a newer release,
+press **Install**. Blindspot downloads it, checks its checksum and code signature, asks, then
+replaces itself and reopens. Your settings, clipboard history and index stay as they are. Blindspot
+only contacts GitHub when you press the button.
+
 ## What you can do
 
 | Type this | And you get |

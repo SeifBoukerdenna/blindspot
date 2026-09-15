@@ -475,6 +475,26 @@ Type `:` or `:help` for the first-party command catalog; `:po` then Tab complete
 
 **Settings → Status** also shows the installed Blindspot version.
 
+**Updates:** press **Settings → Status → Updates → Check for updates**.
+
+- **Checking:** Blindspot asks GitHub for the latest release of SeifBoukerdenna/blindspot. It never
+  checks in the background.
+- **Installing:** **Install** downloads the release and verifies it before anything on disk changes:
+  - the zip must match the release's SHA-256 checksum file;
+  - it may contain only the expected folder;
+  - the app inside must have a valid code signature, Blindspot's bundle identifier and the release's
+    version.
+- **Relaunch:** Blindspot then asks before it quits, replaces itself in place and reopens. Settings,
+  clipboard history and the index are untouched.
+- **Signing:**
+  - A release signed by the same Developer ID as your copy installs directly.
+  - An ad hoc release shows a warning first, because macOS treats it as a new app and asks again for
+    permissions such as Accessibility.
+  - A release signed by a different developer is refused.
+- **Location:** Blindspot must live in a folder you can write to, such as Applications in your home
+  folder. Updating does not work from a copy opened straight out of Downloads, which macOS runs from
+  a temporary read-only location.
+
 Settings cover launcher/Agent shortcuts, login startup, result count, app folders,
 launch-history ranking decay, indexed roots/exclusions/source size/power policy,
 clipboard retention/images/OCR, local AI models/host/keep-alive/timeout/allowed roots,
@@ -567,6 +587,11 @@ Not implemented: universal document-format indexing, arbitrary shell automation,
 arbitrary process restart, complete browser automation, public extension distribution,
 hard CPU/RAM quotas, or validated 10-million-record production operation. macOS limits
 process visibility, selected-text access, last-opened metadata and atomic PID identity checks.
+
+**0.2.9 changes**
+
+- **In-app updates:** Settings → Status → Updates checks GitHub for the latest release, then
+  downloads, verifies and installs it and relaunches, asking first.
 
 **0.2.8 changes**
 

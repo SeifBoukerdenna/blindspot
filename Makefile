@@ -6,6 +6,8 @@
 APP        := Blindspot
 BUNDLE_ID  := com.seifboukerdenna.blindspot
 VERSION    := 0.2.8
+# Where Settings → Status looks for updates (shell/Updater.swift). Forks set their own.
+RELEASE_REPO ?= SeifBoukerdenna/blindspot
 
 BUILD      := build
 BUNDLE     := $(BUILD)/$(APP).app
@@ -46,7 +48,7 @@ SWIFTFLAGS := -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
               -framework Quartz -framework EventKit \
               -L $(CORE_DIR)/target/release -lblindspot_core
 
-.PHONY: all core header app sign package install version media run clean test test-actions test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
+.PHONY: all core header app sign package install version media run clean test test-actions test-updater test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
 
 all: sign
 
@@ -81,7 +83,7 @@ $(SEMANTIC): helpers/SemanticWorker.swift Makefile
 $(BINARY): $(SWIFT_SRC) $(CORE_LIB) $(HEADER) shell/Info.plist Makefile
 	@mkdir -p $(CONTENTS)/MacOS $(CONTENTS)/Resources
 	swiftc $(SWIFTFLAGS) -o $@ $(SWIFT_SRC)
-	sed -e 's/@BUNDLE_ID@/$(BUNDLE_ID)/g' -e 's/@VERSION@/$(VERSION)/g' \
+	sed -e 's/@BUNDLE_ID@/$(BUNDLE_ID)/g' -e 's/@VERSION@/$(VERSION)/g' -e 's|@RELEASE_REPO@|$(RELEASE_REPO)|g' \
 	    shell/Info.plist > $(CONTENTS)/Info.plist
 
 RESOURCE_FILES := $(shell find docs/licenses -type f -print 2>/dev/null)
@@ -167,6 +169,13 @@ test-actions: $(CORE_LIB) $(HEADER)
 	@mkdir -p $(BUILD)
 	swiftc $(SWIFTFLAGS) -o $(BUILD)/action-tests bench/ActionTests.swift shell/Actions.swift shell/Bridge.swift shell/Context.swift shell/LocalRequest.swift shell/Schedule.swift
 	$(BUILD)/action-tests
+
+# Self-contained: the updater compiles alone, and its tests build real ad-hoc-signed fixture apps.
+test-updater:
+	@mkdir -p $(BUILD)
+	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
+	    -o $(BUILD)/updater-tests bench/UpdaterTests.swift shell/Updater.swift
+	$(BUILD)/updater-tests
 
 smoke-panel: $(CORE_LIB) $(HEADER)
 	@mkdir -p $(BUILD)

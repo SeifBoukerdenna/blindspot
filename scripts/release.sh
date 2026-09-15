@@ -82,8 +82,6 @@ first = re.search(r"^\*\*\d+\.\d+\.\d+ changes\*\*$", text, re.M)
 if not first:
     sys.exit("error: the guide has no **X.Y.Z changes** entry to place the new one before")
 text = text[:first.start()] + f"**{version} changes**\n\n{subjects}\n\n" + text[first.start():]
-text = re.sub(r"^\*\*Release: [0-9.]+\.\*\*", f"**Release: {version}.**", text, count=1, flags=re.M)
-text = re.sub(r"(and )\d+\.\d+\.\d+( release notes)", rf"\g<1>{version}\g<2>", text, count=1)
 open(path, "w", encoding="utf-8").write(text)
 PY
     echo
@@ -93,6 +91,18 @@ PY
         "${EDITOR:-nano}" "$guide"
     fi
 fi
+# Hand-written notes still need the guide's header to name the release it describes.
+python3 - "$guide" "$version" <<'PY'
+import re
+import sys
+
+path, version = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+updated = re.sub(r"^\*\*Release: [0-9.]+\.\*\*", f"**Release: {version}.**", text, count=1, flags=re.M)
+updated = re.sub(r"(and )\d+\.\d+\.\d+( release notes)", rf"\g<1>{version}\g<2>", updated, count=1)
+if updated != text:
+    open(path, "w", encoding="utf-8").write(updated)
+PY
 python3 scripts/release-notes.py "$guide" "$version" >/dev/null
 
 if [[ $checks == 1 ]]; then

@@ -81,6 +81,9 @@ jobs:
       - name: Shell action tests
         run: make test-actions
 
+      - name: Updater tests
+        run: make test-updater
+
       - name: Content watcher tests
         run: make test-content
 

@@ -3,6 +3,9 @@
 <!-- Template. The Makefile substitutes @BUNDLE_ID@ and @VERSION@ into build/. -->
 <plist version="1.0">
 <dict>
+	<!-- The GitHub repository whose latest release Settings → Status can install (Updater.swift). -->
+	<key>BlindspotReleaseRepository</key>
+	<string>@RELEASE_REPO@</string>
 	<key>CFBundleExecutable</key>
 	<string>blindspot</string>
 	<key>CFBundleIdentifier</key>

@@ -53,6 +53,19 @@ tell people to open **System Settings → Privacy & Security** and click **Open 
 `xattr -dr com.apple.quarantine /Applications/Blindspot.app`. Builds you make with `make install`
 are not affected.
 
+## In-app updates
+
+Settings → Status → Updates installs the latest release (shell/Updater.swift). It depends on what
+the Release workflow publishes, so keep these as they are:
+
+- **Tags:** `vX.Y.Z`, published as a normal release (drafts and prereleases are ignored).
+- **Asset names:** `Blindspot-X.Y.Z.zip` holding `Blindspot-X.Y.Z/Blindspot.app`, and
+  `Blindspot-X.Y.Z-SHA256SUMS.txt`.
+- **Repository:** `RELEASE_REPO` in the Makefile, written into Info.plist. A fork sets its own.
+
+Without the Developer ID secret below, releases are signed ad hoc. The updater then warns before
+installing, because macOS treats each update as a new app for permissions.
+
 ## Optional: keep permissions across updates
 
 By default the Release workflow signs ad hoc. That works, but the signature changes with every

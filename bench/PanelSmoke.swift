@@ -62,12 +62,15 @@ enum PanelSmoke {
         precondition(window.attachedSheet == nil)
         precondition(core.contentState?.enabled == wasEnabled && core.contentState?.erasing == false,
                      "Cancelling confirmation must not change content settings or erase data")
+        settings.show(settingKey: "status.version")
+        guard let updates = findRow(in: content, key: "updates"),
+              findButton(in: updates, title: "Check for updates") != nil else { fatalError("Updates row missing from Status") }
         window.close()
         panel.standDown()
         panel.show()
         precondition(panel.isVisible && panel.query.isEmpty)
         panel.standDown()
-        print("Panel show/reopen, 14 queries, command Tab completion, setting Return navigation, content erasure confirmation cancellation, bounded rows and arrow routing: passed")
+        print("Panel show/reopen, 14 queries, command Tab completion, setting Return navigation, content erasure confirmation cancellation, Status updates row, bounded rows and arrow routing: passed")
     }
 
     private static func findRow(in view: NSView, key: String) -> NSView? {

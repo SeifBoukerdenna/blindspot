@@ -183,6 +183,13 @@ CI and GitHub releases (docs/releasing.md):
   and that the commit is on main, runs the tests, signs, and publishes the release.
   - Signing uses a Developer ID only if the optional MACOS_CERTIFICATE_P12_BASE64 and
     MACOS_CERTIFICATE_PASSWORD secrets exist; otherwise ad hoc.
+- **In-app updates:** shell/Updater.swift, driven from Settings → Status → Updates, user-initiated only.
+  - Reads the latest release of Info.plist `BlindspotReleaseRepository` (Makefile `RELEASE_REPO`).
+  - Checks: repo-hosted asset URLs; the SHA-256 file; zip entries under `Blindspot-X.Y.Z/` before
+    extraction; valid strict code signature, same bundle ID, tag version.
+  - Signing trust: same team installs directly; ad hoc asks with a warning; a different team is refused.
+  - Swaps via replaceItemAt beside the app and relaunches after exit.
+  - Tests: `make test-updater` (offline fixture apps; in CI and release).
 - **No Apple services:** releases are GitHub Releases only; the user does not want notarization,
   App Store Connect or Apple-server steps. Signing keeps --timestamp=none and no hardened runtime.
 - **The user does all of these, never Claude:** commits, pushes, tags, secrets, repository

@@ -67,6 +67,7 @@ jobs:
           make check
           make test
           make test-actions
+          make test-updater
 
       # Optional. Without the certificate secret the app is signed ad hoc, which works, but an ad
       # hoc identity changes with every build, so macOS asks for Accessibility again after each
