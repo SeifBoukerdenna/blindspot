@@ -194,7 +194,8 @@ mod tests {
             title: id.to_string(),
             rank: 0.0,
             revision: 1,
-            related: false, snippet: None,
+            related: false,
+            snippet: None,
         }
     }
     fn ids(page: &SearchPage) -> Vec<i64> {

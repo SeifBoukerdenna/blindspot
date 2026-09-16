@@ -534,7 +534,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // after `windowDidResignKey` had already dismissed the panel. Measured exactly
         // that way round.
         previewing = true
-        previewing = preview.toggle(match.path)
+        previewing = preview.toggle(match.path, page: match.page)
     }
 
     /// `restoringFocus` is false when dismissing because the user launched something:
@@ -715,6 +715,11 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             matches = schedule.rows()
             pending = false
         }
+        if case .createEvent(let draft) = plan {
+            schedule.onChange = { [weak self] in self?.refresh() }
+            matches = schedule.draftRows(draft)
+            pending = false
+        }
         tabBar.show(status: plan?.status ?? Self.status(for: mode, in: matches))
         agentWorking = pending && effectiveQuery.hasPrefix(">")
         if !(poll && matches == results.matches) {
@@ -833,6 +838,9 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
                 case .preview(let path):
                     self.previewing = true
                     self.previewing = self.preview.toggle(path)
+                case .previewPage(let path, let page):
+                    self.previewing = true
+                    self.previewing = self.preview.toggle(path, page: page)
                 case .dismiss(let restoringFocus): self.dismiss(restoringFocus: restoringFocus)
                 case .localAI(let request, let reference):
                     self.field.stringValue = ">" + request

@@ -58,7 +58,7 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
           rustup default "$RUST_TOOLCHAIN"
           cargo install cbindgen --version "$CBINDGEN_VERSION" --locked
-          cargo fetch --locked --manifest-path core/Cargo.toml
+          cargo fetch --locked
           cargo fetch --locked --manifest-path helpers/vector-worker/Cargo.toml
 
       - name: Verify before building the release
@@ -66,6 +66,7 @@ jobs:
           make check-header
           make check
           make test
+          make test-retrieval
           make test-actions
           make test-updater
 

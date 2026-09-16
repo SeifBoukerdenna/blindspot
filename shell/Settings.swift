@@ -1401,7 +1401,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         guard let state else { return "Status unavailable" }
         if let overview = state.overview {
             let phase = overview.state == "ready" ? "Up to date" : overview.state == "indexing" ? "Indexing" + (overview.stage.isEmpty ? "" : " · \(overview.stage)") : overview.message
-            return ([phase] + [overview.documents.map { "\(IndexUI.number($0)) documents" }, overview.semantic.enabled ? overview.semantic.embedded.map { "\(IndexUI.number($0)) searchable by meaning" } : nil].compactMap { $0 }).joined(separator: " · ")
+            return ([phase] + [overview.documents.map { "\(IndexUI.number($0)) documents" }, overview.semantic.enabled ? overview.semantic.embedded.map { "\(IndexUI.number($0)) passages searchable by meaning" } : nil].compactMap { $0 }).joined(separator: " · ")
         }
         var line = state.status
         if let documents = state.documents, let embeddings = state.embeddings {

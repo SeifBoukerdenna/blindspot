@@ -1,7 +1,10 @@
 //! Durable, bounded content retrieval. Owned by background workers, never the UI thread.
 
 pub mod vectors;
+pub mod passage_search;
+pub mod passage_vectors;
 
+use blindspot_retrieval as retrieval;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::path::{Component, Path};
 use std::sync::{
@@ -11,8 +14,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const APPLICATION_ID: i64 = 0x42534349;
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 10;
 pub const MAX_BODY_BYTES: usize = 65_536;
+pub const MAX_PASSAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Constraints from `kind:`, `size:` and `modified:` on a content query. Applied inside the ranked
 /// candidate set, so a filter narrows the results instead of emptying the first page.
@@ -35,17 +39,39 @@ impl SearchFilter {
     fn sql(&self) -> String {
         let mut clauses = Vec::new();
         if !self.extensions.is_empty() {
-            let valid: Vec<_> = self.extensions.iter()
-                .filter(|extension| (1..=16).contains(&extension.len()) && extension.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-                .map(|extension| format!("lower(d.path) GLOB '*.{}'", extension.to_ascii_lowercase()))
+            let valid: Vec<_> = self
+                .extensions
+                .iter()
+                .filter(|extension| {
+                    (1..=16).contains(&extension.len())
+                        && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+                .map(|extension| {
+                    format!("lower(d.path) GLOB '*.{}'", extension.to_ascii_lowercase())
+                })
                 .collect();
-            clauses.push(if valid.len() == self.extensions.len() { format!("({})", valid.join(" OR ")) } else { "0".to_owned() });
+            clauses.push(if valid.len() == self.extensions.len() {
+                format!("({})", valid.join(" OR "))
+            } else {
+                "0".to_owned()
+            });
         }
-        if let Some(min) = self.min_bytes { clauses.push(format!("d.bytes>={}", min.min(i64::MAX as u64))); }
-        if let Some(max) = self.max_bytes { clauses.push(format!("d.bytes<={}", max.min(i64::MAX as u64))); }
-        if let Some(after) = self.modified_after_ns { clauses.push(format!("d.modified_ns>={after}")); }
-        if let Some(before) = self.modified_before_ns { clauses.push(format!("d.modified_ns<{before}")); }
-        clauses.iter().map(|clause| format!(" AND {clause}")).collect()
+        if let Some(min) = self.min_bytes {
+            clauses.push(format!("d.bytes>={}", min.min(i64::MAX as u64)));
+        }
+        if let Some(max) = self.max_bytes {
+            clauses.push(format!("d.bytes<={}", max.min(i64::MAX as u64)));
+        }
+        if let Some(after) = self.modified_after_ns {
+            clauses.push(format!("d.modified_ns>={after}"));
+        }
+        if let Some(before) = self.modified_before_ns {
+            clauses.push(format!("d.modified_ns<{before}"));
+        }
+        clauses
+            .iter()
+            .map(|clause| format!(" AND {clause}"))
+            .collect()
     }
 }
 
@@ -58,19 +84,80 @@ pub enum Snippet {
 }
 
 const STOPWORDS: &[&str] = &[
-    "about", "after", "all", "and", "any", "are", "been", "but", "can", "could", "did", "does", "doc", "docs",
-    "document", "documents", "file", "files", "find", "for", "from", "had", "has", "have", "how", "into", "its",
-    "mention", "mentioned", "note", "notes", "not", "our", "said", "say", "says", "should", "show", "that", "the",
-    "their", "them", "there", "they", "this", "those", "was", "were", "what", "when", "where", "which", "who", "why",
-    "will", "with", "would", "you", "your",
+    "about",
+    "after",
+    "all",
+    "and",
+    "any",
+    "are",
+    "been",
+    "but",
+    "can",
+    "could",
+    "did",
+    "does",
+    "doc",
+    "docs",
+    "document",
+    "documents",
+    "file",
+    "files",
+    "find",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "how",
+    "into",
+    "its",
+    "mention",
+    "mentioned",
+    "note",
+    "notes",
+    "not",
+    "our",
+    "said",
+    "say",
+    "says",
+    "should",
+    "show",
+    "that",
+    "the",
+    "their",
+    "them",
+    "there",
+    "they",
+    "this",
+    "those",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
 ];
 
 /// The distinctive words of a natural-language question, for an any-word search: its function
 /// words would otherwise make an all-words match impossible.
 pub fn question_terms(question: &str) -> Vec<String> {
     let mut terms = Vec::new();
-    for word in question.split(|character: char| !character.is_alphanumeric()).map(str::to_lowercase) {
-        if word.chars().count() >= 3 && word.len() <= 64 && !STOPWORDS.contains(&word.as_str()) && !terms.contains(&word) {
+    for word in question
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::to_lowercase)
+    {
+        if word.chars().count() >= 3
+            && word.len() <= 64
+            && !STOPWORDS.contains(&word.as_str())
+            && !terms.contains(&word)
+        {
             terms.push(word);
             if terms.len() == 12 {
                 break;
@@ -89,7 +176,8 @@ pub struct CompactReport {
 }
 
 fn database_bytes(path: &Path) -> u64 {
-    ["", "-wal", "-shm"].iter()
+    ["", "-wal", "-shm"]
+        .iter()
         .filter_map(|suffix| std::fs::metadata(format!("{}{suffix}", path.display())).ok())
         .map(|metadata| metadata.len())
         .sum()
@@ -128,8 +216,15 @@ pub(crate) const SEMANTIC_ELIGIBLE: &str = "(d.extraction=1 OR (d.extraction=0 A
 pub fn semantic_eligible(path: &Path, extraction: Extraction) -> bool {
     match extraction {
         Extraction::Extracted => true,
-        Extraction::Text => path.extension().and_then(|value| value.to_str())
-            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "txt" | "md" | "markdown" | "rst" | "html")),
+        Extraction::Text => path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "txt" | "md" | "markdown" | "rst" | "html"
+                )
+            }),
         _ => false,
     }
 }
@@ -180,6 +275,91 @@ CREATE TABLE embeddings(
  vector BLOB NOT NULL CHECK(length(vector)=dimensions*4)
 );
 "#;
+
+/// Passages, and the search over them. External content again, so the text is stored once in
+/// `chunks`; the triggers keep the index in step exactly as `content_fts` does for documents.
+/// `symbols` carries identifiers split into words, which is why it is its own column: a code
+/// search for "search filtered" must not be outranked by prose that happens to use both words.
+const SCHEMA_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS chunks(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+ ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+ page INTEGER NOT NULL DEFAULT 0 CHECK(page>=0),
+ line INTEGER NOT NULL DEFAULT 0 CHECK(line>=0),
+ heading TEXT NOT NULL, text TEXT NOT NULL, symbols TEXT NOT NULL,
+ UNIQUE(document_id,ordinal)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(heading,text,symbols,content='chunks',content_rowid='id',tokenize='unicode61');
+INSERT INTO chunks_fts(chunks_fts,rank) VALUES('rank','bm25(2.0,1.0,1.0)');
+CREATE TRIGGER IF NOT EXISTS chunks_insert AFTER INSERT ON chunks BEGIN
+ INSERT INTO chunks_fts(rowid,heading,text,symbols) VALUES(new.id,new.heading,new.text,new.symbols);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_delete AFTER DELETE ON chunks BEGIN
+ INSERT INTO chunks_fts(chunks_fts,rowid,heading,text,symbols) VALUES('delete',old.id,old.heading,old.text,old.symbols);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_update AFTER UPDATE OF heading,text,symbols ON chunks BEGIN
+ INSERT INTO chunks_fts(chunks_fts,rowid,heading,text,symbols) VALUES('delete',old.id,old.heading,old.text,old.symbols);
+ INSERT INTO chunks_fts(rowid,heading,text,symbols) VALUES(new.id,new.heading,new.text,new.symbols);
+END;
+"#;
+
+/// One vector per passage, beside the whole-document vectors rather than replacing them, so the
+/// existing semantic search keeps serving while this set fills in.
+///
+/// No revision column, unlike `embeddings`: [`write_chunks`] deletes and re-inserts a document's
+/// chunks on every rewrite, and `chunks.id` is AUTOINCREMENT, so a changed file's old vectors are
+/// cascaded away and their ids are never handed to a new chunk. Staleness cannot outlive the chunk.
+const SCHEMA_V9: &str = r#"
+CREATE TABLE IF NOT EXISTS chunk_embeddings(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ chunk_id INTEGER NOT NULL UNIQUE REFERENCES chunks(id) ON DELETE CASCADE,
+ model TEXT NOT NULL CHECK(length(CAST(model AS BLOB)) BETWEEN 1 AND 128),
+ dimensions INTEGER NOT NULL CHECK(dimensions BETWEEN 1 AND 2048),
+ vector BLOB NOT NULL CHECK(length(vector)=dimensions*4)
+);
+"#;
+
+/// Which passages earn a vector. Wider than [`SEMANTIC_ELIGIBLE`] on purpose: a whole-file vector
+/// built from a source file's opening lines ranked as noise, but a passage is one declaration with
+/// its symbols, which is the case chunking was built for. Machine data stays lexical-only — a
+/// vector over a JSON fragment or a CSV row describes its shape, not its meaning.
+pub(crate) const CHUNK_ELIGIBLE: &str = "((d.extraction=1 AND lower(d.path) NOT GLOB '*.xlsx') OR (d.extraction=0 AND lower(d.path) NOT GLOB '*.json'
+ AND lower(d.path) NOT GLOB '*.csv' AND lower(d.path) NOT GLOB '*.tsv' AND lower(d.path) NOT GLOB '*.xml'
+ AND lower(d.path) NOT GLOB '*.yaml' AND lower(d.path) NOT GLOB '*.yml' AND lower(d.path) NOT GLOB '*.toml'))";
+
+/// Rust mirror of [`CHUNK_ELIGIBLE`].
+pub fn chunk_eligible(path: &Path, extraction: Extraction) -> bool {
+    match extraction {
+        Extraction::Extracted => !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("xlsx")),
+        Extraction::Text => !path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "json" | "csv" | "tsv" | "xml" | "yaml" | "yml" | "toml"
+                )
+            }),
+        _ => false,
+    }
+}
+
+/// A passage of a file: what search returns and what "open at" uses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Passage {
+    pub document_id: i64,
+    pub path: String,
+    pub title: String,
+    pub ordinal: i64,
+    /// Page for an extracted document, else 0.
+    pub page: i64,
+    /// Line for text and code, else 0.
+    pub line: i64,
+    pub heading: String,
+    pub text: String,
+    pub rank: f64,
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -271,6 +451,26 @@ pub struct EmbeddingPage {
     pub lexical_only: usize,
 }
 
+/// A passage awaiting a vector. No revision: a rewritten document's chunks are deleted and
+/// re-inserted with fresh ids, so a vector cannot outlive the text it describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChunk {
+    pub id: i64,
+    pub document_id: i64,
+    pub path: String,
+    /// The heading breadcrumb and the passage, which is what reaches the model.
+    pub text: String,
+}
+
+#[derive(Debug, Default)]
+pub struct ChunkEmbeddingPage {
+    pub after: i64,
+    pub scanned: usize,
+    pub pending: Vec<PendingChunk>,
+    /// Passages deliberately kept lexical-only: machine data, and failed extraction.
+    pub lexical_only: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanOutcome {
     Complete,
@@ -282,6 +482,28 @@ pub struct ContentStore {
 }
 
 impl ContentStore {
+    pub fn storage_bytes(&self) -> Result<u64> {
+        let path:String=self.connection.query_row("SELECT file FROM pragma_database_list WHERE name='main'",[],|row|row.get(0))?;
+        if path.is_empty() { return Ok(0); }
+        let path=Path::new(&path);
+        let mut total=database_bytes(path);
+        if let Some(parent)=path.parent() {
+            let directory=parent.join("content-vectors");
+            match std::fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink()=>{
+                    for entry in std::fs::read_dir(directory)?.take(10_001) {
+                        let entry=entry?;
+                        let metadata=std::fs::symlink_metadata(entry.path())?;
+                        if metadata.is_file() { total=total.saturating_add(metadata.len()); }
+                    }
+                },
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
+                _=>return Err(Error::Invalid("Vector storage unavailable")),
+            }
+        }
+        Ok(total)
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         if let Some(parent) = path.parent() {
@@ -310,6 +532,10 @@ impl ContentStore {
         store.connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA cache_size=-8192; PRAGMA wal_autocheckpoint=1000;")?;
         store.connection.execute(
             "INSERT INTO content_fts(content_fts,rank) VALUES('secure-delete',1)",
+            [],
+        )?;
+        store.connection.execute(
+            "INSERT INTO chunks_fts(chunks_fts,rank) VALUES('secure-delete',1)",
             [],
         )?;
         store.connection.busy_timeout(Duration::from_millis(100))?;
@@ -402,13 +628,57 @@ impl ContentStore {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
             if let Some((kind, not_null, default)) = existing {
                 if kind != "INTEGER" || not_null != 1 || default.as_deref() != Some("0") {
-                    return Err(Error::Invalid("Incompatible content database extraction column"));
+                    return Err(Error::Invalid(
+                        "Incompatible content database extraction column",
+                    ));
                 }
             } else {
                 transaction.execute_batch("ALTER TABLE documents ADD COLUMN extraction INTEGER NOT NULL DEFAULT 0 CHECK(extraction BETWEEN 0 AND 5);")?;
             }
         }
         transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+        if version < 8 {
+            // Additive: documents, their bodies and the published vector shards are untouched, so
+            // search keeps working on the old rows while chunks fill in file by file.
+            transaction.execute_batch(SCHEMA_V8)?;
+        }
+        if version < 9 {
+            // Additive for the same reason: whole-document vectors and their shards keep serving
+            // semantic search while passage vectors are embedded file by file.
+            transaction.execute_batch(SCHEMA_V9)?;
+        }
+        if version < 10 {
+            let present: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('documents') WHERE name='passage_version')",
+                [], |row| row.get(0))?;
+            if !present {
+                transaction.execute_batch("ALTER TABLE documents ADD COLUMN passage_version INTEGER NOT NULL DEFAULT 0;
+                    ALTER TABLE documents ADD COLUMN partial INTEGER NOT NULL DEFAULT 0;")?;
+            }
+            let generations: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='passage_models')", [], |row| row.get(0))?;
+            if !generations {
+                transaction.execute_batch("ALTER TABLE chunk_embeddings RENAME TO chunk_embeddings_v9;
+                    CREATE TABLE chunk_embeddings(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                        model TEXT NOT NULL CHECK(length(CAST(model AS BLOB)) BETWEEN 1 AND 128),
+                        dimensions INTEGER NOT NULL CHECK(dimensions BETWEEN 1 AND 2048),
+                        vector BLOB NOT NULL CHECK(length(vector)=dimensions*4 OR length(vector)=dimensions),
+                        scale REAL NOT NULL DEFAULT 0,
+                        UNIQUE(chunk_id,model,dimensions));
+                    INSERT INTO chunk_embeddings(id,chunk_id,model,dimensions,vector) SELECT * FROM chunk_embeddings_v9;
+                    UPDATE sqlite_sequence SET seq=max(seq,coalesce((SELECT seq FROM sqlite_sequence WHERE name='chunk_embeddings_v9'),0)) WHERE name='chunk_embeddings';
+                    DROP TABLE chunk_embeddings_v9;
+                    CREATE TABLE passage_models(model TEXT PRIMARY KEY, dimensions INTEGER NOT NULL,
+                        active INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0);
+                    CREATE UNIQUE INDEX passage_active_model ON passage_models(active) WHERE active=1;
+                    CREATE TABLE passage_shards(model TEXT NOT NULL, after_key INTEGER NOT NULL,
+                        through_key INTEGER NOT NULL, dimensions INTEGER NOT NULL, token TEXT NOT NULL UNIQUE,
+                        checksum TEXT NOT NULL, count INTEGER NOT NULL, bytes INTEGER NOT NULL,
+                        PRIMARY KEY(model,after_key));")?;
+            }
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         Ok(())
@@ -462,9 +732,10 @@ impl ContentStore {
                 "INSERT INTO documents(identity,root,path,title,body,modified_ns,bytes,seen,changed_ns,extraction) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(identity) DO UPDATE SET root=excluded.root,path=excluded.path,title=excluded.title,body=excluded.body,
                  modified_ns=excluded.modified_ns,bytes=excluded.bytes,seen=excluded.seen,changed_ns=excluded.changed_ns,extraction=excluded.extraction,revision=documents.revision+1 RETURNING id,revision",
-                params![document.identity,scan.root,path,document.title,document.body,document.modified_ns,document.bytes as i64,scan.generation,document.changed_ns,document.extraction as i64],
+                params![document.identity,scan.root,path,document.title,&document.body[..document.body.floor_char_boundary(MAX_BODY_BYTES.min(document.body.len()))],document.modified_ns,document.bytes as i64,scan.generation,document.changed_ns,document.extraction as i64],
                 |r| Ok((r.get(0)?,r.get(1)?)))?;
             transaction.execute("DELETE FROM embeddings WHERE document_id=?1", [identity.0])?;
+            write_chunks(&transaction, identity.0, document)?;
             identities.push(identity);
         }
         transaction.commit()?;
@@ -480,19 +751,37 @@ impl ContentStore {
         changed_ns: i64,
         bytes: u64,
     ) -> Result<bool> {
+        self.mark_unchanged_version(scan,identity,path,modified_ns,changed_ns,bytes,1)
+    }
+
+    #[expect(clippy::too_many_arguments, reason="matches indexed file metadata and extraction version")]
+    pub fn mark_unchanged_version(&mut self,scan:&Scan,identity:&str,path:&Path,modified_ns:i64,changed_ns:i64,bytes:u64,version:i64)->Result<bool> {
         let path = validated_path(path)?;
         if bytes > i64::MAX as u64 {
             return Err(Error::Invalid("Invalid file size"));
         }
         let transaction = self.connection.transaction()?;
         check_scan(&transaction, scan)?;
-        let changed = transaction.execute("UPDATE documents SET seen=?1 WHERE identity=?2 AND path=?3 AND root=?4 AND modified_ns=?5 AND bytes=?6 AND changed_ns=?7 AND extraction IN (0,1)",
-            params![scan.generation,identity,path,scan.root,modified_ns,bytes as i64,changed_ns])?;
+        let changed = transaction.execute("UPDATE documents SET seen=?1 WHERE identity=?2 AND path=?3 AND root=?4 AND modified_ns=?5 AND bytes=?6 AND changed_ns=?7 AND extraction IN (0,1) AND passage_version=?8",
+            params![scan.generation,identity,path,scan.root,modified_ns,bytes as i64,changed_ns,version])?;
         transaction.commit()?;
         Ok(changed != 0)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "mirrors the identity/metadata fields a scan records for every file")]
+    pub fn set_extraction_metadata(&mut self,id:i64,version:i64,partial:bool,ocr_pages:&[u32])->Result<()> {
+        let transaction=self.connection.transaction()?;
+        transaction.execute("UPDATE documents SET passage_version=?2,partial=max(partial,?3) WHERE id=?1",params![id,version,partial])?;
+        for page in ocr_pages.iter().take(100) {
+            transaction.execute("UPDATE chunks SET heading='Read by OCR · '||heading WHERE document_id=?1 AND page=?2",params![id,page])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the identity/metadata fields a scan records for every file"
+    )]
     pub fn mark_extraction_failure(
         &mut self,
         scan: &Scan,
@@ -548,7 +837,12 @@ impl ContentStore {
     /// Removes records at or below `path` that this scan did not see. Only for event-driven partial
     /// scans: records elsewhere in the root keep their older generation until the next full pass.
     /// Uses a range on the unique path index rather than a prefix pattern over the whole root.
-    pub fn remove_unseen_under(&mut self, scan: &Scan, path: &Path, cancel: &AtomicBool) -> Result<usize> {
+    pub fn remove_unseen_under(
+        &mut self,
+        scan: &Scan,
+        path: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<usize> {
         let path = validated_path(path)?;
         if !Path::new(path).starts_with(&scan.root) || path == scan.root {
             return Err(Error::Invalid("Path is outside its indexing root"));
@@ -687,10 +981,13 @@ impl ContentStore {
             }
             let transaction = self.connection.transaction()?;
             transaction.execute(
-                "INSERT INTO content_fts(content_fts) VALUES('delete-all')",
+                "INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all')",
                 [],
             )?;
             transaction.execute("DELETE FROM embeddings", [])?;
+            transaction.execute("DELETE FROM chunk_embeddings", [])?;
+            transaction.execute("DELETE FROM passage_shards", [])?;
+            transaction.execute("DELETE FROM passage_models", [])?;
             transaction.execute("DELETE FROM vector_shards", [])?;
             transaction.execute("DELETE FROM scopes", [])?;
             transaction.commit()?;
@@ -712,9 +1009,17 @@ impl ContentStore {
     }
 
     /// Documents matching any of `terms`, best first, for answering a question from passages.
-    pub fn search_any(&self, terms: &[String], limit: usize, cancel: Arc<AtomicBool>) -> Result<Vec<Hit>> {
-        let expression = terms.iter()
-            .filter(|term| !term.is_empty() && term.len() <= 64 && term.chars().all(char::is_alphanumeric))
+    pub fn search_any(
+        &self,
+        terms: &[String],
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<Hit>> {
+        let expression = terms
+            .iter()
+            .filter(|term| {
+                !term.is_empty() && term.len() <= 64 && term.chars().all(char::is_alphanumeric)
+            })
             .map(|term| format!("\"{term}\""))
             .collect::<Vec<_>>()
             .join(" OR ");
@@ -726,17 +1031,32 @@ impl ContentStore {
         }
         let started = Instant::now();
         let cancelled = Arc::clone(&cancel);
-        self.connection.progress_handler(1000, Some(move || cancelled.load(Ordering::Acquire) || started.elapsed() > Duration::from_millis(500)))?;
+        self.connection.progress_handler(
+            1000,
+            Some(move || {
+                cancelled.load(Ordering::Acquire) || started.elapsed() > Duration::from_millis(500)
+            }),
+        )?;
         let result = (|| -> Result<Vec<Hit>> {
             let mut statement = self.connection.prepare(
                 "SELECT d.id,d.identity,d.path,d.title,content_fts.rank,d.revision FROM content_fts
                  JOIN documents d ON d.id=content_fts.rowid WHERE content_fts MATCH ?1
                  AND length(CAST(d.path AS BLOB))<=4096 AND length(CAST(d.title AS BLOB))<=1024
-                 ORDER BY content_fts.rank LIMIT ?2")?;
-            let rows = statement.query_map(params![expression, limit.min(MAX_RESULTS) as i64], |row| Ok(Hit {
-                id: row.get(0)?, identity: row.get(1)?, path: row.get(2)?, title: row.get(3)?, rank: row.get(4)?,
-                revision: row.get(5)?, related: false, snippet: None,
-            }))?;
+                 ORDER BY content_fts.rank LIMIT ?2",
+            )?;
+            let rows =
+                statement.query_map(params![expression, limit.min(MAX_RESULTS) as i64], |row| {
+                    Ok(Hit {
+                        id: row.get(0)?,
+                        identity: row.get(1)?,
+                        path: row.get(2)?,
+                        title: row.get(3)?,
+                        rank: row.get(4)?,
+                        revision: row.get(5)?,
+                        related: false,
+                        snippet: None,
+                    })
+                })?;
             let mut hits = Vec::new();
             for hit in rows {
                 let hit = hit?;
@@ -755,8 +1075,98 @@ impl ContentStore {
 
     /// The window of a document's stored text that mentions the most `terms`, at most `budget`
     /// bytes and whitespace-normalized; the opening when no term appears.
+    /// The passages matching `query`, best first, at most one per document so a single long file
+    /// cannot fill the list. Used for content results, and for the benchmark.
+    pub fn passages(
+        &self,
+        query: &str,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<Passage>> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        let expression = expression(query)?;
+        if expression.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let cancelled = Arc::clone(&cancel);
+        self.connection.progress_handler(
+            1000,
+            Some(move || {
+                cancelled.load(Ordering::Acquire) || started.elapsed() > Duration::from_millis(250)
+            }),
+        )?;
+        let result = (|| -> Result<Vec<Passage>> {
+            let mut found = self.passage_page(&expression, limit)?;
+            if found.len() < 3 && expression.contains(" AND ") {
+                let seen: Vec<i64> = found.iter().map(|passage| passage.document_id).collect();
+                for passage in self.passage_page(&expression.replace(" AND ", " OR "), limit)? {
+                    if found.len() >= limit {
+                        break;
+                    }
+                    if !seen.contains(&passage.document_id) {
+                        found.push(passage);
+                    }
+                }
+            }
+            Ok(found)
+        })();
+        self.connection.progress_handler(0, None::<fn() -> bool>)?;
+        result
+    }
+
+    fn passage_page(&self, expression: &str, limit: usize) -> Result<Vec<Passage>> {
+        let mut statement = self.connection.prepare(
+            "WITH matched AS MATERIALIZED (
+               SELECT rowid,rank FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY rank LIMIT ?3
+             ), ranked AS (
+               SELECT c.id AS chunk_id, m.rank AS rank,
+                      ROW_NUMBER() OVER (PARTITION BY c.document_id ORDER BY m.rank, c.id) AS place
+               FROM matched m JOIN chunks c ON c.id=m.rowid
+             )
+             SELECT c.document_id,d.path,d.title,c.ordinal,c.page,c.line,c.heading,c.text,r.rank
+             FROM ranked r JOIN chunks c ON c.id=r.chunk_id JOIN documents d ON d.id=c.document_id
+             WHERE r.place=1 ORDER BY r.rank, c.document_id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![
+                expression,
+                limit.min(MAX_RESULTS) as i64,
+                (MAX_CANDIDATES + 1) as i64
+            ],
+            |row| {
+                Ok(Passage {
+                    document_id: row.get(0)?,
+                    path: row.get(1)?,
+                    title: row.get(2)?,
+                    ordinal: row.get(3)?,
+                    page: row.get(4)?,
+                    line: row.get(5)?,
+                    heading: row.get(6)?,
+                    text: row.get(7)?,
+                    rank: row.get(8)?,
+                })
+            },
+        )?;
+        let mut found = Vec::new();
+        for row in rows {
+            let passage = row?;
+            if passage.path.len() <= 4096 && validated_path(Path::new(&passage.path)).is_ok() {
+                found.push(passage);
+            }
+        }
+        Ok(found)
+    }
+
     pub fn passage(&self, id: i64, terms: &[String], budget: usize) -> Result<Option<String>> {
-        let body: Option<String> = self.connection.query_row("SELECT body FROM documents WHERE id=?1", [id], |row| row.get(0)).optional()?;
+        let body: Option<String> = self
+            .connection
+            .query_row("SELECT body FROM documents WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
         let Some(body) = body else { return Ok(None) };
         let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
         if text.is_empty() || budget == 0 {
@@ -769,8 +1179,15 @@ impl ContentStore {
             let begin = text.floor_char_boundary(start);
             let end = text.floor_char_boundary((begin + window).min(text.len()));
             let slice = text.get(begin..end).unwrap_or_default().to_lowercase();
-            let score: usize = terms.iter()
-                .map(|term| if slice.contains(term.as_str()) { 100 + slice.matches(term.as_str()).count() } else { 0 })
+            let score: usize = terms
+                .iter()
+                .map(|term| {
+                    if slice.contains(term.as_str()) {
+                        100 + slice.matches(term.as_str()).count()
+                    } else {
+                        0
+                    }
+                })
                 .sum();
             if score > best_score {
                 (best_score, best_start) = (score, begin);
@@ -786,17 +1203,30 @@ impl ContentStore {
 
     /// Removes vectors of retired models, merges the word index and rewrites the database file so
     /// deleted pages go back to the disk. Runs only when the user asks.
-    pub fn compact(&mut self, database: &Path, model_identifier: &str, cancel: Arc<AtomicBool>, mut report: impl FnMut(&'static str)) -> Result<CompactReport> {
+    pub fn compact(
+        &mut self,
+        database: &Path,
+        model_identifier: &str,
+        cancel: Arc<AtomicBool>,
+        mut report: impl FnMut(&'static str),
+    ) -> Result<CompactReport> {
         let database = database_path(database)?;
         let before = database_bytes(&database);
-        let directory = database.parent().ok_or(Error::Invalid("Missing database directory"))?;
+        let directory = database
+            .parent()
+            .ok_or(Error::Invalid("Missing database directory"))?;
         // VACUUM writes a complete copy before it replaces the original.
-        if available_bytes(directory).is_some_and(|free| free < before.saturating_add(64 * 1_048_576)) {
-            return Err(Error::Invalid("Not enough free disk space to compact the index"));
+        if available_bytes(directory)
+            .is_some_and(|free| free < before.saturating_add(64 * 1_048_576))
+        {
+            return Err(Error::Invalid(
+                "Not enough free disk space to compact the index",
+            ));
         }
         let current = format!("[[]\"{model_identifier}\",*");
         let cancelled = Arc::clone(&cancel);
-        self.connection.progress_handler(1000, Some(move || cancelled.load(Ordering::Acquire)))?;
+        self.connection
+            .progress_handler(1000, Some(move || cancelled.load(Ordering::Acquire)))?;
         let result = (|| -> Result<u64> {
             report("Removing unused vectors");
             let mut removed = 0u64;
@@ -811,22 +1241,32 @@ impl ContentStore {
                     break;
                 }
             }
-            self.connection.execute("DELETE FROM vector_shards WHERE model NOT GLOB ?1", [&current])?;
+            self.connection.execute(
+                "DELETE FROM vector_shards WHERE model NOT GLOB ?1",
+                [&current],
+            )?;
             report("Merging the word index");
-            self.connection.execute("INSERT INTO content_fts(content_fts) VALUES('optimize')", [])?;
+            self.connection.execute(
+                "INSERT INTO content_fts(content_fts) VALUES('optimize')",
+                [],
+            )?;
             report("Rewriting the database");
             let mut attempts = 0;
             loop {
                 match self.connection.execute_batch("VACUUM") {
                     Ok(()) => break,
-                    Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy && attempts < 10 => {
+                    Err(rusqlite::Error::SqliteFailure(error, _))
+                        if error.code == rusqlite::ErrorCode::DatabaseBusy && attempts < 10 =>
+                    {
                         attempts += 1;
                         std::thread::sleep(Duration::from_millis(200));
                     }
                     Err(error) => return Err(error.into()),
                 }
             }
-            let _: i64 = self.connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            let _: i64 =
+                self.connection
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
             Ok(removed)
         })();
         self.connection.progress_handler(0, None::<fn() -> bool>)?;
@@ -834,27 +1274,51 @@ impl ContentStore {
             return Err(Error::Cancelled);
         }
         let removed = result?;
-        Ok(CompactReport { before_bytes: before, after_bytes: database_bytes(&database), removed_vectors: removed })
+        Ok(CompactReport {
+            before_bytes: before,
+            after_bytes: database_bytes(&database),
+            removed_vectors: removed,
+        })
     }
 
     /// Adds a short excerpt to the first `count` hits so a result shows why it matched.
-    pub fn annotate(&self, query: &str, hits: &mut [Hit], count: usize, mode: Snippet, cancel: Arc<AtomicBool>) -> Result<()> {
+    pub fn annotate(
+        &self,
+        query: &str,
+        hits: &mut [Hit],
+        count: usize,
+        mode: Snippet,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<()> {
         let expression = expression(query)?;
-        if cancel.load(Ordering::Acquire) { return Err(Error::Cancelled); }
+        if cancel.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
         let started = Instant::now();
         let cancelled = Arc::clone(&cancel);
-        self.connection.progress_handler(1000, Some(move || cancelled.load(Ordering::Acquire) || started.elapsed() > Duration::from_millis(250)))?;
+        self.connection.progress_handler(
+            1000,
+            Some(move || {
+                cancelled.load(Ordering::Acquire) || started.elapsed() > Duration::from_millis(250)
+            }),
+        )?;
         let result = (|| -> Result<()> {
             let mut matched = self.connection.prepare(
                 "SELECT snippet(content_fts,1,'','','…',16) FROM content_fts WHERE content_fts MATCH ?1 AND rowid=?2")?;
-            let mut opening = self.connection.prepare("SELECT substr(body,1,600) FROM documents WHERE id=?1")?;
+            let mut opening = self
+                .connection
+                .prepare("SELECT substr(body,1,600) FROM documents WHERE id=?1")?;
             for hit in hits.iter_mut().take(count) {
                 let text: Option<String> = if mode == Snippet::Opening || expression.is_empty() {
                     opening.query_row([hit.id], |row| row.get(0)).optional()?
                 } else {
-                    matched.query_row(params![expression, hit.id], |row| row.get(0)).optional()?
+                    matched
+                        .query_row(params![expression, hit.id], |row| row.get(0))
+                        .optional()?
                 };
-                hit.snippet = text.map(|text| tidy_excerpt(&text)).filter(|text| !text.is_empty());
+                hit.snippet = text
+                    .map(|text| tidy_excerpt(&text))
+                    .filter(|text| !text.is_empty());
             }
             Ok(())
         })();
@@ -864,11 +1328,18 @@ impl ContentStore {
 
     /// Drops hits that fail `filter`; used for semantic hits, which are found outside the SQL filter.
     pub fn keep_matching(&self, hits: &mut Vec<Hit>, filter: &SearchFilter) -> Result<()> {
-        if filter.is_empty() { return Ok(()); }
-        let mut statement = self.connection.prepare(&format!("SELECT EXISTS(SELECT 1 FROM documents d WHERE d.id=?1{})", filter.sql()))?;
+        if filter.is_empty() {
+            return Ok(());
+        }
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT EXISTS(SELECT 1 FROM documents d WHERE d.id=?1{})",
+            filter.sql()
+        ))?;
         let mut kept = Vec::with_capacity(hits.len());
         for hit in hits.drain(..) {
-            if statement.query_row([hit.id], |row| row.get::<_, bool>(0))? { kept.push(hit); }
+            if statement.query_row([hit.id], |row| row.get::<_, bool>(0))? {
+                kept.push(hit);
+            }
         }
         *hits = kept;
         Ok(())
@@ -878,7 +1349,13 @@ impl ContentStore {
         self.search_filtered(query, &SearchFilter::default(), limit, cancel)
     }
 
-    pub fn search_filtered(&self, query: &str, filter: &SearchFilter, limit: usize, cancel: Arc<AtomicBool>) -> Result<SearchPage> {
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        filter: &SearchFilter,
+        limit: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<SearchPage> {
         if cancel.load(Ordering::Acquire) {
             return Err(Error::Cancelled);
         }
@@ -1099,6 +1576,138 @@ impl ContentStore {
         Ok(true)
     }
 
+    /// Passages still needing a vector for this model, paged by chunk id.
+    ///
+    /// Shaped like [`ContentStore::embedding_page`]: the text comes back only when no current
+    /// vector exists, so a pass that is interrupted and resumed re-embeds nothing it already did.
+    pub fn chunk_embedding_page(
+        &self,
+        after: i64,
+        model: &str,
+        dimensions: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<ChunkEmbeddingPage> {
+        if after < 0 || model.is_empty() || model.len() > 128 || !(1..=2048).contains(&dimensions) {
+            return Err(Error::Invalid("Invalid embedding cursor or model"));
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(Error::Cancelled);
+        }
+        let started = Instant::now();
+        let cancelled = Arc::clone(&cancel);
+        self.connection.progress_handler(
+            1000,
+            Some(move || {
+                cancelled.load(Ordering::Acquire) || started.elapsed() > Duration::from_millis(250)
+            }),
+        )?;
+        let result = (|| -> Result<ChunkEmbeddingPage> {
+            let mut statement = self.connection.prepare(&format!(
+                "SELECT c.id,c.document_id,substr(d.path,1,4097),
+                 CASE WHEN NOT {CHUNK_ELIGIBLE} THEN NULL
+                 WHEN ce.model=?2 AND ce.dimensions=?3 AND (length(ce.vector)=?3*4 OR length(ce.vector)=?3) THEN NULL
+                 ELSE substr(c.heading,1,256)||char(10)||substr(c.text,1,4096) END,{CHUNK_ELIGIBLE}
+                 FROM chunks c JOIN documents d ON d.id=c.document_id
+                 LEFT JOIN chunk_embeddings ce ON ce.chunk_id=c.id AND ce.model=?2 AND ce.dimensions=?3
+                 WHERE c.id>?1 ORDER BY c.id LIMIT 128"
+            ))?;
+            let rows = statement.query_map(params![after, model, dimensions as i64], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            })?;
+            let mut page = ChunkEmbeddingPage {
+                after,
+                ..ChunkEmbeddingPage::default()
+            };
+            for row in rows {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(Error::Cancelled);
+                }
+                let (id, document_id, path, text, eligible) = row?;
+                if id <= page.after || document_id <= 0 {
+                    return Err(Error::Invalid("Invalid chunk identity"));
+                }
+                validated_path(Path::new(&path))?;
+                page.after = id;
+                page.scanned += 1;
+                if !eligible {
+                    page.lexical_only += 1;
+                }
+                if let Some(mut text) = text {
+                    let mut end = text.len().min(4096);
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                    page.pending.push(PendingChunk {
+                        id,
+                        document_id,
+                        path,
+                        text,
+                    });
+                }
+            }
+            Ok(page)
+        })();
+        self.connection.progress_handler(0, None::<fn() -> bool>)?;
+        if cancel.load(Ordering::Acquire) || started.elapsed() > Duration::from_millis(250) {
+            return Err(Error::Cancelled);
+        }
+        result
+    }
+
+    /// Stores one passage vector, normalized as [`ContentStore::put_embedding`] does so readers can
+    /// assert unit norm. `false` means the chunk was rewritten while the model was working, which
+    /// is not an error: the replacement chunk is picked up by the next page.
+    pub fn put_chunk_embedding(
+        &mut self,
+        chunk_id: i64,
+        model: &str,
+        vector: &[f32],
+    ) -> Result<bool> {
+        if model.is_empty()
+            || model.len() > 128
+            || vector.is_empty()
+            || vector.len() > 2048
+            || vector.iter().any(|v| !v.is_finite())
+        {
+            return Err(Error::Invalid("Invalid embedding metadata"));
+        }
+        let norm = vector
+            .iter()
+            .map(|v| f64::from(*v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if norm <= 0.0 || !norm.is_finite() {
+            return Err(Error::Invalid("Invalid embedding norm"));
+        }
+        let normalized:Vec<f32>=vector.iter().map(|value|(f64::from(*value)/norm) as f32).collect();
+        let (bytes,scale)=retrieval::quantize(&normalized).ok_or(Error::Invalid("Invalid compressed vector"))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let present: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunks WHERE id=?1)",
+            [chunk_id],
+            |row| row.get(0),
+        )?;
+        if !present {
+            return Ok(false);
+        }
+        transaction.execute("DELETE FROM chunk_embeddings WHERE chunk_id=?1 AND model=?2 AND dimensions=?3", params![chunk_id,model,vector.len() as i64])?;
+        transaction.execute(
+            "INSERT INTO chunk_embeddings(chunk_id,model,dimensions,vector,scale) VALUES(?1,?2,?3,?4,?5)",
+            params![chunk_id, model, vector.len() as i64, bytes,scale],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn count(&self) -> Result<u64> {
         let count: i64 = self
             .connection
@@ -1156,6 +1765,69 @@ fn validated_path(path: &Path) -> Result<&str> {
         .ok_or(Error::Invalid("Invalid index path"))
 }
 
+/// Replaces a document's passages. Same transaction as the document itself, so the two can never
+/// disagree about what a file says.
+fn write_chunks(
+    transaction: &rusqlite::Transaction<'_>,
+    document_id: i64,
+    document: &Document<'_>,
+) -> Result<()> {
+    transaction.execute("DELETE FROM chunks WHERE document_id=?1", [document_id])?;
+    let chunked = retrieval::chunks(
+        chunk_kind(document),
+        document.body,
+        &retrieval::Limits::default(),
+    );
+    transaction.execute("UPDATE documents SET passage_version=1,partial=?2 WHERE id=?1",
+        params![document_id, chunked.truncated || document.body.len() >= MAX_PASSAGE_BYTES])?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO chunks(document_id,ordinal,page,line,heading,text,symbols) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+    )?;
+    for chunk in &chunked.chunks {
+        let (page, line) = match chunk.location {
+            retrieval::Location::Page(page) => (i64::from(page), 0),
+            retrieval::Location::Line(line) => (0, if document.extraction==Extraction::Extracted {0} else {i64::from(line)}),
+        };
+        insert.execute(params![
+            document_id,
+            i64::from(chunk.ordinal),
+            page,
+            line,
+            chunk.heading,
+            chunk.text,
+            chunk.symbols
+        ])?;
+    }
+    Ok(())
+}
+
+/// Extracted documents arrive as pages; source files are split at declarations; everything else
+/// reads as prose.
+fn chunk_kind(document: &Document<'_>) -> retrieval::Kind {
+    if document.extraction==Extraction::Extracted && document.path.extension().is_some_and(|extension|extension.eq_ignore_ascii_case("xlsx")) {
+        return retrieval::Kind::Sections;
+    }
+    if document.extraction == Extraction::Extracted
+        && document.path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdf") || extension.eq_ignore_ascii_case("pptx")) {
+        return retrieval::Kind::Paged;
+    }
+    let extension = document
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    const CODE: &[&str] = &[
+        "rs", "swift", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "hpp", "rb",
+        "sh", "sql", "css",
+    ];
+    if CODE.contains(&extension.as_str()) {
+        retrieval::Kind::Code
+    } else {
+        retrieval::Kind::Prose
+    }
+}
+
 fn validate_document(scan: &Scan, document: &Document<'_>) -> Result<()> {
     validated_path(document.path)?;
     if !document.path.starts_with(&scan.root) || document.path == Path::new(&scan.root) {
@@ -1165,7 +1837,7 @@ fn validate_document(scan: &Scan, document: &Document<'_>) -> Result<()> {
         || document.identity.len() > 128
         || document.identity.contains('\0')
         || document.title.len() > 1024
-        || document.body.len() > MAX_BODY_BYTES
+        || document.body.len() > MAX_PASSAGE_BYTES
         || document.bytes > i64::MAX as u64
     {
         return Err(Error::Invalid("Document exceeds index limits"));
@@ -1542,12 +2214,12 @@ mod tests {
             .unwrap();
         if conflict {
             connection
-                .execute_batch(
-                    "ALTER TABLE documents ADD COLUMN extraction TEXT;",
-                )
+                .execute_batch("ALTER TABLE documents ADD COLUMN extraction TEXT;")
                 .unwrap();
         }
-        connection.pragma_update(None, "application_id", APPLICATION_ID).unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
         connection.pragma_update(None, "user_version", 6).unwrap();
         connection
     }
@@ -1558,19 +2230,64 @@ mod tests {
         drop(write_schema_six(&fixture.0, false));
         let store = fixture.open();
         assert_eq!(store.count().unwrap(), 1);
-        assert_eq!(store.connection.query_row("SELECT body FROM documents WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), "legacy body");
-        assert_eq!(store.connection.query_row("SELECT id || ':' || hex(vector) FROM embeddings", [], |r| r.get::<_, String>(0)).unwrap(), "42:0000803F00000000");
-        assert_eq!(store.vector_catalog(Arc::new(AtomicBool::new(false))).unwrap().len(), 1);
-        assert_eq!(store.connection.query_row("SELECT extraction FROM documents WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT body FROM documents WHERE id=1", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "legacy body"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT id || ':' || hex(vector) FROM embeddings", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "42:0000803F00000000"
+        );
+        assert_eq!(
+            store
+                .vector_catalog(Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT extraction FROM documents WHERE id=1", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         drop(store);
 
         let conflict = Fixture::new();
         drop(write_schema_six(&conflict.0, true));
         assert!(ContentStore::open(&conflict.0).is_err());
         let connection = Connection::open(&conflict.0).unwrap();
-        assert_eq!(connection.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 6);
-        assert_eq!(connection.query_row("SELECT body FROM documents WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), "legacy body");
-        assert_eq!(connection.query_row("SELECT hex(vector) FROM embeddings WHERE id=42", [], |r| r.get::<_, String>(0)).unwrap(), "0000803F00000000");
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT body FROM documents WHERE id=1", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "legacy body"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT hex(vector) FROM embeddings WHERE id=42", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+            "0000803F00000000"
+        );
     }
 
     #[test]
@@ -1586,49 +2303,172 @@ mod tests {
                 modified_ns: 1_000_000_000, changed_ns: 1, bytes: 5000, extraction: Extraction::Text },
         ]).unwrap();
         let cancel = || Arc::new(AtomicBool::new(false));
-        let paths = |filter: SearchFilter| store.search_filtered("genetec", &filter, 10, cancel()).unwrap()
-            .hits.into_iter().map(|hit| hit.path).collect::<Vec<_>>();
+        let paths = |filter: SearchFilter| {
+            store
+                .search_filtered("genetec", &filter, 10, cancel())
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|hit| hit.path)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(paths(SearchFilter::default()).len(), 2);
-        assert_eq!(paths(SearchFilter { extensions: vec!["PDF".into()], ..SearchFilter::default() }), ["/fixture/a.pdf"]);
-        assert_eq!(paths(SearchFilter { modified_after_ns: Some(2_000_000_000), ..SearchFilter::default() }), ["/fixture/a.pdf"]);
-        assert_eq!(paths(SearchFilter { max_bytes: Some(100), ..SearchFilter::default() }), ["/fixture/a.pdf"]);
-        assert_eq!(paths(SearchFilter { min_bytes: Some(100), modified_before_ns: Some(2_000_000_000), ..SearchFilter::default() }), ["/fixture/b.go"]);
-        assert!(paths(SearchFilter { extensions: vec!["pdf' OR 1=1 --".into()], ..SearchFilter::default() }).is_empty());
+        assert_eq!(
+            paths(SearchFilter {
+                extensions: vec!["PDF".into()],
+                ..SearchFilter::default()
+            }),
+            ["/fixture/a.pdf"]
+        );
+        assert_eq!(
+            paths(SearchFilter {
+                modified_after_ns: Some(2_000_000_000),
+                ..SearchFilter::default()
+            }),
+            ["/fixture/a.pdf"]
+        );
+        assert_eq!(
+            paths(SearchFilter {
+                max_bytes: Some(100),
+                ..SearchFilter::default()
+            }),
+            ["/fixture/a.pdf"]
+        );
+        assert_eq!(
+            paths(SearchFilter {
+                min_bytes: Some(100),
+                modified_before_ns: Some(2_000_000_000),
+                ..SearchFilter::default()
+            }),
+            ["/fixture/b.go"]
+        );
+        assert!(
+            paths(SearchFilter {
+                extensions: vec!["pdf' OR 1=1 --".into()],
+                ..SearchFilter::default()
+            })
+            .is_empty()
+        );
         let mut hits = store.search("signaling", 10, cancel()).unwrap().hits;
-        store.annotate("signaling", &mut hits, 10, Snippet::Matched, cancel()).unwrap();
-        assert!(hits[0].snippet.as_deref().is_some_and(|text| text.contains("signaling protocol") && !text.contains('\n')), "{hits:?}");
+        store
+            .annotate("signaling", &mut hits, 10, Snippet::Matched, cancel())
+            .unwrap();
+        assert!(
+            hits[0]
+                .snippet
+                .as_deref()
+                .is_some_and(|text| text.contains("signaling protocol") && !text.contains('\n')),
+            "{hits:?}"
+        );
         let mut all = store.search("genetec", 10, cancel()).unwrap().hits;
-        store.keep_matching(&mut all, &SearchFilter { extensions: vec!["go".into()], ..SearchFilter::default() }).unwrap();
+        store
+            .keep_matching(
+                &mut all,
+                &SearchFilter {
+                    extensions: vec!["go".into()],
+                    ..SearchFilter::default()
+                },
+            )
+            .unwrap();
         assert_eq!(all.len(), 1);
     }
 
     #[test]
     fn question_passages_and_compaction_keep_current_vectors() {
         let terms = question_terms("What did the capstone decide about WebRTC signaling?");
-        assert!(terms.contains(&"signaling".to_owned()) && terms.contains(&"capstone".to_owned()) && !terms.contains(&"the".to_owned()));
+        assert!(
+            terms.contains(&"signaling".to_owned())
+                && terms.contains(&"capstone".to_owned())
+                && !terms.contains(&"the".to_owned())
+        );
         let fixture = Fixture::new();
         let mut store = fixture.open();
         let scan = store.begin_scan(Path::new("/fixture")).unwrap();
         let filler = "unrelated words ".repeat(300);
         let body = format!("{filler} The capstone chose WebRTC signaling over polling. {filler}");
-        let ids = store.put_batch(&scan, &[
-            Document { identity: "a", path: Path::new("/fixture/a.md"), title: "a.md", body: &body, modified_ns: 1, changed_ns: 1, bytes: 1, extraction: Extraction::Text },
-            Document { identity: "b", path: Path::new("/fixture/b.md"), title: "b.md", body: "nothing relevant here", modified_ns: 1, changed_ns: 1, bytes: 1, extraction: Extraction::Text },
-        ]).unwrap();
+        let ids = store
+            .put_batch(
+                &scan,
+                &[
+                    Document {
+                        identity: "a",
+                        path: Path::new("/fixture/a.md"),
+                        title: "a.md",
+                        body: &body,
+                        modified_ns: 1,
+                        changed_ns: 1,
+                        bytes: 1,
+                        extraction: Extraction::Text,
+                    },
+                    Document {
+                        identity: "b",
+                        path: Path::new("/fixture/b.md"),
+                        title: "b.md",
+                        body: "nothing relevant here",
+                        modified_ns: 1,
+                        changed_ns: 1,
+                        bytes: 1,
+                        extraction: Extraction::Text,
+                    },
+                ],
+            )
+            .unwrap();
         let terms = question_terms("which signaling did the capstone choose");
-        let hits = store.search_any(&terms, 5, Arc::new(AtomicBool::new(false))).unwrap();
-        assert_eq!(hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(), ["/fixture/a.md"]);
+        let hits = store
+            .search_any(&terms, 5, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>(),
+            ["/fixture/a.md"]
+        );
         let passage = store.passage(hits[0].id, &terms, 600).unwrap().unwrap();
-        assert!(passage.contains("WebRTC signaling") && passage.len() <= 600, "{passage}");
-        store.put_embedding(ids[0].0, ids[0].1, "[\"apple-contextual-en\",1,2]", &[1.0, 0.0]).unwrap();
-        store.put_embedding(ids[1].0, ids[1].1, "[\"apple-sentence-en\",1,2]", &[0.0, 1.0]).unwrap();
-        let report = store.compact(&fixture.0, "apple-contextual-en", Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+        assert!(
+            passage.contains("WebRTC signaling") && passage.len() <= 600,
+            "{passage}"
+        );
+        store
+            .put_embedding(
+                ids[0].0,
+                ids[0].1,
+                "[\"apple-contextual-en\",1,2]",
+                &[1.0, 0.0],
+            )
+            .unwrap();
+        store
+            .put_embedding(
+                ids[1].0,
+                ids[1].1,
+                "[\"apple-sentence-en\",1,2]",
+                &[0.0, 1.0],
+            )
+            .unwrap();
+        let report = store
+            .compact(
+                &fixture.0,
+                "apple-contextual-en",
+                Arc::new(AtomicBool::new(false)),
+                |_| {},
+            )
+            .unwrap();
         assert_eq!(report.removed_vectors, 1);
-        let models: Vec<String> = store.connection.prepare("SELECT model FROM embeddings").unwrap()
-            .query_map([], |row| row.get(0)).unwrap().collect::<std::result::Result<_, _>>().unwrap();
+        let models: Vec<String> = store
+            .connection
+            .prepare("SELECT model FROM embeddings")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
         assert_eq!(models, ["[\"apple-contextual-en\",1,2]"]);
         assert_eq!(store.count().unwrap(), 2);
-        assert_eq!(store.search("polling", 5, Arc::new(AtomicBool::new(false))).unwrap().hits.len(), 1);
+        assert_eq!(
+            store
+                .search("polling", 5, Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .hits
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1636,14 +2476,22 @@ mod tests {
         let fixture = Fixture::new();
         let mut store = fixture.open();
         let scan = store.begin_scan(Path::new("/fixture")).unwrap();
-        store.put_batch(&scan, &[doc("a", "/fixture/a.txt", "idle heron")]).unwrap();
+        store
+            .put_batch(&scan, &[doc("a", "/fixture/a.txt", "idle heron")])
+            .unwrap();
         drop(store);
         // Closing the last WAL connection removes the side files, as when indexing goes idle; the
         // bundled SQLite must still let a read-only connection open and search.
         assert!(!std::path::PathBuf::from(format!("{}-wal", fixture.0.display())).exists());
         let reader = ContentStore::open_reader(&fixture.0).expect("reader on an idle index");
         assert_eq!(search(&reader, "heron").len(), 1);
-        assert!(reader.connection.execute("DELETE FROM documents", []).is_err(), "readers stay query-only");
+        assert!(
+            reader
+                .connection
+                .execute("DELETE FROM documents", [])
+                .is_err(),
+            "readers stay query-only"
+        );
     }
 
     #[test]
@@ -1651,21 +2499,82 @@ mod tests {
         let fixture = Fixture::new();
         let mut store = fixture.open();
         let first = store.begin_scan(Path::new("/fixture")).unwrap();
-        let (id, revision) = store.put_batch(&first, &[doc("a", "/fixture/report.pdf", "old extracted body")]).unwrap()[0];
-        store.put_embedding(id, revision, "fixture", &[1.0, 0.0]).unwrap();
+        let (id, revision) = store
+            .put_batch(
+                &first,
+                &[doc("a", "/fixture/report.pdf", "old extracted body")],
+            )
+            .unwrap()[0];
+        store
+            .put_embedding(id, revision, "fixture", &[1.0, 0.0])
+            .unwrap();
         let next = store.begin_scan(Path::new("/fixture")).unwrap();
-        store.mark_extraction_failure(&next, "a", Path::new("/fixture/report.pdf"), "report.pdf", 2, 2, 99, Extraction::Unreadable).unwrap();
-        assert_eq!(store.connection.query_row("SELECT body,extraction,revision FROM documents WHERE id=?1", [id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))).unwrap(), ("old extracted body".into(), 5, revision + 1));
-        assert_eq!(store.connection.query_row("SELECT count(*) FROM embeddings", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        store
+            .mark_extraction_failure(
+                &next,
+                "a",
+                Path::new("/fixture/report.pdf"),
+                "report.pdf",
+                2,
+                2,
+                99,
+                Extraction::Unreadable,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT body,extraction,revision FROM documents WHERE id=?1",
+                    [id],
+                    |r| Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?
+                    ))
+                )
+                .unwrap(),
+            ("old extracted body".into(), 5, revision + 1)
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM embeddings", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert_eq!(search(&store, "old extracted").len(), 1);
         let retry = store.begin_scan(Path::new("/fixture")).unwrap();
-        assert!(!store.mark_unchanged(&retry, "a", Path::new("/fixture/report.pdf"), 2, 2, 99).unwrap());
-        store.put_batch(&retry, &[Document {
-            identity: "a", path: Path::new("/fixture/report.pdf"), title: "report.pdf",
-            body: "new extracted body", modified_ns: 3, changed_ns: 3, bytes: 18,
-            extraction: Extraction::Extracted,
-        }]).unwrap();
-        assert_eq!(store.connection.query_row("SELECT extraction FROM documents WHERE id=?1", [id], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert!(
+            !store
+                .mark_unchanged(&retry, "a", Path::new("/fixture/report.pdf"), 2, 2, 99)
+                .unwrap()
+        );
+        store
+            .put_batch(
+                &retry,
+                &[Document {
+                    identity: "a",
+                    path: Path::new("/fixture/report.pdf"),
+                    title: "report.pdf",
+                    body: "new extracted body",
+                    modified_ns: 3,
+                    changed_ns: 3,
+                    bytes: 18,
+                    extraction: Extraction::Extracted,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT extraction FROM documents WHERE id=?1", [id], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -2254,6 +3163,205 @@ mod tests {
     }
 
     #[test]
+    fn a_version_seven_index_gains_chunks_without_losing_anything() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.0.parent().expect("parent")).expect("mkdir");
+        {
+            // A v7 database, as an installed 0.2.8 leaves it: documents, a body, a published shard.
+            let connection = Connection::open(&fixture.0).expect("open");
+            connection.execute_batch(SCHEMA_V1).expect("v1");
+            connection.execute_batch(SCHEMA_V2).expect("v2");
+            connection
+                .execute_batch(
+                    "ALTER TABLE documents ADD COLUMN changed_ns INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE documents ADD COLUMN extraction INTEGER NOT NULL DEFAULT 0 CHECK(extraction BETWEEN 0 AND 5);
+                     CREATE TABLE scan_clock(id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL);
+                     INSERT INTO scan_clock VALUES(1,0);
+                     CREATE TABLE vector_shards(after_key INTEGER PRIMARY KEY, through_key INTEGER NOT NULL,
+                        model TEXT NOT NULL, dimensions INTEGER NOT NULL, token TEXT NOT NULL UNIQUE,
+                        checksum TEXT NOT NULL, count INTEGER NOT NULL, bytes INTEGER NOT NULL);
+                     INSERT INTO vector_shards VALUES(0,1,'apple-contextual-en',512,'0123456789abcdef0123456789abcdef','a',1,64);
+                     INSERT INTO documents(identity,root,path,title,body,modified_ns,bytes,seen,revision)
+                        VALUES('old','/fixture','/fixture/kept.md','kept.md','renewal terms',1,13,1,1);",
+                )
+                .expect("v7 shape");
+            connection
+                .pragma_update(None, "application_id", APPLICATION_ID)
+                .expect("id");
+            connection
+                .pragma_update(None, "user_version", 7)
+                .expect("v7");
+        }
+        let store = fixture.open();
+        assert_eq!(
+            store.count().expect("count"),
+            1,
+            "documents survive the migration"
+        );
+        assert_eq!(search(&store, "renewal")[0].path, "/fixture/kept.md");
+        let shards: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM vector_shards", [], |row| row.get(0))
+            .expect("shards");
+        assert_eq!(shards, 1, "published vectors keep serving");
+        let chunks: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))
+            .expect("chunks");
+        assert_eq!(
+            chunks, 0,
+            "chunks fill in as files are re-read, not during migration"
+        );
+        store.check_integrity().expect("integrity");
+    }
+
+    #[test]
+    fn passage_backfill_revisits_unchanged_metadata_and_keeps_legacy_excerpt_bounded() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).unwrap();
+        let body = format!("{}\n\nuniquelatesection", "ordinary paragraph\n\n".repeat(4000));
+        store.put_batch(&scan, &[doc("a", "/fixture/long.md", &body)]).unwrap();
+        assert_eq!(store.connection.query_row("SELECT length(CAST(body AS BLOB)) FROM documents", [], |r| r.get::<_, i64>(0)).unwrap(), MAX_BODY_BYTES as i64);
+        assert_eq!(store.passages("uniquelatesection", 10, Arc::new(AtomicBool::new(false))).unwrap().len(), 1);
+        assert!(store.mark_unchanged(&scan, "a", Path::new("/fixture/long.md"), 1, 1, body.len() as u64).unwrap());
+        store.connection.execute("UPDATE documents SET passage_version=0", []).unwrap();
+        assert!(!store.mark_unchanged(&scan, "a", Path::new("/fixture/long.md"), 1, 1, body.len() as u64).unwrap());
+        assert_eq!(store.passages("uniquelatesection", 10, Arc::new(AtomicBool::new(false))).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn office_text_does_not_invent_pdf_page_numbers() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).unwrap();
+        store.put_batch(&scan, &[Document { extraction: Extraction::Extracted,
+            ..doc("word", "/fixture/report.docx", "Renewal deadline") }]).unwrap();
+        let found = store.passages("renewal", 10, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(found[0].page, 0);
+    }
+
+    #[test]
+    fn chunks_follow_their_document_through_rewrites_and_deletion() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).expect("scan");
+        let long = format!(
+            "# Notes\n\n{}\n\n## Later\n\n{}\n",
+            "alpha ".repeat(300),
+            "omega ".repeat(300)
+        );
+        store
+            .put_batch(&scan, &[doc("a", "/fixture/notes.md", &long)])
+            .expect("put");
+        let counted = |store: &ContentStore| -> i64 {
+            store
+                .connection
+                .query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))
+                .expect("count")
+        };
+        let first = counted(&store);
+        assert!(first > 1, "a long note becomes several passages, not one");
+
+        let scan = store.begin_scan(Path::new("/fixture")).expect("rescan");
+        store
+            .put_batch(
+                &scan,
+                &[doc("a", "/fixture/notes.md", "# Notes\n\nshort now\n")],
+            )
+            .expect("rewrite");
+        assert_eq!(counted(&store), 1, "rewriting a file replaces its passages");
+        assert!(
+            store
+                .passages("alpha", 10, Arc::new(AtomicBool::new(false)))
+                .expect("passages")
+                .is_empty()
+        );
+
+        let scan = store.begin_scan(Path::new("/fixture")).expect("third");
+        store
+            .finish_scan(&scan, ScanOutcome::Complete, &AtomicBool::new(false))
+            .expect("finish");
+        assert_eq!(
+            counted(&store),
+            0,
+            "deleting a document takes its passages with it"
+        );
+        store.check_integrity().expect("integrity");
+    }
+
+    #[test]
+    fn passages_carry_the_page_or_line_to_open() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).expect("scan");
+        let report = Document {
+            extraction: Extraction::Extracted,
+            ..doc(
+                "pdf",
+                "/fixture/report.pdf",
+                "Cover page\u{c}The renewal deadline is October 31\u{c}Signatures",
+            )
+        };
+        let filler = "    let _ = 1;\n".repeat(30);
+        let source = format!(
+            "use std::fs;\n\nfn publish_shard() {{\n{filler}}}\n\nfn rebuild_shard() {{\n{filler}}}\n"
+        );
+        let code = doc("code", "/fixture/store.rs", &source);
+        store.put_batch(&scan, &[report, code]).expect("put");
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let found = store
+            .passages("renewal deadline", 10, Arc::clone(&cancel))
+            .expect("pdf");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].page, 2, "the page a reader should be taken to");
+        assert_eq!(found[0].line, 0);
+        assert!(found[0].text.contains("October 31"));
+
+        let found = store.passages("rebuild shard", 10, cancel).expect("code");
+        assert_eq!(found[0].path, "/fixture/store.rs");
+        assert_eq!(
+            found[0].line, 36,
+            "the second declaration starts its own passage, at its own line"
+        );
+        assert!(found[0].heading.contains("rebuild_shard"));
+    }
+
+    #[test]
+    fn a_question_in_your_own_words_still_finds_the_passage() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).expect("scan");
+        store
+            .put_batch(
+                &scan,
+                &[doc(
+                    "r",
+                    "/fixture/releasing.md",
+                    "# Releasing\n\nPush a version tag and the workflow publishes the release.\n",
+                )],
+            )
+            .expect("put");
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Every term matches, so the strict pass answers.
+        assert!(
+            !store
+                .passages("version tag workflow", 10, Arc::clone(&cancel))
+                .expect("all")
+                .is_empty()
+        );
+        // "how" and "I" appear nowhere: all-terms finds nothing, any-terms still does.
+        let asked = store
+            .passages("how do I publish a release", 10, cancel)
+            .expect("any");
+        assert_eq!(
+            asked.first().map(|passage| passage.path.as_str()),
+            Some("/fixture/releasing.md")
+        );
+    }
+
+    #[test]
     fn failed_migration_rolls_back_and_foreign_database_is_untouched() {
         let fixture = Fixture::new();
         std::fs::create_dir_all(fixture.0.parent().expect("parent")).expect("mkdir");
@@ -2360,5 +3468,287 @@ mod tests {
         let selective = query(&store, "unique");
         assert!(!selective.limited);
         assert_eq!(selective.hits.len(), 1);
+    }
+
+    #[test]
+    fn a_version_eight_index_gains_chunk_vectors_without_losing_anything() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(fixture.0.parent().expect("parent")).expect("mkdir");
+        {
+            // A v8 database: documents, chunks, a published shard and a document vector.
+            let connection = Connection::open(&fixture.0).expect("open");
+            connection.execute_batch(SCHEMA_V1).expect("v1");
+            connection.execute_batch(SCHEMA_V2).expect("v2");
+            connection
+                .execute_batch(
+                    "ALTER TABLE documents ADD COLUMN changed_ns INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE documents ADD COLUMN extraction INTEGER NOT NULL DEFAULT 0 CHECK(extraction BETWEEN 0 AND 5);
+                     CREATE TABLE scan_clock(id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL);
+                     INSERT INTO scan_clock VALUES(1,0);
+                     CREATE TABLE vector_shards(after_key INTEGER PRIMARY KEY, through_key INTEGER NOT NULL,
+                        model TEXT NOT NULL, dimensions INTEGER NOT NULL, token TEXT NOT NULL UNIQUE,
+                        checksum TEXT NOT NULL, count INTEGER NOT NULL, bytes INTEGER NOT NULL);
+                     INSERT INTO vector_shards VALUES(0,1,'apple-contextual-en',512,'0123456789abcdef0123456789abcdef','a',1,64);
+                     INSERT INTO documents(identity,root,path,title,body,modified_ns,bytes,seen,revision)
+                        VALUES('old','/fixture','/fixture/kept.md','kept.md','renewal terms',1,13,1,1);",
+                )
+                .expect("v8 shape");
+            connection.execute_batch(SCHEMA_V8).expect("chunks");
+            connection
+                .execute_batch(
+                    "INSERT INTO chunks(document_id,ordinal,page,line,heading,text,symbols)
+                        VALUES(1,0,0,1,'Renewal','renewal terms','');
+                     INSERT INTO embeddings(document_id,revision,model,dimensions,vector)
+                        VALUES(1,1,'apple-contextual-en',2,x'0000803f00000000');",
+                )
+                .expect("v8 content");
+            connection
+                .pragma_update(None, "application_id", APPLICATION_ID)
+                .expect("id");
+            connection
+                .pragma_update(None, "user_version", 8)
+                .expect("v8");
+        }
+        let store = fixture.open();
+        let counted = |table: &str| -> i64 {
+            store
+                .connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count")
+        };
+        assert_eq!(store.count().expect("count"), 1, "documents survive");
+        assert_eq!(search(&store, "renewal")[0].path, "/fixture/kept.md");
+        assert_eq!(counted("chunks"), 1, "passages survive");
+        assert_eq!(
+            counted("vector_shards"),
+            1,
+            "published vectors keep serving"
+        );
+        assert_eq!(counted("embeddings"), 1, "document vectors are not retired");
+        assert_eq!(
+            counted("chunk_embeddings"),
+            0,
+            "passage vectors are embedded by a later pass, not by the migration"
+        );
+        // The passage is now offered to the model, which is the whole point of the migration.
+        let page = store
+            .chunk_embedding_page(0, "fixture", 2, Arc::new(AtomicBool::new(false)))
+            .expect("page");
+        assert_eq!(page.pending.len(), 1);
+        assert!(page.pending[0].text.contains("renewal terms"));
+        store.check_integrity().expect("integrity");
+    }
+
+    /// A unit vector of `dimensions` width, distinct per `seed`.
+    fn vector(dimensions: usize, seed: usize) -> Vec<f32> {
+        let mut values = vec![0.0; dimensions];
+        values[seed % dimensions] = 1.0;
+        values
+    }
+
+    #[test]
+    fn chunk_embedding_pages_are_bounded_resume_and_skip_current_vectors() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).unwrap();
+        let paths: Vec<_> = (0..130).map(|i| format!("/fixture/{i}.txt")).collect();
+        let documents: Vec<_> = paths
+            .iter()
+            .map(|path| doc(path, path, "one short passage"))
+            .collect();
+        store.put_batch(&scan, &documents).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let first = store
+            .chunk_embedding_page(0, "fixture-v1", 2, Arc::clone(&cancel))
+            .unwrap();
+        assert_eq!(first.scanned, 128, "the page is bounded");
+        assert_eq!(first.pending.len(), 128);
+        assert!(first.pending.iter().all(|chunk| !chunk.text.is_empty()));
+
+        let second = store
+            .chunk_embedding_page(first.after, "fixture-v1", 2, Arc::clone(&cancel))
+            .unwrap();
+        assert_eq!(
+            second.scanned, 2,
+            "the cursor resumes where the page stopped"
+        );
+
+        // A stored vector removes that chunk from the next pass, so resuming re-embeds nothing.
+        let embedded = first.pending[0].id;
+        assert!(
+            store
+                .put_chunk_embedding(embedded, "fixture-v1", &vector(2, 0))
+                .unwrap()
+        );
+        let again = store
+            .chunk_embedding_page(0, "fixture-v1", 2, Arc::clone(&cancel))
+            .unwrap();
+        assert_eq!(again.scanned, 128, "it is still counted as examined");
+        assert_eq!(again.pending.len(), 127, "but no longer needs the model");
+        assert!(again.pending.iter().all(|chunk| chunk.id != embedded));
+
+        // Another model has its own vectors: the same chunk is pending again.
+        let other = store
+            .chunk_embedding_page(0, "fixture-v2", 2, cancel)
+            .unwrap();
+        assert_eq!(other.pending.len(), 128);
+    }
+
+    #[test]
+    fn chunk_embedding_page_rejects_cancelled_and_malformed_records() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).unwrap();
+        store
+            .put_batch(&scan, &[doc("a", "/fixture/a.txt", "text")])
+            .unwrap();
+        assert!(matches!(
+            store.chunk_embedding_page(0, "fixture", 2, Arc::new(AtomicBool::new(true))),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(
+            store
+                .chunk_embedding_page(0, "fixture", 2, Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .pending
+                .len(),
+            1
+        );
+        store
+            .connection
+            .execute("UPDATE documents SET path='/fixture/../outside'", [])
+            .unwrap();
+        assert!(
+            store
+                .chunk_embedding_page(0, "fixture", 2, Arc::new(AtomicBool::new(false)))
+                .is_err(),
+            "a path that escapes its root is refused"
+        );
+        assert!(
+            store
+                .chunk_embedding_page(-1, "fixture", 2, Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
+        // A vector whose values cannot be normalized would be unreadable once stored.
+        assert!(
+            store
+                .put_chunk_embedding(1, "fixture", &[0.0, 0.0])
+                .is_err()
+        );
+        assert!(
+            store
+                .put_chunk_embedding(1, "fixture", &[f32::NAN, 1.0])
+                .is_err()
+        );
+        assert!(store.put_chunk_embedding(1, "", &[1.0, 0.0]).is_err());
+        assert!(
+            !store
+                .put_chunk_embedding(999_999, "fixture", &[1.0, 0.0])
+                .unwrap(),
+            "a chunk that no longer exists is not an error"
+        );
+    }
+
+    #[test]
+    fn code_passages_are_embedded_and_machine_data_is_not() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).unwrap();
+        store
+            .put_batch(
+                &scan,
+                &[
+                    doc(
+                        "code",
+                        "/fixture/search.rs",
+                        "fn rebuild_shards() { let x = 1; }",
+                    ),
+                    doc("data", "/fixture/telemetry.json", r#"{"a":1,"b":2}"#),
+                    doc(
+                        "notes",
+                        "/fixture/notes.md",
+                        "# Renewal\n\nThe deadline is March.",
+                    ),
+                ],
+            )
+            .unwrap();
+        let page = store
+            .chunk_embedding_page(0, "fixture", 2, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        let embedded: Vec<_> = page
+            .pending
+            .iter()
+            .map(|chunk| chunk.path.as_str())
+            .collect();
+        assert!(
+            embedded.contains(&"/fixture/search.rs"),
+            "a passage is one declaration with its symbols, unlike a whole-file vector: {embedded:?}"
+        );
+        assert!(embedded.contains(&"/fixture/notes.md"), "{embedded:?}");
+        assert!(
+            !embedded.contains(&"/fixture/telemetry.json"),
+            "a vector over machine data describes its shape, not its meaning: {embedded:?}"
+        );
+        assert_eq!(page.lexical_only, 1);
+    }
+
+    #[test]
+    fn rewriting_or_deleting_a_document_takes_its_chunk_vectors_with_it() {
+        let fixture = Fixture::new();
+        let mut store = fixture.open();
+        let scan = store.begin_scan(Path::new("/fixture")).unwrap();
+        store
+            .put_batch(&scan, &[doc("a", "/fixture/a.md", "the original passage")])
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let page = store
+            .chunk_embedding_page(0, "fixture", 2, Arc::clone(&cancel))
+            .unwrap();
+        for chunk in &page.pending {
+            assert!(
+                store
+                    .put_chunk_embedding(chunk.id, "fixture", &vector(2, 0))
+                    .unwrap()
+            );
+        }
+        let count = |store: &ContentStore| -> i64 {
+            store
+                .connection
+                .query_row("SELECT count(*) FROM chunk_embeddings", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        assert!(count(&store) > 0);
+
+        // Rewriting replaces the chunks, and the vectors cascade away with them rather than
+        // describing text the file no longer contains.
+        store
+            .put_batch(
+                &scan,
+                &[doc("a", "/fixture/a.md", "a completely different passage")],
+            )
+            .unwrap();
+        assert_eq!(count(&store), 0, "stale vectors survived a rewrite");
+
+        let page = store
+            .chunk_embedding_page(0, "fixture", 2, Arc::clone(&cancel))
+            .unwrap();
+        assert!(!page.pending.is_empty(), "the new passage needs a vector");
+        for chunk in &page.pending {
+            store
+                .put_chunk_embedding(chunk.id, "fixture", &vector(2, 1))
+                .unwrap();
+        }
+        assert!(count(&store) > 0);
+        // A later scan that no longer sees the file retires it, the way the indexer does.
+        let next = store.begin_scan(Path::new("/fixture")).unwrap();
+        store
+            .remove_unseen_under(&next, Path::new("/fixture/a.md"), &cancel)
+            .unwrap();
+        assert_eq!(count(&store), 0, "vectors outlived their document");
     }
 }

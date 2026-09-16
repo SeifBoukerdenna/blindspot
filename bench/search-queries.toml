@@ -1,0 +1,248 @@
+# Golden set for `make bench-search`: what content search should find.
+#
+# Queries and paths only, never file contents. Paths are relative to the home folder, and a query
+# counts as found when any of its `expect` paths appears in the results; `rank` is the position of
+# the first one.
+#
+# `kind = "words"` means the query's words appear in the file, which exact search should already
+# find. `kind = "meaning"` means they mostly do not: those are the ones today's one-vector-per-file
+# design misses, and the ones the chunking and embedding work is for.
+#
+# The set deliberately targets this repository and its documents: the files are known, stable and
+# already indexed, so the same numbers can be compared across phases on any machine that indexes
+# its own checkout.
+
+[[query]]
+text = "single instance guard"
+expect = ["blindspot/shell/AppDelegate.swift"]
+kind = "meaning"
+
+[[query]]
+text = "how does the launcher avoid two copies fighting over one index"
+expect = ["blindspot/shell/AppDelegate.swift"]
+kind = "meaning"
+
+[[query]]
+text = "give focus back to the app you came from"
+expect = ["blindspot/shell/Panel.swift"]
+kind = "meaning"
+
+[[query]]
+text = "carbon hotkey registration"
+expect = ["blindspot/shell/HotKey.swift"]
+kind = "words"
+
+[[query]]
+text = "passwords copied from a password manager are never stored"
+expect = ["blindspot/shell/ClipboardWatcher.swift"]
+kind = "meaning"
+
+[[query]]
+text = "recognize text in an image on device"
+expect = ["blindspot/shell/TextCapture.swift", "blindspot/shell/ClipboardWatcher.swift"]
+kind = "words"
+
+[[query]]
+text = "select part of the screen and copy what it says"
+expect = ["blindspot/shell/TextCapture.swift"]
+kind = "meaning"
+
+[[query]]
+text = "zoom and google meet links in calendar events"
+expect = ["blindspot/shell/Schedule.swift"]
+kind = "words"
+
+[[query]]
+text = "turn what I typed into a calendar entry"
+expect = ["blindspot/shell/LocalRequest.swift", "blindspot/shell/Schedule.swift"]
+kind = "meaning"
+
+[[query]]
+text = "verify a download against its published checksum"
+expect = ["blindspot/shell/Updater.swift"]
+kind = "words"
+
+[[query]]
+text = "swap the running app for a newer copy and start it again"
+expect = ["blindspot/shell/Updater.swift"]
+kind = "meaning"
+
+[[query]]
+text = "settings window tabs and pages"
+expect = ["blindspot/shell/Settings.swift"]
+kind = "words"
+
+[[query]]
+text = "dashboard tiles showing what has been indexed"
+expect = ["blindspot/shell/IndexDashboard.swift"]
+kind = "words"
+
+[[query]]
+text = "colour schemes for the panel"
+expect = ["blindspot/shell/Theme.swift"]
+kind = "meaning"
+
+[[query]]
+text = "which symbol is drawn beside each kind of result"
+expect = ["blindspot/shell/ResultsView.swift"]
+kind = "meaning"
+
+[[query]]
+text = "watch folders for file system events"
+expect = ["blindspot/shell/ContentWatcher.swift"]
+kind = "words"
+
+[[query]]
+text = "stop indexing while the laptop runs on battery"
+expect = ["blindspot/shell/ContentWatcher.swift", "blindspot/core/src/content_service.rs"]
+kind = "meaning"
+
+[[query]]
+text = "read the text the user has selected in another application"
+expect = ["blindspot/shell/Context.swift"]
+kind = "meaning"
+
+[[query]]
+text = "registry of actions for a result"
+expect = ["blindspot/shell/Actions.swift"]
+kind = "words"
+
+[[query]]
+text = "lock the screen, sleep, empty the trash"
+expect = ["blindspot/core/src/system.rs", "blindspot/shell/Actions.swift"]
+kind = "words"
+
+[[query]]
+text = "full text search tables in sqlite"
+expect = ["blindspot/core/src/content.rs"]
+kind = "meaning"
+
+[[query]]
+text = "show the sentence that matched inside a document"
+expect = ["blindspot/core/src/content.rs"]
+kind = "meaning"
+
+[[query]]
+text = "reclaim disk space from the index"
+expect = ["blindspot/core/src/content.rs"]
+kind = "meaning"
+
+[[query]]
+text = "skip node_modules and build folders while walking"
+expect = ["blindspot/core/src/content_indexer.rs"]
+kind = "words"
+
+[[query]]
+text = "pull the text out of pdf and word files"
+expect = ["blindspot/core/src/content_indexer.rs", "blindspot/helpers/ExtractWorker.swift"]
+kind = "meaning"
+
+[[query]]
+text = "parsing a document must not reach the network"
+expect = ["blindspot/helpers/ExtractWorker.swift"]
+kind = "meaning"
+
+[[query]]
+text = "embedding pass and shard building"
+expect = ["blindspot/core/src/semantic/indexing.rs"]
+kind = "words"
+
+[[query]]
+text = "rebuild the vector cache while search keeps working"
+expect = ["blindspot/core/src/semantic/indexing.rs"]
+kind = "meaning"
+
+[[query]]
+text = "mix exact matches with ones found by meaning"
+expect = ["blindspot/core/src/semantic/search.rs"]
+kind = "meaning"
+
+[[query]]
+text = "checksum and token of a vector shard"
+expect = ["blindspot/core/src/content/vectors.rs"]
+kind = "words"
+
+[[query]]
+text = "vectors written after the newest shard are searched exactly"
+expect = ["blindspot/core/src/content/vectors.rs", "blindspot/core/src/semantic/search.rs"]
+kind = "words"
+
+[[query]]
+text = "save a quick link with a keyword"
+expect = ["blindspot/core/src/shortcuts.rs"]
+kind = "words"
+
+[[query]]
+text = "saved prompts such as fix grammar"
+expect = ["blindspot/core/src/shortcuts.rs"]
+kind = "words"
+
+[[query]]
+text = "convert feet and inches into metres"
+expect = ["blindspot/core/src/tools.rs"]
+kind = "meaning"
+
+[[query]]
+text = "read the time zone files macos ships"
+expect = ["blindspot/core/src/tools/timezones.rs"]
+kind = "meaning"
+
+[[query]]
+text = "daylight saving rule in the posix footer"
+expect = ["blindspot/core/src/tools/timezones.rs"]
+kind = "words"
+
+[[query]]
+text = "arithmetic with percentages and parentheses"
+expect = ["blindspot/core/src/calc.rs"]
+kind = "meaning"
+
+[[query]]
+text = "renaming must never overwrite a file that already exists"
+expect = ["blindspot/core/src/agent/intent.rs"]
+kind = "meaning"
+
+[[query]]
+text = "talk to the local model over loopback"
+expect = ["blindspot/core/src/agent/http.rs", "blindspot/core/src/agent/mod.rs"]
+kind = "meaning"
+
+[[query]]
+text = "which process is listening on a port"
+expect = ["blindspot/core/src/ports.rs"]
+kind = "words"
+
+[[query]]
+text = "ask spotlight for files by name"
+expect = ["blindspot/core/src/files.rs"]
+kind = "meaning"
+
+[[query]]
+text = "filters like kind size and modified in a query"
+expect = ["blindspot/core/src/query.rs"]
+kind = "words"
+
+[[query]]
+text = "how long clipboard entries are kept and how they are pinned"
+expect = ["blindspot/core/src/clips.rs"]
+kind = "words"
+
+[[query]]
+text = "how do I publish a new release"
+expect = ["blindspot/docs/releasing.md"]
+kind = "meaning"
+
+[[query]]
+text = "what changed in 0.2.8"
+expect = ["blindspot/docs/new-features.md"]
+kind = "words"
+
+[[query]]
+text = "take the screenshots used in the readme"
+expect = ["blindspot/scripts/capture-media.sh", "blindspot/media/README.md"]
+kind = "meaning"
+
+[[query]]
+text = "download the app and open it the first time"
+expect = ["blindspot/README.md", "blindspot/docs/new-features.md"]
+kind = "meaning"

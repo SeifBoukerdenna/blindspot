@@ -412,6 +412,9 @@ private final class ResultRow: NSView {
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         subtitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         rail.lineBreakMode = .byTruncatingTail
+        // One line: the label's attributed string carries a wrapping paragraph style, which broke
+        // "centimetres" in the middle of the word on a second line.
+        rail.maximumNumberOfLines = 1
         rail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         iconView.imageScaling = .scaleProportionallyUpOrDown
 
@@ -708,6 +711,10 @@ private final class ResultRow: NSView {
         case .agentModel:
             // "current · 2.4 GB" marks the model in use; the badge says so instead.
             return (match.name, match.subtitle.replacingOccurrences(of: currentPrefix, with: ""))
+        case .file where match.page > 0 || match.line > 0:
+            let paged = URL(fileURLWithPath: match.path).pathExtension.lowercased() == "pptx" ? "slide" : "p."
+            let place = match.page > 0 ? "\(paged) \(match.page)" : "line \(match.line)"
+            return (match.name, match.subtitle.isEmpty ? place : "\(place) · \(match.subtitle)")
         case .app, .file, .port, .command, .setting, .shortcut, .quickLink, .snippet, .system, .prompt, .event, .header, .agentPrompt, .agentStep, .agentBlocked,
             .agentOk, .agentFailed, .agentAnswer:
             return (match.name, match.subtitle)

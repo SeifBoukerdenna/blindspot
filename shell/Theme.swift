@@ -61,7 +61,7 @@ enum Theme {
     static let selectionBar: CGFloat = 3
     /// Names the form of a computed row — "RAW", "BINARY". Fixed, so the figures beside
     /// it line up as a column you can read down.
-    static let railWidth: CGFloat = 76
+    static let railWidth: CGFloat = 104
     /// A proposed command's step number, or the mark saying how it ended.
     static let stepRail: CGFloat = 16
 

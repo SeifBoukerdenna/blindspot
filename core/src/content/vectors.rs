@@ -292,13 +292,24 @@ impl ContentStore {
         })
     }
 
-    pub fn vector_shard_reusable(&self, shard: &Shard, last: bool, cancel: Arc<AtomicBool>) -> Result<bool> {
+    pub fn vector_shard_reusable(
+        &self,
+        shard: &Shard,
+        last: bool,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<bool> {
         shard.validate()?;
         self.vector_read(cancel, || shard_reusable(&self.connection, shard, last))
     }
 
     /// Current vectors newer than every published shard, searched exactly until the next rebuild.
-    pub fn vector_delta(&self, after: i64, model: &str, dimensions: usize, cancel: Arc<AtomicBool>) -> Result<Vec<Vector>> {
+    pub fn vector_delta(
+        &self,
+        after: i64,
+        model: &str,
+        dimensions: usize,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Vec<Vector>> {
         validate_model(model, dimensions)?;
         if after < 0 {
             return Err(Error::Invalid("Invalid vector cursor"));
@@ -368,7 +379,9 @@ fn shard_reusable(connection: &rusqlite::Connection, shard: &Shard, last: bool) 
         params![shard.after, shard.through, shard.after + SHARD_CAPACITY, shard.model, shard.dimensions as i64],
         |row| Ok((row.get(0)?, row.get(1)?)))?;
     let count = shard.count as i64;
-    Ok(inside <= count && (count - inside) * 10 <= count && (beyond == 0 || (last && beyond <= MAX_DELTA as i64)))
+    Ok(inside <= count
+        && (count - inside) * 10 <= count
+        && (beyond == 0 || (last && beyond <= MAX_DELTA as i64)))
 }
 
 fn shard_current(connection: &rusqlite::Connection, shard: &Shard) -> Result<bool> {

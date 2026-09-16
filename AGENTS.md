@@ -40,6 +40,16 @@ run meaningful focused checks for changed behavior. Report what was actually ver
   until Compact is run. Historical snapshot, not a fixed count.
 - Claude and Codex sessions both work in this tree. Many files are modified or untracked;
   inspect git status, diffs and file mtimes. Never reset, clean or overwrite them.
+- Uncommitted, September 15, 2026: content search ranks passages, not whole files. Schema v8
+  adds chunks/chunks_fts; v7 indexes migrate in place, keeping documents and embeddings, and
+  erasure clears the chunk text too. Chunking lives in the dependency-free blindspot-retrieval
+  crate, so core and that crate are now members of a workspace rooted at ./Cargo.toml and
+  core/Cargo.lock moved to ./Cargo.lock. Cargo consequently writes to ./target; core/target
+  holds only pre-split leftovers. The Makefile still linked that stale archive against a freshly
+  generated header, which put BsResult's page/line fields at different offsets on each side of
+  the ABI and killed the panel inside a Swift string decode with a bogus allocation size —
+  distrust core/target rather than the FFI code. `make bench-search` scores search against
+  bench/search-queries.toml, whose paths are yours, so keep its output local.
 
 0.2.8: system commands (core/src/system.rs catalog, BS_KIND_SYSTEM rows spliced after apps in
 file_query and `:system`; shell SystemActions with confirmations for restart/shut down/log out/
@@ -196,6 +206,34 @@ CI and GitHub releases (docs/releasing.md):
 - **Calendar questions:** LocalRequest.asksAboutCalendar routes everyday calendar questions, plain or
   after `>`, to the EventKit schedule, because the model has no calendar access. Create, move and
   notes requests are excluded. The agent SYSTEM prompt points to `my schedule`.
+- **Event creation:** LocalRequest.eventDraft handles schedule/book, or add/create/plan/set + an event
+  noun.
+  - Dates come from NSDataDetector; day and time matches are combined, `for N minutes` is parsed,
+    the default length is 1 h, and a date without a time is all-day. No model is involved.
+  - ScheduleProvider.draftRows previews with the add-event path carrying title, start, end and
+    allDay, and lists that day's events.
+  - EventActions "add" saves to defaultCalendarForNewEvents; the session `added` set prevents
+    duplicates.
+- **Workspace:** root Cargo.toml (`core`, `crates/retrieval`; vector worker excluded), one
+  Cargo.lock at the root. `crates/retrieval` (blindspot-retrieval) is dependency-free and holds
+  pure retrieval logic: chunking now (prose by paragraph/heading, code by declaration, documents by
+  page, byte and chunk ceilings, identifier splitting), ranking later. Storage stays in the core.
+  - `make test-retrieval` runs its tests; `make check` is workspace-wide.
+  - `make bench-search` measures search quality against bench/search-queries.toml (queries and
+    relative paths only) on the live index; not in CI. Baseline 2026-09-15: hit@5 34%, MRR 0.31,
+    and fusing today's semantic search makes ranking worse. See docs/semantic-plan.md.
+- **Conversions:** core/src/tools.rs.
+  - Unit dimensions carry `offset` (temperature) and `inverse` (mpg, km/L).
+  - `normalize_units` rewrites multi-word unit names; `explicit_target` handles `X to/in unit`.
+  - `display_rows` picks outputs per dimension; `sig` sets the digits.
+- **Time zones:** core/src/tools/timezones.rs.
+  - A TZif reader over /usr/share/zoneinfo with POSIX footer rules, so there is no dependency.
+  - City names from the zone folders plus ALIASES; unknown places return nothing.
+  - Tests are pinned to fixed instants.
+- **Copy Text from Screen:** system command `capture-text`, run by shell/TextCapture.swift.
+  - `screencapture -i` into a temp file, then TextRecognition (shared with clipboard OCR), the
+    clipboard and a Toast.
+  - Needs Screen Recording for Blindspot.
 - **No Apple services:** releases are GitHub Releases only; the user does not want notarization,
   App Store Connect or Apple-server steps. Signing keeps --timestamp=none and no hardened runtime.
 - **The user does all of these, never Claude:** commits, pushes, tags, secrets, repository

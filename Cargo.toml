@@ -1,0 +1,7 @@
+# Workspace so the pure retrieval logic can be built, tested and measured on its own, while the
+# storage it serves stays in `core`. The vector worker is deliberately left out: it pulls a C++
+# library nothing else links, and its licences are collected from its own lock.
+[workspace]
+resolver = "3"
+members = ["core", "crates/retrieval"]
+exclude = ["helpers/vector-worker"]

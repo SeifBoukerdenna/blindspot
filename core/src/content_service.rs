@@ -1,12 +1,16 @@
 //! Owns the opt-in indexing and query lifetimes; all disk access stays on workers.
 
+pub mod passage_engine;
+
 use crate::{
     config::Content,
     content::{ContentStore, SearchPage},
     content_indexer::{self, Policy, Progress},
     process_job::{Failure, Latest},
 };
-use crate::semantic::{self, search::{Engine,Helpers}};
+use crate::semantic::{self, search::Helpers};
+use passage_engine::Engine;
+use crate::content::passage_search::{Match as PassageMatch, fuse as fuse_passages};
 
 type SharedEngine = Arc<Mutex<Option<Engine>>>;
 
@@ -158,8 +162,8 @@ pub struct ContentService {
     control: Mutex<Control>,
     snapshot: Arc<Mutex<Snapshot>>,
     indexing: Latest<IndexRequest, ()>,
-    searching: Latest<SearchRequest, SearchPage>,
-    semantic_searching: Latest<SemanticRequest, Vec<crate::content::Hit>>,
+    searching: Latest<SearchRequest, Vec<PassageMatch>>,
+    semantic_searching: Latest<SemanticRequest, Vec<PassageMatch>>,
     helpers: Option<Helpers>,
     query_engine: SharedEngine,
     activity: Mutex<std::collections::VecDeque<(std::time::Instant, PathBuf)>>,
@@ -173,7 +177,7 @@ impl ContentService {
     }
 
     pub fn with_helpers(path: Option<PathBuf>, helpers: Option<Helpers>) -> Self {
-        let query_engine=Arc::new(Mutex::new(helpers.clone().map(Engine::new)));
+        let query_engine=Arc::new(Mutex::new(helpers.clone().map(|helpers| Engine::new(helpers, Content::default().embedding_host))));
         Self {
             path,
             control: Mutex::new(Control {
@@ -264,7 +268,7 @@ impl ContentService {
         snapshot.semantic_progress = None;
         snapshot.phase = if !control.config.enabled {
             Phase::Disabled
-        } else if control.config.roots.is_empty() {
+        } else if control.config.roots.is_empty() && control.config.code_roots.is_empty() {
             Phase::NeedsRoots
         } else if control.paused {
             Phase::Paused
@@ -492,7 +496,26 @@ impl ContentService {
         self.search_filtered(query, crate::content::SearchFilter::default())
     }
 
+    /// The best passage of each matching file, for content rows that open where the match is.
+    /// Empty rather than an error: the row falls back to a whole-document match, which is what a
+    /// file indexed before chunking still has.
+    pub fn passages(&self, query: &str, limit: usize) -> Vec<crate::content::Passage> {
+        self.search_matches(query, crate::content::SearchFilter::default()).0
+            .and_then(Result::ok).unwrap_or_default().into_iter().take(limit).map(|item| item.passage).collect()
+    }
+
     pub fn search_filtered(&self, query: &str, filter: crate::content::SearchFilter) -> (Option<Result<SearchPage, Failure>>, bool) {
+        let (result,pending) = self.search_matches(query,filter);
+        (result.map(|result| result.map(|matches| {
+            let mut seen=std::collections::HashSet::new();
+            SearchPage { hits: matches.into_iter().filter(|item| seen.insert(item.passage.document_id)).map(|item| crate::content::Hit {
+                id:item.passage.document_id, identity:item.passage.document_id.to_string(),path:item.passage.path,title:item.passage.title,
+                rank:item.passage.rank,revision:item.revision,related:!item.words,snippet:Some(item.passage.text),
+            }).collect(), limited:false }
+        })),pending)
+    }
+
+    pub fn search_matches(&self, query: &str, filter: crate::content::SearchFilter) -> (Option<Result<Vec<PassageMatch>, Failure>>, bool) {
         let snapshot = self.snapshot();
         let Some(path) = &self.path else {
             return (None, false);
@@ -519,9 +542,9 @@ impl ContentService {
             self.semantic_searching.results(&request)
         } else {self.semantic_searching.cancel();(None,false)};
         let page=match (lexical,semantic) {
-            (Some(Ok(page)),Some(Ok(hits)))=>Some(Ok(semantic::search::fuse(page,hits))),
-            (Some(Ok(page)),_)=>Some(Ok(page)),
-            (_,Some(Ok(hits))) if !hits.is_empty()=>Some(Ok(semantic::search::fuse(SearchPage::default(),hits))),
+            (Some(Ok(page)),Some(Ok(hits)))=>Some(Ok(fuse_passages(page,hits,2))),
+            (Some(Ok(page)),_)=>Some(Ok(fuse_passages(page,Vec::new(),2))),
+            (_,Some(Ok(hits))) if !hits.is_empty()=>Some(Ok(fuse_passages(Vec::new(),hits,2))),
             (Some(Err(error)),_)=>Some(Err(error)),
             _=>None,
         };
@@ -531,6 +554,16 @@ impl ContentService {
     pub fn cancel_search(&self) {
         self.searching.cancel();
         self.semantic_searching.cancel();
+    }
+
+    pub fn stored_passage(&self,id:i64,path:&std::path::Path)->Option<String> {
+        let snapshot=self.snapshot();
+        if !snapshot.ready || matches!(snapshot.phase,Phase::Disabled|Phase::NeedsRoots|Phase::Erasing|Phase::Erased|Phase::Compacting) {return None;}
+        let policy=Policy {excluded_paths:snapshot.exclusions.clone(),..Policy::default()};
+        if !within_scope(path,&snapshot.roots,&policy) {return None;}
+        let reader=ContentStore::open_reader(self.path.as_ref()?).ok()?;
+        let text=reader.stored_passage(id,path,&snapshot.roots,&snapshot.exclusions,Arc::new(AtomicBool::new(false))).ok()??;
+        (self.snapshot().epoch==snapshot.epoch).then_some(text)
     }
 
     pub fn watched_roots(&self) -> Vec<String> {
@@ -561,33 +594,38 @@ pub struct Passage {
     pub title: String,
     pub path: String,
     pub text: String,
+    pub page: u32,
+    pub line: u32,
 }
 
 impl Retriever {
     /// Up to five passages and about 7,000 characters: any-word matches for the question's
     /// distinctive terms fused with semantic neighbours, limited to the indexed scope.
     pub fn passages(&self, question: &str, cancel: Arc<AtomicBool>) -> Result<Vec<Passage>, &'static str> {
-        let terms = crate::content::question_terms(question);
         let reader = ContentStore::open_reader(&self.path).map_err(|_| "The content index is unavailable")?;
-        let lexical = reader.search_any(&terms, 30, Arc::clone(&cancel)).map_err(|_| "Searching the index did not finish")?;
+        let filter=crate::content::SearchFilter::default();
+        let lexical = reader.search_passages(question,&filter,&self.roots,&self.exclusions,Arc::clone(&cancel)).map_err(|_| "Searching the index did not finish")?;
         let semantic = if self.semantic {
             let mut owner = self.engine.lock().unwrap_or_else(PoisonError::into_inner);
-            owner.as_mut().and_then(|engine| engine.search(&self.path, question, Arc::clone(&cancel)).ok()).unwrap_or_default()
+            owner.as_mut().and_then(|engine| engine.search(&self.path, question, &filter,&self.roots,&self.exclusions,Arc::clone(&cancel)).ok()).unwrap_or_default()
         } else {
             Vec::new()
         };
-        let fused = semantic::search::fuse(SearchPage { hits: lexical, limited: false }, semantic);
+        let fused = fuse_passages(lexical, semantic,2);
         let policy = Policy { excluded_paths: self.exclusions.clone(), ..Policy::default() };
         let mut passages = Vec::new();
         let mut budget = 7_000usize;
-        for hit in fused.hits.iter().filter(|hit| within_scope(std::path::Path::new(&hit.path), &self.roots, &policy)) {
+        for hit in fused.iter().map(|item| &item.passage).filter(|hit| within_scope(std::path::Path::new(&hit.path), &self.roots, &policy)) {
             if passages.len() == 5 || budget < 400 || cancel.load(Ordering::Acquire) {
                 break;
             }
-            if let Ok(Some(text)) = reader.passage(hit.id, &terms, budget.min(1_800)) {
-                budget = budget.saturating_sub(text.len());
-                passages.push(Passage { title: hit.title.clone(), path: hit.path.clone(), text });
-            }
+            let end=hit.text.floor_char_boundary(budget.min(1_800).min(hit.text.len()));
+            let text=hit.text[..end].to_owned();
+            budget=budget.saturating_sub(text.len());
+            let page_kind=if hit.path.to_ascii_lowercase().ends_with(".pptx") {"slide"} else {"p."};
+            let location=if hit.page>0 {format!(" · {page_kind} {}",hit.page)} else if hit.line>0 {format!(" · line {}",hit.line)} else {String::new()};
+            passages.push(Passage {title:format!("{}{location}",hit.title),path:hit.path.clone(),text,
+                page:u32::try_from(hit.page).unwrap_or(0),line:u32::try_from(hit.line).unwrap_or(0)});
         }
         Ok(passages)
     }
@@ -598,9 +636,12 @@ fn run_compact(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fa
     close_query_engine(&request.query_engine);
     let outcome = (|| -> Result<crate::content::CompactReport, crate::content::Error> {
         let mut store = ContentStore::open(&request.path)?;
-        let report = store.compact(&request.path, semantic::MODEL_IDENTIFIER, Arc::clone(&cancel),
+        let retired=store.retire_passage_models(&cancel)?;
+        let mut report = store.compact(&request.path, semantic::MODEL_IDENTIFIER, Arc::clone(&cancel),
             |stage| publish(request, &cancel, |snapshot| snapshot.stage = stage))?;
-        let catalog = store.vector_catalog(Arc::clone(&cancel))?;
+        report.removed_vectors+=retired;
+        let mut catalog = store.vector_catalog(Arc::clone(&cancel))?;
+        catalog.extend(store.passage_catalog(None,Arc::clone(&cancel))?);
         semantic::cache::prune(&request.path, &catalog, &cancel)?;
         Ok(report)
     })();
@@ -647,7 +688,7 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
         if request.stop {return Ok(());}
     }
     let config = &request.config;
-    if config.roots.len() > 32
+    if config.roots.len() + config.code_roots.len() > 32
         || config.excluded_paths.len() > 128
         || !(1..=16).contains(&config.max_file_mb)
     {
@@ -697,6 +738,11 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
     }
     let started = std::time::Instant::now();
     let mut store = ContentStore::open(&request.path).map_err(|_| Failure::Unavailable)?;
+    {
+        let mut engine=request.query_engine.lock().unwrap_or_else(PoisonError::into_inner);
+        *engine=request.helpers.clone().map(|helpers| Engine::new(helpers,config.embedding_host.clone())
+            .with_code_roots(config.expanded_code_roots().into_iter().filter_map(|root|root.canonicalize().ok()).collect()));
+    }
     publish(request, &cancel, |snapshot| {
         snapshot.ready = true;
         snapshot.stage = if config.documents { "Scanning folders and extracting PDFs" } else { "Scanning folders" };
@@ -710,6 +756,8 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
         max_document_bytes: config.max_document_mb.saturating_mul(1_048_576),
         extractor: request.helpers.as_ref().map(|helpers| helpers.embedding.with_file_name("blindspot-extract")),
         max_file_bytes: config.max_file_mb * 1_048_576,
+        storage_budget_bytes: config.index_budget_mb.clamp(256,32768) * 1_048_576,
+        ocr_pages: if config.ocr {config.ocr_pages.clamp(1,100)} else {0},
         batch_pause: if config.low_impact { std::time::Duration::from_millis(50) } else { std::time::Duration::from_millis(10) },
         ..Policy::default()
     };
@@ -763,37 +811,46 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
     // has not finished cleanly. Otherwise a folder of machine-written data files restarts the model
     // helper and re-validates the cache on every save (measured: 34 passes in 20 s, 15-28% CPU).
     let semantic_clean = request.snapshot.lock().unwrap_or_else(PoisonError::into_inner).semantic_clean;
-    if config.semantic && (total.semantic_updates > 0 || !semantic_clean) {
+    if config.semantic && !total.budget_exhausted && (total.semantic_updates > 0 || !semantic_clean) {
         let outcome=(||->Result<(),semantic::indexing::Error> {
             let helpers=request.helpers.as_ref().ok_or(semantic::Failure::Unavailable)?;
-            let mut client=semantic::Client::new(helpers.embedding.clone());
-            let progress=semantic::indexing::run(&mut store,&mut client,Arc::clone(&cancel),
-                |path|within_scope(path,&roots,&policy),|progress|publish(request,&cancel,|snapshot| {
-                    snapshot.stage="Embedding documents";
+            let (mut client,model,fallback)=passage_engine::select(helpers,&config.embedding_host,&config.embedding_model,&cancel)?;
+            let key=semantic::indexing::model_key(&model)?;
+            store.begin_passage_model(&key,model.dimensions)?;
+            let code_roots:Vec<_>=config.expanded_code_roots().into_iter().filter_map(|root|root.canonicalize().ok()).collect();
+            let progress=semantic::indexing::run_chunks_with_budget(&mut store,&mut client,Arc::clone(&cancel),
+                |path|within_scope(path,&roots,&policy) && passage_engine::eligible_path(path,&code_roots),|progress|publish(request,&cancel,|snapshot| {
+                    snapshot.stage="Embedding passages";
                     snapshot.semantic_status=format!("Embedding · {} written · {} current",progress.written,progress.current);
                     snapshot.semantic_progress=Some(progress.clone());
-                }))?;
-            let model=client.probe(&cancel)?;
+                }),policy.storage_budget_bytes)?;
             client.close();
-            let cache=semantic::indexing::maintain_cache(&store,&request.path,&helpers.vectors,&model,Arc::clone(&cancel),|progress| {
+            passage_engine::maintain_with_budget(&store,&request.path,&helpers.vectors,&model,Arc::clone(&cancel),|built,reused| {
                 publish(request,&cancel,|snapshot| {
                     snapshot.stage="Building semantic cache";
-                    snapshot.semantic_status=format!("Semantic cache · {} built · {} reused",progress.built,progress.reused);
-                    snapshot.semantic_revision=progress.built as u64+1;
+                    snapshot.semantic_status=format!("Passage cache · {built} built · {reused} reused");
+                    snapshot.semantic_revision=built as u64+1;
                 });
-            })?;
-            publish(request,&cancel,|snapshot|{snapshot.semantic_progress=Some(progress.clone());snapshot.semantic_clean=true;snapshot.semantic_status=if progress.failed>0 {
+            },policy.storage_budget_bytes)?;
+            if progress.stale==0 && progress.current+progress.written>0 { store.activate_passage_model(&key,&cancel)?; }
+            publish(request,&cancel,|snapshot|{snapshot.semantic_progress=Some(progress.clone());snapshot.semantic_clean=progress.stale==0;snapshot.semantic_status=if progress.failed>0 {
                 format!("Semantic ready · {} text items unavailable",progress.failed)
-            } else {format!("Semantic ready · {} shards",cache.built+cache.reused)};});
+            } else {format!("Semantic ready · {}{}",model.identifier,if fallback {" · Apple fallback"} else {""})};});
             Ok(())
         })();
         match outcome {
             Err(semantic::indexing::Error::Cancelled)=>return Err(Failure::Cancelled),
+            Err(semantic::indexing::Error::Storage(crate::content::Error::Invalid("Storage budget reached"|"Index storage budget reached")))=>{
+                total.budget_exhausted=true;
+                total.complete=false;
+                publish(request,&cancel,|snapshot|{snapshot.semantic_clean=false;snapshot.semantic_status="Storage budget reached; text search and prior vectors retained".into();});
+            },
             Err(_)=>publish(request,&cancel,|snapshot|{snapshot.semantic_clean=false;snapshot.semantic_status="Semantic unavailable; text search ready".into();}),
             Ok(())=>{},
         }
     }
     publish(request, &cancel, |snapshot| {
+        let exhausted=total.budget_exhausted;
         snapshot.phase = if total.complete {
             Phase::Ready
         } else {
@@ -801,7 +858,7 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
         };
         snapshot.progress = total;
         snapshot.current_path = None;
-        snapshot.stage = "";
+        snapshot.stage = if exhausted {"Storage budget reached; increase the budget or Compact"} else {""};
         snapshot.last_pass = Some((std::time::SystemTime::now(), started.elapsed()));
     });
     Ok(())
@@ -830,20 +887,15 @@ fn close_query_engine(engine:&SharedEngine) {
     if let Some(engine)=engine.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {engine.close();}
 }
 
-fn run_semantic_search(request:&SemanticRequest,cancel:Arc<AtomicBool>)->Result<Vec<crate::content::Hit>,Failure> {
+fn run_semantic_search(request:&SemanticRequest,cancel:Arc<AtomicBool>)->Result<Vec<PassageMatch>,Failure> {
     let mut owner=request.engine.lock().unwrap_or_else(PoisonError::into_inner);
     let engine=owner.as_mut().ok_or(Failure::Unavailable)?;
-    let mut hits=engine.search(&request.search.path,&request.search.query,Arc::clone(&cancel)).map_err(|error|match error {
+    let mut hits=engine.search(&request.search.path,&request.search.query,&request.search.filter,&request.search.roots,&request.search.exclusions,Arc::clone(&cancel)).map_err(|error|match error {
         semantic::Failure::Cancelled=>Failure::Cancelled,semantic::Failure::TimedOut=>Failure::TimedOut,_=>Failure::Unavailable,
     })?;
     let policy=Policy {excluded_paths:request.search.exclusions.clone(),..Policy::default()};
-    hits.retain(|hit|within_scope(std::path::Path::new(&hit.path),&request.search.roots,&policy));
+    hits.retain(|hit|within_scope(std::path::Path::new(&hit.passage.path),&request.search.roots,&policy));
     drop(owner);
-    if let Ok(reader)=ContentStore::open_reader(&request.search.path) {
-        reader.keep_matching(&mut hits,&request.search.filter).map_err(|_|Failure::Unavailable)?;
-        // Excerpts are a courtesy: a slow or failed lookup still returns the hits.
-        let _=reader.annotate(&request.search.query,&mut hits,8,crate::content::Snippet::Opening,cancel);
-    }
     Ok(hits)
 }
 
@@ -856,19 +908,19 @@ fn add(total: &mut Progress, next: &Progress) {
     total.failed += next.failed;
     total.removed += next.removed;
     total.semantic_updates += next.semantic_updates;
+    total.budget_exhausted |= next.budget_exhausted;
 }
 
-fn run_search(request: &SearchRequest, cancel: Arc<AtomicBool>) -> Result<SearchPage, Failure> {
+fn run_search(request: &SearchRequest, cancel: Arc<AtomicBool>) -> Result<Vec<PassageMatch>, Failure> {
     let reader = ContentStore::open_reader(&request.path).map_err(|_| Failure::Unavailable)?;
     let mut page = reader
-        .search_filtered(&request.query, &request.filter, 100, Arc::clone(&cancel))
+        .search_passages(&request.query, &request.filter, &request.roots,&request.exclusions,Arc::clone(&cancel))
         .map_err(|error| match error {
             crate::content::Error::Cancelled => Failure::Cancelled,
             _ => Failure::Unavailable,
         })?;
     let policy=Policy {excluded_paths:request.exclusions.clone(),..Policy::default()};
-    page.hits.retain(|hit|within_scope(std::path::Path::new(&hit.path),&request.roots,&policy));
-    let _ = reader.annotate(&request.query, &mut page.hits, 20, crate::content::Snippet::Matched, cancel);
+    page.retain(|hit|within_scope(std::path::Path::new(&hit.passage.path),&request.roots,&policy));
     Ok(page)
 }
 
@@ -1008,7 +1060,7 @@ mod tests {
 import json, sys, time
 for line in sys.stdin:
     request=json.loads(line)
-    response={'version':1,'id':request['id'],'model':{'identifier':'fixture','revision':1,'dimensions':2}}
+    response={'version':1,'id':request['id'],'model':{'identifier':'apple-contextual-en','revision':1,'dimensions':2}}
     if request['operation']=='embed':
         if request['texts']==['migrations']: time.sleep(1)
         response['vectors']=[[0.0,1.0] if ('fruit' in text or text=='apples') else [1.0,0.0] for text in request['texts']]
@@ -1019,7 +1071,7 @@ for line in sys.stdin:
         let service=ContentService::with_helpers(Some(database.clone()),Some(Helpers {
             embedding,vectors:std::env::var_os("BLINDSPOT_VECTOR_WORKER").expect("helper").into(),
         }));
-        service.configure(&Content {enabled:true,semantic:true,roots:vec![source.to_string_lossy().into()],..Content::default()});
+        service.configure(&Content {enabled:true,semantic:true,embedding_model:String::new(),roots:vec![source.to_string_lossy().into()],..Content::default()});
         service.set_paused(false, 0);wait(&service);
         assert_eq!(service.snapshot().phase,Phase::Ready);
         assert!(service.status().contains("Semantic ready"));
@@ -1047,7 +1099,7 @@ for line in sys.stdin:
             assert!(started.elapsed()<Duration::from_secs(2));
             std::thread::sleep(Duration::from_millis(5));
         }
-        service.configure(&Content::default());
+        service.configure(&Content {enabled:false,..Content::default()});
         service.erase().unwrap();wait(&service);
         assert_eq!(service.snapshot().phase,Phase::Erased);
         assert_eq!(std::fs::read_dir(root.join("content-vectors")).unwrap().count(),0);

@@ -220,39 +220,10 @@ enum ImageClip {
 
         return Encoded(
             png: png, thumbnail: thumbnail,
-            text: readingText ? recognizeText(image) : "",
+            text: readingText ? TextRecognition.text(in: image) : "",
             width: image.width, height: image.height)
     }
 
-    /// The text in an image, in reading order, via Vision's on-device recogniser.
-    ///
-    /// `.accurate`, not `.fast`: on a 3024 × 1964 screenshot, fast took 16ms and returned
-    /// `errorlE05991` and dropped French accents; accurate took 99ms warm and returned
-    /// `error[E0599]` and "vérifiez" intact. The whole decode-encode-recognise step measured
-    /// 367ms on a cold first run. It happens once per copied image, off the main thread,
-    /// before the clip is stored — slower than a keystroke, faster than copy-then-open.
-    /// English and French because this is a bilingual machine; detection picks between them.
-    ///
-    /// On-device text recognition, not an AI feature: deterministic, no network, and the
-    /// same recogniser behind Live Text. Chosen deliberately against CLAUDE.md's "No AI".
-    private static func recognizeText(_ image: CGImage) -> String {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.recognitionLanguages = ["en-US", "fr-FR"]
-        request.automaticallyDetectsLanguage = true
-        request.usesLanguageCorrection = true
-        guard (try? VNImageRequestHandler(cgImage: image).perform([request])) != nil else {
-            return ""
-        }
-        // Vision does not promise reading order, and the first line becomes the title, so
-        // sort top to bottom, then left to right. Its coordinates put y = 0 at the bottom.
-        let lines = (request.results ?? []).sorted { a, b in
-            let ay = a.boundingBox.midY, by = b.boundingBox.midY
-            if abs(ay - by) > 0.01 { return ay > by }
-            return a.boundingBox.minX < b.boundingBox.minX
-        }
-        return lines.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
-    }
 
     private static func pngData(_ image: CGImage) -> Data? {
         let out = NSMutableData()

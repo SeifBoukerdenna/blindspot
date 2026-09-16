@@ -21,7 +21,12 @@ VECTOR_DIR := helpers/vector-worker
 VECTOR_SRC := $(shell find $(VECTOR_DIR)/src -name '*.rs')
 
 CORE_DIR   := core
-CORE_LIB   := $(CORE_DIR)/target/release/libblindspot_core.a
+# Since the retrieval crate split, core is a workspace member, so cargo writes to the
+# workspace root's target directory and core/target holds only pre-split leftovers.
+# Linking that stale path paired a freshly generated header with an old archive, which
+# put BsResult's fields at different offsets on each side of the ABI.
+TARGET_DIR := target
+CORE_LIB   := $(TARGET_DIR)/release/libblindspot_core.a
 CORE_SRC   := $(shell find $(CORE_DIR)/src -name '*.rs')
 HEADER     := include/blindspot.h
 SWIFT_SRC  := $(wildcard shell/*.swift)
@@ -46,15 +51,16 @@ SWIFTFLAGS := -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
               -import-objc-header $(HEADER) \
               -framework AppKit -framework Carbon -framework Vision -framework ServiceManagement \
               -framework Quartz -framework EventKit \
-              -L $(CORE_DIR)/target/release -lblindspot_core
+              -L $(TARGET_DIR)/release -lblindspot_core
 
-.PHONY: all core header app sign package install version media run clean test test-actions test-updater test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
+.PHONY: all core header app sign package install version media run clean test test-retrieval test-actions test-updater bench-search test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
 
 all: sign
 
 core: $(CORE_LIB)
 
-$(CORE_LIB): $(CORE_SRC) $(CORE_DIR)/Cargo.toml $(CORE_DIR)/Cargo.lock Makefile
+RETRIEVAL_SRC := $(shell find crates -name '*.rs')
+$(CORE_LIB): $(CORE_SRC) $(RETRIEVAL_SRC) $(CORE_DIR)/Cargo.toml Cargo.lock Makefile
 	MACOSX_DEPLOYMENT_TARGET=$(DEPLOY) cargo build --release --locked --manifest-path $(CORE_DIR)/Cargo.toml
 
 header: $(HEADER)
@@ -70,10 +76,10 @@ $(VECTORS): $(VECTOR_SRC) $(VECTOR_DIR)/Cargo.toml $(VECTOR_DIR)/Cargo.lock Make
 	@mkdir -p $(CONTENTS)/Helpers
 	cp $(VECTOR_DIR)/target/release/blindspot-vector-worker $@
 
-$(EXTRACT): helpers/ExtractWorker.swift Makefile
+$(EXTRACT): helpers/ExtractWorker.swift helpers/OfficeExtract.swift Makefile
 	@mkdir -p $(CONTENTS)/Helpers
 	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) -parse-as-library \
-	    -framework PDFKit -o $@ helpers/ExtractWorker.swift
+	    -framework PDFKit -larchive -o $@ helpers/ExtractWorker.swift helpers/OfficeExtract.swift
 
 $(SEMANTIC): helpers/SemanticWorker.swift Makefile
 	@mkdir -p $(CONTENTS)/Helpers
@@ -87,7 +93,7 @@ $(BINARY): $(SWIFT_SRC) $(CORE_LIB) $(HEADER) shell/Info.plist Makefile
 	    shell/Info.plist > $(CONTENTS)/Info.plist
 
 RESOURCE_FILES := $(shell find docs/licenses -type f -print 2>/dev/null)
-$(RESOURCE_STAMP): scripts/package-resources.py core/Cargo.lock helpers/vector-worker/Cargo.lock \
+$(RESOURCE_STAMP): scripts/package-resources.py Cargo.lock helpers/vector-worker/Cargo.lock \
 		docs/new-features.md shell/AppIcon.icns $(RESOURCE_FILES)
 	python3 scripts/package-resources.py --root . --output $(BUILD)/release-licenses
 	@mkdir -p $(CONTENTS)/Resources/ThirdPartyLicenses
@@ -152,7 +158,7 @@ media: $(CORE_LIB) $(HEADER)
 	swiftc $(SWIFTFLAGS) -o $(MEDIA_ROOT)/MacOS/media-capture bench/MediaCapture.swift \
 	    $(filter-out shell/AppDelegate.swift,$(SWIFT_SRC))
 	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) -parse-as-library \
-	    -framework PDFKit -o $(MEDIA_ROOT)/Helpers/blindspot-extract helpers/ExtractWorker.swift
+	    -framework PDFKit -larchive -o $(MEDIA_ROOT)/Helpers/blindspot-extract helpers/ExtractWorker.swift helpers/OfficeExtract.swift
 	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) -parse-as-library \
 	    -framework NaturalLanguage -o $(MEDIA_ROOT)/Helpers/blindspot-semantic helpers/SemanticWorker.swift
 	MACOSX_DEPLOYMENT_TARGET=$(DEPLOY) cargo build --release --locked --manifest-path $(VECTOR_DIR)/Cargo.toml
@@ -166,9 +172,13 @@ run: sign
 test:
 	cargo test --locked --manifest-path $(CORE_DIR)/Cargo.toml
 
+# The pure retrieval crate: chunking now, ranking as it lands. Seconds, no index needed.
+test-retrieval:
+	cargo test --locked --manifest-path crates/retrieval/Cargo.toml
+
 test-actions: $(CORE_LIB) $(HEADER)
 	@mkdir -p $(BUILD)
-	swiftc $(SWIFTFLAGS) -o $(BUILD)/action-tests bench/ActionTests.swift shell/Actions.swift shell/Bridge.swift shell/Context.swift shell/LocalRequest.swift shell/Schedule.swift
+	swiftc $(SWIFTFLAGS) -o $(BUILD)/action-tests bench/ActionTests.swift shell/Actions.swift shell/Bridge.swift shell/Context.swift shell/LocalRequest.swift shell/Schedule.swift shell/TextCapture.swift
 	$(BUILD)/action-tests
 
 # Self-contained: the updater compiles alone, and its tests build real ad-hoc-signed fixture apps.
@@ -187,6 +197,13 @@ smoke-panel: $(CORE_LIB) $(HEADER)
 test-content: $(BUILD)/content-tests
 	$(BUILD)/content-tests
 
+.PHONY: test-passages
+test-passages: $(EXTRACT)
+	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
+	    -framework AppKit -framework Quartz -framework PDFKit -o $(BUILD)/passage-tests bench/PassageTests.swift shell/Preview.swift
+	$(BUILD)/passage-tests $(abspath $(EXTRACT))
+	python3 bench/OfficeExtractTests.py $(EXTRACT)
+
 test-semantic: $(SEMANTIC)
 	python3 bench/SemanticWorkerTests.py $(SEMANTIC)
 
@@ -198,7 +215,7 @@ $(BUILD)/content-tests: bench/ContentWatcherTests.swift shell/ContentWatcher.swi
 	swiftc $(SWIFTFLAGS) -o $@ bench/ContentWatcherTests.swift shell/ContentWatcher.swift shell/Bridge.swift
 
 check:
-	cargo clippy --locked --manifest-path $(CORE_DIR)/Cargo.toml --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 
 # Regenerates the header beside the committed one and fails on any difference, so an ffi.rs
 # change cannot land with a stale C view of the ABI. The `$(HEADER)` rule would instead rewrite
@@ -210,6 +227,17 @@ check-header:
 
 bench:
 	cargo bench --manifest-path $(CORE_DIR)/Cargo.toml
+
+# Search quality against bench/search-queries.toml, read-only on the live index. Not in CI: it
+# needs a real index of a real checkout. Point it elsewhere with `make bench-search DB=… HELPERS=…`,
+# and add `BENCH_FLAGS=--lexical` to measure exact search alone.
+DB       ?= $(HOME)/.local/share/blindspot/content.sqlite
+HELPERS  ?= $(HOME)/Applications/$(APP).app/Contents/Helpers
+BENCH_FLAGS ?=
+
+bench-search:
+	cargo run --release --locked --manifest-path $(CORE_DIR)/Cargo.toml --example search_bench -- \
+	    "$(DB)" bench/search-queries.toml --helpers "$(HELPERS)" $(BENCH_FLAGS)
 
 # The criterion bench above covers the Rust ranker, which measured 0.15% of the real
 # keystroke path. This covers the other 99.85%, which is all AppKit. It links the

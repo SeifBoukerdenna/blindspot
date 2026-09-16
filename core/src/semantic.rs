@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod indexing;
+pub mod ollama;
 pub mod search;
 pub mod vectors;
 
@@ -84,39 +85,80 @@ pub struct Client {
 
 impl Client {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, connection: None, sequence: 0,
-            startup_timeout: Duration::from_secs(5), request_timeout: Duration::from_secs(2) }
+        Self {
+            path,
+            connection: None,
+            sequence: 0,
+            startup_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(2),
+        }
     }
 
-    pub fn close(&mut self) { self.connection = None; }
+    pub fn close(&mut self) {
+        self.connection = None;
+    }
+
+    /// The largest batch this client accepts, so callers size their work without knowing which
+    /// transport they hold. See [`Client::embed`] for the rest of the limits.
+    pub const BATCH: usize = 8;
 
     pub fn probe(&mut self, cancel: &AtomicBool) -> Result<Model, Failure> {
-        self.request("probe", &[], cancel).map(|batch|batch.model)
+        self.request("probe", &[], cancel).map(|batch| batch.model)
     }
 
     pub fn embed(&mut self, texts: &[String], cancel: &AtomicBool) -> Result<Batch, Failure> {
-        if texts.is_empty() || texts.len()>8 || texts.iter().any(|text|text.trim().is_empty() || text.len()>4096)
-            || texts.iter().map(String::len).sum::<usize>()>16_384 {
+        if texts.is_empty()
+            || texts.len() > 8
+            || texts
+                .iter()
+                .any(|text| text.trim().is_empty() || text.len() > 4096)
+            || texts.iter().map(String::len).sum::<usize>() > 16_384
+        {
             return Err(Failure::InvalidInput);
         }
         self.request("embed", texts, cancel)
     }
 
-    fn request(&mut self, operation: &'static str, texts: &[String], cancel: &AtomicBool) -> Result<Batch, Failure> {
-        if cancel.load(Ordering::Acquire) { return Err(Failure::Cancelled); }
+    fn request(
+        &mut self,
+        operation: &'static str,
+        texts: &[String],
+        cancel: &AtomicBool,
+    ) -> Result<Batch, Failure> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(Failure::Cancelled);
+        }
         self.sequence = self.sequence.checked_add(1).ok_or(Failure::Unavailable)?;
-        let request = Request { version: 1, id: self.sequence, operation, texts };
-        let mut bytes = serde_json::to_vec(&request).map_err(|_|Failure::InvalidInput)?;
-        if bytes.len()>65_536 { return Err(Failure::InvalidInput); }
+        let request = Request {
+            version: 1,
+            id: self.sequence,
+            operation,
+            texts,
+        };
+        let mut bytes = serde_json::to_vec(&request).map_err(|_| Failure::InvalidInput)?;
+        if bytes.len() > 65_536 {
+            return Err(Failure::InvalidInput);
+        }
         bytes.push(b'\n');
-        let deadline = Instant::now() + if self.connection.is_some() {self.request_timeout} else {self.startup_timeout};
+        let deadline = Instant::now()
+            + if self.connection.is_some() {
+                self.request_timeout
+            } else {
+                self.startup_timeout
+            };
         let result = (|| {
-            if self.connection.is_none() { self.connection = Some(Connection::spawn(&self.path)?); }
+            if self.connection.is_none() {
+                self.connection = Some(Connection::spawn(&self.path)?);
+            }
             let connection = self.connection.as_mut().ok_or(Failure::Unavailable)?;
             let response: Response = connection.exchange(&bytes, deadline, cancel)?;
-            if response.version!=1 || response.id!=request.id { return Err(Failure::InvalidResponse); }
+            if response.version != 1 || response.id != request.id {
+                return Err(Failure::InvalidResponse);
+            }
             if let Some(error) = response.error {
-                if response.model.is_some() || response.vectors.is_some() { return Err(Failure::InvalidResponse); }
+                if response.model.is_some() || response.vectors.is_some() {
+                    return Err(Failure::InvalidResponse);
+                }
                 return Err(match error {
                     WorkerError::ModelUnavailable => Failure::ModelUnavailable,
                     WorkerError::EmbeddingUnavailable => Failure::EmbeddingUnavailable,
@@ -124,27 +166,90 @@ impl Client {
                 });
             }
             let model = response.model.ok_or(Failure::InvalidResponse)?;
-            if model.identifier.is_empty() || model.identifier.len()>128 || !model.identifier.is_ascii()
-                || model.identifier.chars().any(char::is_control) || model.revision==0 || !(1..=2048).contains(&model.dimensions) {
+            if model.identifier.is_empty()
+                || model.identifier.len() > 128
+                || !model.identifier.is_ascii()
+                || model.identifier.chars().any(char::is_control)
+                || model.revision == 0
+                || !(1..=2048).contains(&model.dimensions)
+            {
                 return Err(Failure::InvalidResponse);
             }
-            let vectors = match (operation,response.vectors) {
-                ("probe",None) => Vec::new(),
-                ("embed",Some(vectors)) if vectors.len()==texts.len() => vectors,
+            let vectors = match (operation, response.vectors) {
+                ("probe", None) => Vec::new(),
+                ("embed", Some(vectors)) if vectors.len() == texts.len() => vectors,
                 _ => return Err(Failure::InvalidResponse),
             };
             for vector in &vectors {
-                let norm = vector.iter().map(|value|f64::from(*value).powi(2)).sum::<f64>();
-                if vector.len()!=model.dimensions || vector.iter().any(|value|!value.is_finite()) || (norm-1.0).abs()>0.001 {
+                let norm = vector
+                    .iter()
+                    .map(|value| f64::from(*value).powi(2))
+                    .sum::<f64>();
+                if vector.len() != model.dimensions
+                    || vector.iter().any(|value| !value.is_finite())
+                    || (norm - 1.0).abs() > 0.001
+                {
                     return Err(Failure::InvalidResponse);
                 }
             }
-            Ok(Batch {model,vectors})
+            Ok(Batch { model, vectors })
         })();
-        if matches!(result, Err(Failure::Cancelled | Failure::TimedOut | Failure::Unavailable | Failure::InvalidResponse)) {
+        if matches!(
+            result,
+            Err(Failure::Cancelled
+                | Failure::TimedOut
+                | Failure::Unavailable
+                | Failure::InvalidResponse)
+        ) {
             self.close();
         }
         result
+    }
+}
+
+/// Whichever local embedding backend is in use, behind one interface.
+///
+/// The two transports are unrelated — a helper process over a Unix socket, and Ollama over
+/// loopback HTTP — but they answer the same two questions, so a pass is written once against this
+/// rather than twice. They are never interchangeable *within* one set of vectors:
+/// [`indexing::model_key`] keys on the model's identifier, so switching backends retires the old
+/// vectors instead of silently mixing two vector spaces.
+pub enum Embedder {
+    /// Apple's on-device model, through the bundled helper. The fallback, because it needs no
+    /// server running and no model installed.
+    Apple(Client),
+    Ollama(ollama::Client),
+}
+
+impl Embedder {
+    /// The largest batch this backend accepts. Apple's helper refuses more than eight texts, so a
+    /// caller that assumed Ollama's thirty-two would see every batch fail as `InvalidInput`.
+    pub fn batch(&self) -> usize {
+        match self {
+            Self::Apple(_) => Client::BATCH,
+            Self::Ollama(_) => ollama::BATCH,
+        }
+    }
+
+    pub fn probe(&mut self, cancel: &AtomicBool) -> Result<Model, Failure> {
+        match self {
+            Self::Apple(client) => client.probe(cancel),
+            Self::Ollama(client) => client.probe(cancel),
+        }
+    }
+
+    pub fn embed(&mut self, texts: &[String], cancel: &AtomicBool) -> Result<Batch, Failure> {
+        match self {
+            Self::Apple(client) => client.embed(texts, cancel),
+            Self::Ollama(client) => client.embed(texts, cancel),
+        }
+    }
+
+    pub fn close(&mut self) {
+        match self {
+            Self::Apple(client) => client.close(),
+            Self::Ollama(client) => client.close(),
+        }
     }
 }
 
@@ -155,53 +260,74 @@ struct Connection {
 
 impl Connection {
     fn spawn(path: &Path) -> Result<Self, Failure> {
-        Self::spawn_in(path,None)
+        Self::spawn_in(path, None)
     }
 
     fn spawn_in(path: &Path, directory: Option<&Path>) -> Result<Self, Failure> {
-        if !path.is_absolute() { return Err(Failure::Unavailable); }
-        let (socket, peer) = UnixStream::pair().map_err(|_|Failure::Unavailable)?;
-        socket.set_read_timeout(Some(IO_POLL)).map_err(|_|Failure::Unavailable)?;
-        socket.set_write_timeout(Some(IO_POLL)).map_err(|_|Failure::Unavailable)?;
-        let input = peer.try_clone().map_err(|_|Failure::Unavailable)?;
+        if !path.is_absolute() {
+            return Err(Failure::Unavailable);
+        }
+        let (socket, peer) = UnixStream::pair().map_err(|_| Failure::Unavailable)?;
+        socket
+            .set_read_timeout(Some(IO_POLL))
+            .map_err(|_| Failure::Unavailable)?;
+        socket
+            .set_write_timeout(Some(IO_POLL))
+            .map_err(|_| Failure::Unavailable)?;
+        let input = peer.try_clone().map_err(|_| Failure::Unavailable)?;
         let mut command = Command::new(path);
         if let Some(directory) = directory {
-            if !directory.is_absolute() { return Err(Failure::Unavailable); }
+            if !directory.is_absolute() {
+                return Err(Failure::Unavailable);
+            }
             command.current_dir(directory);
         }
-        let child = command.stdin(Stdio::from(OwnedFd::from(input)))
+        let child = command
+            .stdin(Stdio::from(OwnedFd::from(input)))
             .stdout(Stdio::from(OwnedFd::from(peer)))
-            .stderr(Stdio::null()).spawn().map_err(|_|Failure::Unavailable)?;
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| Failure::Unavailable)?;
         Ok(Self { socket, child })
     }
 
-    fn exchange<T: serde::de::DeserializeOwned>(&mut self, request: &[u8], deadline: Instant, cancel: &AtomicBool) -> Result<T, Failure> {
+    fn exchange<T: serde::de::DeserializeOwned>(
+        &mut self,
+        request: &[u8],
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> Result<T, Failure> {
         let mut sent = 0;
-        while sent<request.len() {
-            check(deadline,cancel)?;
+        while sent < request.len() {
+            check(deadline, cancel)?;
             match self.socket.write(&request[sent..]) {
                 Ok(0) => return Err(Failure::Unavailable),
-                Ok(count) => sent+=count,
-                Err(error) if retryable(&error) => {},
+                Ok(count) => sent += count,
+                Err(error) if retryable(&error) => {}
                 Err(_) => return Err(Failure::Unavailable),
             }
         }
         let mut response = Vec::new();
-        let mut buffer = [0u8;4096];
+        let mut buffer = [0u8; 4096];
         loop {
-            check(deadline,cancel)?;
+            check(deadline, cancel)?;
             match self.socket.read(&mut buffer) {
                 Ok(0) => return Err(Failure::Unavailable),
                 Ok(count) => {
                     response.extend_from_slice(&buffer[..count]);
-                    if response.len()>MAX_RESPONSE+1 { return Err(Failure::InvalidResponse); }
-                    if let Some(end) = response.iter().position(|byte|*byte==b'\n') {
-                        if end+1!=response.len() { return Err(Failure::InvalidResponse); }
-                        check(deadline,cancel)?;
-                        return serde_json::from_slice(&response[..end]).map_err(|_|Failure::InvalidResponse);
+                    if response.len() > MAX_RESPONSE + 1 {
+                        return Err(Failure::InvalidResponse);
+                    }
+                    if let Some(end) = response.iter().position(|byte| *byte == b'\n') {
+                        if end + 1 != response.len() {
+                            return Err(Failure::InvalidResponse);
+                        }
+                        check(deadline, cancel)?;
+                        return serde_json::from_slice(&response[..end])
+                            .map_err(|_| Failure::InvalidResponse);
                     }
                 }
-                Err(error) if retryable(&error) => {},
+                Err(error) if retryable(&error) => {}
                 Err(_) => return Err(Failure::Unavailable),
             }
         }
@@ -217,13 +343,22 @@ impl Drop for Connection {
 }
 
 fn check(deadline: Instant, cancel: &AtomicBool) -> Result<(), Failure> {
-    if cancel.load(Ordering::Acquire) { return Err(Failure::Cancelled); }
-    if Instant::now()>=deadline { return Err(Failure::TimedOut); }
+    if cancel.load(Ordering::Acquire) {
+        return Err(Failure::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(Failure::TimedOut);
+    }
     Ok(())
 }
 
 fn retryable(error: &std::io::Error) -> bool {
-    matches!(error.kind(),std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted)
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
 }
 
 #[cfg(test)]
@@ -236,9 +371,14 @@ mod tests {
     impl Fixture {
         fn new(behavior: &str) -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let directory = std::env::temp_dir().join(format!("blindspot-semantic-client-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let directory = std::env::temp_dir().join(format!(
+                "blindspot-semantic-client-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir(&directory).unwrap();
-            let script = format!(r#"#!/usr/bin/python3
+            let script = format!(
+                r#"#!/usr/bin/python3
 import json, sys, time
 for line in sys.stdin:
     request = json.loads(line)
@@ -247,16 +387,21 @@ for line in sys.stdin:
         response["vectors"] = [[1.0,0.0] for _ in request["texts"]]
     {behavior}
     print(json.dumps(response), flush=True)
-"#);
+"#
+            );
             let path = directory.join("worker");
             std::fs::write(&path, script).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             Self(directory)
         }
-        fn client(&self) -> Client { Client::new(self.0.join("worker")) }
+        fn client(&self) -> Client {
+            Client::new(self.0.join("worker"))
+        }
     }
     impl Drop for Fixture {
-        fn drop(&mut self) { std::fs::remove_dir_all(&self.0).unwrap(); }
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
     }
 
     #[test]
@@ -266,7 +411,13 @@ for line in sys.stdin:
         let cancel = AtomicBool::new(false);
         assert_eq!(client.probe(&cancel).unwrap().dimensions, 2);
         let pid = client.connection.as_ref().unwrap().child.id();
-        assert_eq!(client.embed(&["synthetic sentence".into()], &cancel).unwrap().vectors, vec![vec![1.0, 0.0]]);
+        assert_eq!(
+            client
+                .embed(&["synthetic sentence".into()], &cancel)
+                .unwrap()
+                .vectors,
+            vec![vec![1.0, 0.0]]
+        );
         assert_eq!(client.connection.as_ref().unwrap().child.id(), pid);
         client.close();
         assert!(client.connection.is_none());
@@ -288,7 +439,11 @@ for line in sys.stdin:
         ] {
             let fixture = Fixture::new(behavior);
             let mut client = fixture.client();
-            assert_eq!(client.embed(&["fixture".into()], &AtomicBool::new(false)), Err(Failure::InvalidResponse), "{behavior}");
+            assert_eq!(
+                client.embed(&["fixture".into()], &AtomicBool::new(false)),
+                Err(Failure::InvalidResponse),
+                "{behavior}"
+            );
             assert!(client.connection.is_none());
         }
     }
@@ -296,8 +451,17 @@ for line in sys.stdin:
     #[test]
     fn invalid_input_never_launches_worker() {
         let mut client = Client::new(PathBuf::from("/nonexistent/blindspot-worker"));
-        for texts in [vec![], vec![" ".into()], vec!["x".repeat(4097)], vec!["x".into();9], vec!["x".repeat(4096);5]] {
-            assert_eq!(client.embed(&texts, &AtomicBool::new(false)), Err(Failure::InvalidInput));
+        for texts in [
+            vec![],
+            vec![" ".into()],
+            vec!["x".repeat(4097)],
+            vec!["x".into(); 9],
+            vec!["x".repeat(4096); 5],
+        ] {
+            assert_eq!(
+                client.embed(&texts, &AtomicBool::new(false)),
+                Err(Failure::InvalidInput)
+            );
             assert!(client.connection.is_none());
         }
     }
@@ -314,8 +478,11 @@ for line in sys.stdin:
             trigger.store(true, Ordering::Release);
         });
         let started = Instant::now();
-        assert_eq!(client.embed(&["fixture".into()], &cancel), Err(Failure::Cancelled));
-        assert!(started.elapsed()<Duration::from_millis(500));
+        assert_eq!(
+            client.embed(&["fixture".into()], &cancel),
+            Err(Failure::Cancelled)
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
         assert!(client.connection.is_none());
         thread.join().unwrap();
         cancel.store(false, Ordering::Release);
@@ -330,113 +497,239 @@ for line in sys.stdin:
         client.probe(&cancel).unwrap();
         client.request_timeout = Duration::from_millis(60);
         let started = Instant::now();
-        assert_eq!(client.embed(&["fixture".into()], &cancel), Err(Failure::TimedOut));
-        assert!(started.elapsed()<Duration::from_millis(500));
+        assert_eq!(
+            client.embed(&["fixture".into()], &cancel),
+            Err(Failure::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
         assert!(client.connection.is_none());
     }
 
     #[test]
     fn missing_model_is_a_recoverable_response() {
-        let fixture = Fixture::new("response = {'version':1,'id':request['id'],'error':'modelUnavailable'}");
+        let fixture =
+            Fixture::new("response = {'version':1,'id':request['id'],'error':'modelUnavailable'}");
         let mut client = fixture.client();
-        assert_eq!(client.probe(&AtomicBool::new(false)), Err(Failure::ModelUnavailable));
+        assert_eq!(
+            client.probe(&AtomicBool::new(false)),
+            Err(Failure::ModelUnavailable)
+        );
         assert!(client.connection.is_some());
     }
 
     fn indexed_fixture(fixture: &Fixture, count: usize) -> crate::content::ContentStore {
-        let mut store = crate::content::ContentStore::open(&fixture.0.join("content.sqlite")).unwrap();
+        let mut store =
+            crate::content::ContentStore::open(&fixture.0.join("content.sqlite")).unwrap();
         let scan = store.begin_scan(Path::new("/fixture")).unwrap();
-        let paths: Vec<_> = (0..count).map(|i|format!("/fixture/{i}.txt")).collect();
-        let documents: Vec<_> = paths.iter().map(|path|crate::content::Document {
-            identity:path, path:Path::new(path), title:path.rsplit('/').next().unwrap(),
-            body:"fixture document about database transactions",modified_ns:1,changed_ns:1,bytes:44,
-            extraction: crate::content::Extraction::Text,
-        }).collect();
-        store.put_batch(&scan,&documents).unwrap();
+        let paths: Vec<_> = (0..count).map(|i| format!("/fixture/{i}.txt")).collect();
+        let documents: Vec<_> = paths
+            .iter()
+            .map(|path| crate::content::Document {
+                identity: path,
+                path: Path::new(path),
+                title: path.rsplit('/').next().unwrap(),
+                body: "fixture document about database transactions",
+                modified_ns: 1,
+                changed_ns: 1,
+                bytes: 44,
+                extraction: crate::content::Extraction::Text,
+            })
+            .collect();
+        store.put_batch(&scan, &documents).unwrap();
         store
     }
 
     #[test]
     fn indexing_resumes_committed_batches_after_cancellation_and_reopen() {
         let fixture = Fixture::new("pass");
-        let mut store = indexed_fixture(&fixture,9);
+        let mut store = indexed_fixture(&fixture, 9);
         let mut client = fixture.client();
         let cancel = Arc::new(AtomicBool::new(false));
-        let result = indexing::run(&mut store,&mut client,Arc::clone(&cancel), |_|true, |progress| {
-            if progress.written>=4 { cancel.store(true,Ordering::Release); }
-        });
-        assert!(matches!(result,Err(indexing::Error::Cancelled)));
+        let result = indexing::run(
+            &mut store,
+            &mut client,
+            Arc::clone(&cancel),
+            |_| true,
+            |progress| {
+                if progress.written >= 4 {
+                    cancel.store(true, Ordering::Release);
+                }
+            },
+        );
+        assert!(matches!(result, Err(indexing::Error::Cancelled)));
         drop(store);
         client.close();
-        let mut store = crate::content::ContentStore::open(&fixture.0.join("content.sqlite")).unwrap();
-        cancel.store(false,Ordering::Release);
-        let resumed = indexing::run(&mut store,&mut client,Arc::clone(&cancel), |_|true, |_|{}).unwrap();
-        assert_eq!(resumed.current,4);
-        assert_eq!(resumed.written,5);
-        let unchanged = indexing::run(&mut store,&mut client,cancel, |_|true, |_|{}).unwrap();
-        assert_eq!(unchanged.current,9);
-        assert_eq!(unchanged.written,0);
+        let mut store =
+            crate::content::ContentStore::open(&fixture.0.join("content.sqlite")).unwrap();
+        cancel.store(false, Ordering::Release);
+        let resumed = indexing::run(
+            &mut store,
+            &mut client,
+            Arc::clone(&cancel),
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(resumed.current, 4);
+        assert_eq!(resumed.written, 5);
+        let unchanged = indexing::run(&mut store, &mut client, cancel, |_| true, |_| {}).unwrap();
+        assert_eq!(unchanged.current, 9);
+        assert_eq!(unchanged.written, 0);
     }
 
     #[test]
     fn indexing_rejects_mid_pass_model_changes_without_harming_lexical_search() {
-        let fixture = Fixture::new("if request['operation'] == 'embed': response['model']['revision'] += 1");
-        let mut store = indexed_fixture(&fixture,3);
-        let result = indexing::run(&mut store,&mut fixture.client(),Arc::new(AtomicBool::new(false)), |_|true, |_|{});
-        assert!(matches!(result,Err(indexing::Error::Worker(Failure::InvalidResponse))));
-        let key = indexing::model_key(&Model {identifier:"fixture".into(),revision:1,dimensions:2}).unwrap();
-        assert_eq!(store.embedding_page(0,&key,2,Arc::new(AtomicBool::new(false))).unwrap().pending.len(),3);
-        assert_eq!(store.search("transactions",10,Arc::new(AtomicBool::new(false))).unwrap().hits.len(),3);
+        let fixture =
+            Fixture::new("if request['operation'] == 'embed': response['model']['revision'] += 1");
+        let mut store = indexed_fixture(&fixture, 3);
+        let result = indexing::run(
+            &mut store,
+            &mut fixture.client(),
+            Arc::new(AtomicBool::new(false)),
+            |_| true,
+            |_| {},
+        );
+        assert!(matches!(
+            result,
+            Err(indexing::Error::Worker(Failure::InvalidResponse))
+        ));
+        let key = indexing::model_key(&Model {
+            identifier: "fixture".into(),
+            revision: 1,
+            dimensions: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            store
+                .embedding_page(0, &key, 2, Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .pending
+                .len(),
+            3
+        );
+        assert_eq!(
+            store
+                .search("transactions", 10, Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .hits
+                .len(),
+            3
+        );
     }
 
     #[test]
     fn indexing_isolates_unembeddable_text_and_respects_scope_filter() {
-        let fixture = Fixture::new("if any('1.txt' in text for text in request['texts']): response = {'version':1,'id':request['id'],'error':'embeddingUnavailable'}");
-        let mut store = indexed_fixture(&fixture,3);
-        let progress = indexing::run(&mut store,&mut fixture.client(),Arc::new(AtomicBool::new(false)),
-            |path| !path.ends_with("2.txt"), |_|{}).unwrap();
-        assert_eq!(progress.written,1);
-        assert_eq!(progress.failed,1);
-        assert_eq!(progress.excluded,1);
-        assert_eq!(store.search("transactions",10,Arc::new(AtomicBool::new(false))).unwrap().hits.len(),3);
+        let fixture = Fixture::new(
+            "if any('1.txt' in text for text in request['texts']): response = {'version':1,'id':request['id'],'error':'embeddingUnavailable'}",
+        );
+        let mut store = indexed_fixture(&fixture, 3);
+        let progress = indexing::run(
+            &mut store,
+            &mut fixture.client(),
+            Arc::new(AtomicBool::new(false)),
+            |path| !path.ends_with("2.txt"),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(progress.written, 1);
+        assert_eq!(progress.failed, 1);
+        assert_eq!(progress.excluded, 1);
+        assert_eq!(
+            store
+                .search("transactions", 10, Arc::new(AtomicBool::new(false)))
+                .unwrap()
+                .hits
+                .len(),
+            3
+        );
     }
 
     #[test]
     fn indexing_splits_escaped_payloads_and_reports_blank_text() {
         let fixture = Fixture::new("pass");
-        let mut store = indexed_fixture(&fixture,4);
+        let mut store = indexed_fixture(&fixture, 4);
         let scan = store.begin_scan(Path::new("/fixture")).unwrap();
-        let paths: Vec<_> = (0..4).map(|i|format!("/fixture/{i}.txt")).collect();
+        let paths: Vec<_> = (0..4).map(|i| format!("/fixture/{i}.txt")).collect();
         let body = "\u{1}".repeat(4096);
-        let documents: Vec<_> = paths.iter().map(|path|crate::content::Document {
-            identity:path,path:Path::new(path),title:"",body:&body,modified_ns:2,changed_ns:2,bytes:4096,
-            extraction: crate::content::Extraction::Text,
-        }).collect();
-        store.put_batch(&scan,&documents).unwrap();
-        let progress = indexing::run(&mut store,&mut fixture.client(),Arc::new(AtomicBool::new(false)), |_|true, |_|{}).unwrap();
-        assert_eq!(progress.written,4);
-        assert_eq!(progress.failed,0);
-        store.put_batch(&scan,&[crate::content::Document {
-            identity:"blank",path:Path::new("/fixture/blank.txt"),title:"",body:"",modified_ns:1,changed_ns:1,bytes:0,
-            extraction: crate::content::Extraction::Text,
-        }]).unwrap();
-        let progress = indexing::run(&mut store,&mut fixture.client(),Arc::new(AtomicBool::new(false)), |_|true, |_|{}).unwrap();
-        assert_eq!(progress.current,4);
-        assert_eq!(progress.failed,1);
-        assert_eq!(progress.written,0);
+        let documents: Vec<_> = paths
+            .iter()
+            .map(|path| crate::content::Document {
+                identity: path,
+                path: Path::new(path),
+                title: "",
+                body: &body,
+                modified_ns: 2,
+                changed_ns: 2,
+                bytes: 4096,
+                extraction: crate::content::Extraction::Text,
+            })
+            .collect();
+        store.put_batch(&scan, &documents).unwrap();
+        let progress = indexing::run(
+            &mut store,
+            &mut fixture.client(),
+            Arc::new(AtomicBool::new(false)),
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(progress.written, 4);
+        assert_eq!(progress.failed, 0);
+        store
+            .put_batch(
+                &scan,
+                &[crate::content::Document {
+                    identity: "blank",
+                    path: Path::new("/fixture/blank.txt"),
+                    title: "",
+                    body: "",
+                    modified_ns: 1,
+                    changed_ns: 1,
+                    bytes: 0,
+                    extraction: crate::content::Extraction::Text,
+                }],
+            )
+            .unwrap();
+        let progress = indexing::run(
+            &mut store,
+            &mut fixture.client(),
+            Arc::new(AtomicBool::new(false)),
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(progress.current, 4);
+        assert_eq!(progress.failed, 1);
+        assert_eq!(progress.written, 0);
     }
 
     #[test]
     #[ignore = "requires a built native helper and the installed Apple English sentence model"]
     fn native_content_embedding_pass_persists_and_reuses_vectors() {
         let fixture = Fixture::new("pass");
-        let mut store = indexed_fixture(&fixture,3);
-        let mut client = Client::new(PathBuf::from(std::env::var_os("BLINDSPOT_SEMANTIC_WORKER").expect("helper path")));
-        let first = indexing::run(&mut store,&mut client,Arc::new(AtomicBool::new(false)), |_|true, |_|{}).unwrap();
-        assert_eq!(first.written,3);
-        let next = indexing::run(&mut store,&mut client,Arc::new(AtomicBool::new(false)), |_|true, |_|{}).unwrap();
-        assert_eq!(next.written,0);
-        assert_eq!(next.current,3);
+        let mut store = indexed_fixture(&fixture, 3);
+        let mut client = Client::new(PathBuf::from(
+            std::env::var_os("BLINDSPOT_SEMANTIC_WORKER").expect("helper path"),
+        ));
+        let first = indexing::run(
+            &mut store,
+            &mut client,
+            Arc::new(AtomicBool::new(false)),
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(first.written, 3);
+        let next = indexing::run(
+            &mut store,
+            &mut client,
+            Arc::new(AtomicBool::new(false)),
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(next.written, 0);
+        assert_eq!(next.current, 3);
         store.check_integrity().unwrap();
     }
 
@@ -448,7 +741,15 @@ for line in sys.stdin:
         let cancel = AtomicBool::new(false);
         let model = client.probe(&cancel).unwrap();
         assert_eq!(model.identifier, "apple-contextual-en");
-        let result = client.embed(&["A document about relational databases.".into(), "Notes on SQL database tables.".into()], &cancel).unwrap();
+        let result = client
+            .embed(
+                &[
+                    "A document about relational databases.".into(),
+                    "Notes on SQL database tables.".into(),
+                ],
+                &cancel,
+            )
+            .unwrap();
         assert_eq!(result.model, model);
         assert_eq!(result.vectors.len(), 2);
     }

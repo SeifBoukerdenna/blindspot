@@ -27,6 +27,7 @@ use crate::store::Store;
 
 pub(crate) mod process_native;
 pub mod index_native;
+pub mod passage;
 
 /// How often a rescan may actually run.
 ///
@@ -116,6 +117,7 @@ struct ContentStats {
     extracted: Option<u64>,
     semantic_eligible: Option<u64>,
     semantic_current: Option<u64>,
+    partial_documents: Option<u64>,
     taken: Option<Instant>,
     reclaimable_bytes: Option<u64>,
     kinds: Vec<(String, u64, u64)>,
@@ -147,13 +149,13 @@ struct Inventory {
 fn inventory(connection: &rusqlite::Connection, roots: &[String]) -> Inventory {
     const KINDS: &[(&str, &[&str])] = &[
         ("Notes & text", &["txt", "md", "markdown", "rst"]),
-        ("PDF & Word documents", &["pdf", "docx", "doc", "rtf", "odt"]),
+        ("PDF & Office documents", &["pdf", "docx", "doc", "rtf", "odt", "pptx", "xlsx"]),
         ("Code", &["rs", "swift", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "hpp", "rb", "sh", "sql"]),
         ("Data & config", &["json", "toml", "yaml", "yml", "csv", "tsv", "xml"]),
         ("Web pages & styles", &["html", "css"]),
     ];
     let mut inventory = Inventory::default();
-    let Ok(mut statement) = connection.prepare("SELECT path,bytes,extraction,modified_ns FROM documents") else { return inventory; };
+    let Ok(mut statement) = connection.prepare("SELECT path,bytes,extraction,modified_ns,partial FROM documents") else { return inventory; };
     let Ok(mut rows) = statement.query([]) else { return inventory; };
     let mut kinds = vec![(0u64, 0u64); KINDS.len() + 1];
     let mut folders = std::collections::HashMap::<String, (u64, u64)>::new();
@@ -177,7 +179,8 @@ fn inventory(connection: &rusqlite::Connection, roots: &[String]) -> Inventory {
             entry.0 += 1;
             entry.1 += bytes;
         }
-        if let Ok(status @ 2..=5) = u8::try_from(extraction) && inventory.attention.len() < 20 {
+        let status=if row.get::<_,bool>(4).unwrap_or(false) && extraction<2 {6} else {extraction};
+        if let Ok(status @ 2..=6) = u8::try_from(status) && inventory.attention.len() < 20 {
             inventory.attention.push((path.clone(), status));
         }
         recent.push((modified, path));
@@ -244,6 +247,8 @@ fn content_overview(handle: &BsHandle, config: &Config, snapshot: &crate::conten
     put("semantic", json!({"enabled": config.content.semantic, "embedded": stats.semantic_current, "eligible": stats.semantic_eligible,
         "passEmbedded": semantic.map(|progress| progress.written), "passFailed": semantic.map(|progress| progress.failed)}));
     put("documents", json!(stats.documents));
+    put("partialDocuments", json!(stats.partial_documents));
+    put("budgetBytes", json!(config.content.index_budget_mb.saturating_mul(1_048_576)));
     put("pdfText", json!(stats.extracted));
     put("pdfIssues", json!(stats.extraction_counts));
     put("disk", json!({"database": database, "cache": stats.vector_catalog_bytes}));
@@ -261,7 +266,7 @@ fn content_overview(handle: &BsHandle, config: &Config, snapshot: &crate::conten
         .map(|(path, count, bytes)| json!({"folder": short_path(std::path::Path::new(path)), "path": path, "count": count, "bytes": bytes})).collect::<Vec<_>>()));
     put("attention", json!(stats.attention.iter().map(|(path, status)| {
         let (name, folder) = named(path);
-        let reason = match status { 2 => "No text — scanned or image-only", 3 => "Locked", 4 => "Over the size limit", _ => "Unreadable" };
+        let reason = match status { 2 => "No text — scanned or image-only", 3 => "Locked", 4 => "Over the size limit", 6 => "Partly indexed — byte, passage, page or OCR limit", _ => "Unreadable" };
         json!({"name": name, "folder": folder, "path": path, "reason": reason})
     }).collect::<Vec<_>>()));
     put("recent", json!(stats.recent.iter().map(|(path, modified)| {
@@ -364,6 +369,10 @@ pub struct BsResult {
     /// attached displays to call a full-screen capture a screenshot.
     pub width: u32,
     pub height: u32,
+    /// Where a content passage sits in its file: page for an extracted document, line for text
+    /// and code, zero when the row is not a passage. Swift shows it and opens there.
+    pub page: u32,
+    pub line: u32,
     /// A tool row's subtitle — "binary", "ISO 8601", "decoded". NULL for everything else.
     /// For an epoch, `timestamp` carries the instant too, because only Swift knows the
     /// local time zone to render it in.
@@ -530,13 +539,18 @@ fn content_stats(path: Option<&PathBuf>, roots: &[String]) -> ContentStats {
         database_bytes,
         wal_bytes,
         shm_bytes,
-        vector_catalog_bytes: scalar("SELECT COALESCE(sum(bytes),0) FROM vector_shards"),
+        vector_catalog_bytes: Some(path.parent().map(|parent|parent.join("content-vectors"))
+            .filter(|directory|std::fs::symlink_metadata(directory).is_ok_and(|metadata|metadata.is_dir() && !metadata.file_type().is_symlink()))
+            .and_then(|directory|std::fs::read_dir(directory).ok()).into_iter().flatten().flatten()
+            .filter_map(|entry|std::fs::symlink_metadata(entry.path()).ok())
+            .filter(|metadata|metadata.is_file() && !metadata.file_type().is_symlink()).map(|metadata|metadata.len()).sum()),
         documents: scalar("SELECT count(*) FROM documents"),
-        embeddings: scalar("SELECT count(*) FROM embeddings"),
+        embeddings: scalar("SELECT count(*) FROM chunk_embeddings"),
         extraction_counts: extraction_ok.then_some(extraction_counts),
         extracted: scalar("SELECT count(*) FROM documents WHERE extraction=1"),
-        semantic_eligible: scalar(&format!("SELECT count(*) FROM documents d WHERE {}", crate::content::SEMANTIC_ELIGIBLE)),
-        semantic_current: scalar(&format!("SELECT count(*) FROM documents d WHERE {} AND EXISTS(SELECT 1 FROM embeddings e WHERE e.document_id=d.id AND e.revision=d.revision AND e.model GLOB '[[]\"apple-contextual-en\",*')", crate::content::SEMANTIC_ELIGIBLE)),
+        semantic_eligible: scalar("SELECT count(*) FROM chunks"),
+        semantic_current: scalar("SELECT count(*) FROM chunk_embeddings e JOIN passage_models m ON m.model=e.model AND m.active=1"),
+        partial_documents: scalar("SELECT count(*) FROM documents WHERE partial=1"),
         taken: Some(Instant::now()),
         reclaimable_bytes: reclaimable(&connection),
         kinds: inventory.kinds,
@@ -886,7 +900,7 @@ fn content_filter(query: &crate::query::FileQuery) -> Result<crate::content::Sea
         Some(FileKind::Extension(extension)) => {
             let list = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<_>>();
             filter.extensions = match extension.to_ascii_lowercase().as_str() {
-                "document" | "documents" | "docs" => [list(&["pdf"]), list(WORD), list(NOTES)].concat(),
+                "document" | "documents" | "docs" => [list(&["pdf","pptx","xlsx"]), list(WORD), list(NOTES)].concat(),
                 "note" | "notes" | "text" => list(NOTES),
                 "word" => list(WORD),
                 "code" => list(CODE),
@@ -1765,6 +1779,7 @@ fn init(explicit: Option<String>) -> *mut BsHandle {
     }));
     let content_path = crate::store::data_dir().ok().map(|path|path.join("content.sqlite"));
     let content = crate::content_service::ContentService::with_helpers(content_path.clone(),helpers);
+    config.content.embedding_host = config.agent.host.clone();
     content.configure(&config.content);
     let keep = config.clips.keep;
     let usage = spawn_usage_refresh(config.frecency.half_life_days);
@@ -2085,6 +2100,7 @@ impl BsHandle {
         let mut config = (*self.file_config).clone();
         self.with_overrides(|o| o.apply(&mut config));
 
+        config.content.embedding_host = config.agent.host.clone();
         self.content.configure(&config.content);
         let half_life = config.frecency.half_life_days;
         let agent = config.agent.clone();
@@ -2260,7 +2276,7 @@ impl BsHandle {
             .take(limit)
             .enumerate()
             .map(|(at, row)| match row.kind {
-                crate::agent::session::RowKind::Source => BsResult::source(row),
+                crate::agent::session::RowKind::Source {..} => BsResult::source(row),
                 _ => BsResult::agent(row, at as u64),
             })
             .collect();
@@ -2505,11 +2521,13 @@ impl BsHandle {
             self.content.cancel_search();
             return leak_results(vec![BsResult::header("Add words to search for, e.g. :content kind:pdf modified:month genetec")], false);
         }
-        let (page,pending)=self.content.search_filtered(&parsed.name, filter);
+        let (page,pending)=self.content.search_matches(&parsed.name, filter);
         let items=match page {
             Some(Ok(page))=> {
-                if page.hits.is_empty() && !pending {vec![BsResult::header("No indexed content matches — try fewer words")]}
-                else {page.hits.iter().take(limit).map(|hit|BsResult::content(hit,page.limited)).collect()}
+                if page.is_empty() && !pending {vec![BsResult::header("No indexed content matches — try fewer words")]}
+                else {
+                    page.iter().take(limit).map(BsResult::passage).collect()
+                }
             },
             Some(Err(_))=>vec![BsResult::header("Content search unavailable — ordinary file search still works")],
             None if pending=>Vec::new(),
@@ -2861,16 +2879,41 @@ impl BsResult {
     /// A file a document answer drew on: a real file row, so ↩ opens it and ⌘K offers file actions.
     fn source(row: &crate::agent::session::Row) -> Self {
         let entry = AppEntry::new(row.name.clone(), PathBuf::from(&row.detail));
-        Self::new(&entry, 0, BS_KIND_FILE)
+        let mut result=Self::new(&entry, 0, BS_KIND_FILE);
+        if let crate::agent::session::RowKind::Source {page,line}=row.kind {result.page=page;result.line=line;}
+        result.id=crate::index::fnv1a(&[b"blindspot:source:",row.detail.as_bytes(),row.name.as_bytes()]);
+        result
+    }
+
+    /// A passage: the file it belongs to, the text that matched, and where to open it.
+    fn passage(found: &crate::content::passage_search::Match) -> Self {
+        let passage=&found.passage;
+        let entry = AppEntry::new(passage.title.clone(), PathBuf::from(&passage.path));
+        let mut result = Self::new(&entry, 0, BS_KIND_FILE);
+        let text = one_line(&passage.text, 160);
+        result.id ^= (found.chunk_id as u64).rotate_left(17);
+        let excerpt = if passage.heading.is_empty() {
+            format!("“{text}”")
+        } else {
+            format!("{} · “{text}”", one_line(&passage.heading, 60))
+        };
+        let reason=match (found.words,found.meaning) {
+            (true,true)=>"Words + meaning",(false,true)=>"Meaning",_=>"Words",
+        };
+        let detail=format!("{reason} · {excerpt}");
+        (result.detail, result.detail_len) = leak_bytes(detail.as_bytes());
+        result.page = u32::try_from(passage.page).unwrap_or(0);
+        result.line = u32::try_from(passage.line).unwrap_or(0);
+        result
     }
 
     fn content(hit:&crate::content::Hit, limited:bool)->Self {
         let entry=AppEntry::new(hit.title.clone(),PathBuf::from(&hit.path));
         let mut result=Self::new(&entry,0,BS_KIND_FILE);
         let detail=match (&hit.snippet, hit.related) {
-            (Some(snippet), true) => format!("Related by meaning · “{snippet}”"),
+            (Some(snippet), true) => format!("Related by meaning · “{}”",one_line(snippet,160)),
             (None, true) => "Related by meaning · approximate, no exact word match".to_owned(),
-            (Some(snippet), false) => format!("“{snippet}”"),
+            (Some(snippet), false) => format!("“{}”",one_line(snippet,160)),
             (None, false) if limited => "Content match · limited relevance; refine query".to_owned(),
             (None, false) => "Content match".to_owned(),
         };
@@ -2896,6 +2939,8 @@ impl BsResult {
             timestamp: 0,
             width: 0,
             height: 0,
+            page: 0,
+            line: 0,
             detail: std::ptr::null(),
             detail_len: 0,
             highlights: std::ptr::null(),
@@ -2917,7 +2962,7 @@ impl BsResult {
             RowKind::Model => BS_KIND_AGENT_MODEL,
             RowKind::Running => BS_KIND_AGENT_RUNNING,
             RowKind::Past => BS_KIND_AGENT_PAST,
-            RowKind::Source => BS_KIND_FILE,
+            RowKind::Source {..} => BS_KIND_FILE,
         };
         let (detail, detail_len) = leak_bytes(row.detail.as_bytes());
         Self {
@@ -3006,6 +3051,8 @@ impl BsResult {
             timestamp: 0,
             width: 0,
             height: 0,
+            page: 0,
+            line: 0,
             detail: std::ptr::null(),
             detail_len: 0,
             highlights: std::ptr::null(),
@@ -3655,6 +3702,40 @@ mod tests {
         assert!(query(h, ":prompts", 20).iter().any(|row| row.0 == "ai tldr"));
         // SAFETY: one shutdown, no calls after it.
         unsafe { bs_shutdown(h) };
+    }
+
+    #[test]
+    fn a_passage_row_carries_the_place_to_open_it() {
+        let page = BsResult::passage(&crate::content::passage_search::Match { chunk_id:1,revision:1,words:true,meaning:false,passage:crate::content::Passage {
+            document_id: 1,
+            path: "/fixture/report.pdf".into(),
+            title: "report.pdf".into(),
+            ordinal: 3,
+            page: 12,
+            line: 0,
+            heading: "Renewal".into(),
+            text: "The deadline is October 31".into(),
+            rank: -1.0,
+        }});
+        assert_eq!((page.page, page.line), (12, 0));
+        // SAFETY: the row owns the bytes it just leaked, and they outlive this read.
+        let detail = unsafe { std::slice::from_raw_parts(page.detail, page.detail_len) };
+        let detail = String::from_utf8_lossy(detail);
+        assert!(detail.contains("Renewal") && detail.contains("October 31"), "{detail}");
+
+        let code = BsResult::passage(&crate::content::passage_search::Match { chunk_id:2,revision:1,words:true,meaning:false,passage:crate::content::Passage {
+            document_id: 2,
+            path: "/fixture/store.rs".into(),
+            title: "store.rs".into(),
+            ordinal: 0,
+            page: 0,
+            line: 340,
+            heading: "fn rebuild_shard".into(),
+            text: "let shard = publish();".into(),
+            rank: -2.0,
+        }});
+        assert_eq!((code.page, code.line), (0, 340));
+        assert_eq!(code.kind, BS_KIND_FILE, "a passage is still a file row");
     }
 
     fn blob_text(blob: BsBlob) -> String {

@@ -1,0 +1,9 @@
+[package]
+name = "blindspot-retrieval"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# No dependencies on purpose: this crate is pure text and arithmetic, so its tests run in a second
+# and its behaviour can be reasoned about without a database, a model or a file system.
+[dependencies]

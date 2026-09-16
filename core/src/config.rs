@@ -49,6 +49,13 @@ pub struct Config {
 pub struct Content {
     pub enabled: bool,
     pub semantic: bool,
+    pub embedding_model: String,
+    #[serde(skip)]
+    pub embedding_host: String,
+    pub code_roots: Vec<String>,
+    pub index_budget_mb: u64,
+    pub ocr: bool,
+    pub ocr_pages: u32,
     pub roots: Vec<String>,
     pub excluded_paths: Vec<String>,
     pub max_file_mb: u64,
@@ -74,6 +81,12 @@ impl Default for Content {
         Self {
             enabled: true,
             semantic: false,
+            embedding_model: "embeddinggemma:300m".into(),
+            embedding_host: "127.0.0.1:11434".into(),
+            code_roots: Vec::new(),
+            index_budget_mb: 3072,
+            ocr: false,
+            ocr_pages: 20,
             roots,
             excluded_paths: vec!["~/Library".into(), "~/.ssh".into(), "~/.gnupg".into()],
             max_file_mb: 1,
@@ -89,9 +102,14 @@ impl Content {
     pub fn expanded_roots(&self) -> Vec<PathBuf> {
         self.roots
             .iter()
+            .chain(self.code_roots.iter())
             .take(32)
             .filter_map(|path| expand_tilde(path))
             .collect()
+    }
+
+    pub fn expanded_code_roots(&self) -> Vec<PathBuf> {
+        self.code_roots.iter().take(32).filter_map(|path| expand_tilde(path)).collect()
     }
 
     pub fn expanded_exclusions(&self) -> Vec<PathBuf> {

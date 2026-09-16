@@ -1,5 +1,6 @@
 import AppKit
 import Quartz
+@preconcurrency import PDFKit
 
 /// Quick Look for the selected result, without leaving the panel.
 ///
@@ -12,21 +13,33 @@ import Quartz
 /// still in it. `Panel.previewing` holds that off, and this reports the close so the panel
 /// can take key back.
 @MainActor
-final class Preview: NSObject, @MainActor QLPreviewPanelDataSource {
+final class Preview: NSObject, @MainActor QLPreviewPanelDataSource, NSWindowDelegate {
     private var url: URL?
     private var watching: (any NSObjectProtocol)?
+    private var pdfPanel: NSPanel?
+    private var pdfTask: Task<Void, Never>?
+    private var generation = UUID()
+    private final class Loaded: @unchecked Sendable {
+        let document: PDFDocument
+        init(_ document: PDFDocument) { self.document = document }
+    }
 
     /// Raised when the preview goes away, by whatever route — ⌘Y again, Esc, or its own
     /// close button.
     var onClose: (() -> Void)?
 
     var isShowing: Bool {
-        QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+        pdfPanel?.isVisible == true || (QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible)
     }
 
     /// Shows `path`, or hides what is showing. Returns whether a preview is now up.
     @discardableResult
-    func toggle(_ path: String) -> Bool {
+    func toggle(_ path: String, page: Int = 0) -> Bool {
+        if let pdfPanel { pdfPanel.close(); return false }
+        if page > 0, URL(fileURLWithPath: path).pathExtension.lowercased() == "pdf" {
+            if QLPreviewPanel.sharedPreviewPanelExists() { QLPreviewPanel.shared().orderOut(nil) }
+            return showPDF(path, page: page)
+        }
         guard let quickLook = QLPreviewPanel.shared() else { return false }
         if isShowing {
             quickLook.orderOut(nil)
@@ -41,6 +54,58 @@ final class Preview: NSObject, @MainActor QLPreviewPanelDataSource {
         quickLook.makeKeyAndOrderFront(nil)
         listen(to: quickLook)
         return true
+    }
+
+    private func showPDF(_ path: String, page: Int) -> Bool {
+        let panel = PDFPanel(contentRect: NSRect(x: 0, y: 0, width: 760, height: 800),
+                             styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        panel.title = "\(URL(fileURLWithPath: path).lastPathComponent) · page \(page)"
+        panel.delegate = self
+        let label = NSTextField(labelWithString: "Loading PDF…")
+        label.frame = NSRect(x: 24, y: 24, width: 700, height: 30)
+        panel.contentView?.addSubview(label)
+        pdfPanel = panel
+        generation = UUID()
+        let expected = generation
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        pdfTask = Task { @MainActor [weak self, weak panel] in
+            let worker = Task.detached(priority: .userInitiated) { () -> Loaded? in
+                let descriptor = path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
+                guard descriptor >= 0 else { return nil }
+                let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+                defer { try? file.close() }
+                var metadata = stat()
+                guard fstat(descriptor, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
+                      metadata.st_size > 0, metadata.st_size <= 128 * 1024 * 1024, !Task.isCancelled,
+                      let data = try? file.read(upToCount: 128 * 1024 * 1024), !Task.isCancelled,
+                      let document = PDFDocument(data: data), !document.isLocked else { return nil }
+                return Loaded(document)
+            }
+            let loaded = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+            guard !Task.isCancelled, let self, let panel, self.generation == expected, panel.isVisible else { return }
+            guard let loaded, let destination = loaded.document.page(at: page - 1) else {
+                label.stringValue = "This page is unavailable. Use Open to view the file in its default application."
+                return
+            }
+            let view = PDFView(frame: panel.contentView?.bounds ?? .zero)
+            view.autoresizingMask = [.width, .height]
+            view.autoScales = true
+            view.document = loaded.document
+            panel.contentView = view
+            view.go(to: destination)
+        }
+        return true
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === pdfPanel else { return }
+        generation = UUID()
+        pdfTask?.cancel()
+        pdfTask = nil
+        pdfPanel = nil
+        onClose?()
     }
 
     /// Notification rather than the controller protocol's `endPreviewPanelControl`, which
@@ -73,5 +138,15 @@ final class Preview: NSObject, @MainActor QLPreviewPanelDataSource {
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
         url as NSURL?
+    }
+}
+
+@MainActor
+private final class PDFPanel: NSPanel {
+    override func cancelOperation(_ sender: Any?) { close() }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           event.charactersIgnoringModifiers == "y" { close(); return true }
+        return super.performKeyEquivalent(with: event)
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 import PDFKit
 import AppKit
 import Darwin
+import Vision
 
 // Two independent modes in one binary:
 //
@@ -60,12 +61,14 @@ private enum LegacyMode {
 
 // MARK: - Indexing mode
 
-private enum DocumentKind: String { case pdf, docx, doc, rtf, odt }
+private enum DocumentKind: String { case pdf, docx, doc, rtf, odt, pptx, xlsx }
 
 private struct IndexResult: Encodable {
     var status: String
     var text: String?
     var pages: Int?
+    var partial: Bool = false
+    var ocrPages: [Int] = []
 }
 
 @_silgen_name("sandbox_init")
@@ -73,15 +76,17 @@ private func sandboxInit(_ profile: UnsafePointer<CChar>, _ flags: Int, _ error:
 
 private enum IndexMode {
     private static let maxInputBytes = 128 * 1024 * 1024
-    private static let maxResponseBytes = 262_144
+    private static let maxResponseBytes = 16 * 1024 * 1024
     private static let watchdogSeconds: TimeInterval = 20
 
     static func run(_ arguments: [String]) {
-        guard arguments.count == 3,
+        guard (3...4).contains(arguments.count),
               let kind = DocumentKind(rawValue: arguments[0]),
-              let maxBytes = Int(arguments[1]), (1...65_536).contains(maxBytes),
+              let maxBytes = Int(arguments[1]), (1...2_097_152).contains(maxBytes),
               let maxPages = Int(arguments[2]), (1...1_000).contains(maxPages)
         else { exit(2) }
+        let ocrPages = arguments.count == 4 ? (Int(arguments[3]) ?? -1) : 0
+        guard (0...100).contains(ocrPages) else { exit(2) }
 
         guard denyNetwork() else {
             emit(IndexResult(status: "unreadable"))
@@ -90,7 +95,7 @@ private enum IndexMode {
         startWatchdog()
         _ = pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0)
 
-        let result = autoreleasepool { extract(kind: kind, maxBytes: maxBytes, maxPages: maxPages) }
+        let result = autoreleasepool { extract(kind: kind, maxBytes: maxBytes, maxPages: maxPages, ocrBudget: ocrPages) }
         emit(result)
         exit(0)
     }
@@ -120,7 +125,7 @@ private enum IndexMode {
         thread.start()
     }
 
-    private static func extract(kind: DocumentKind, maxBytes: Int, maxPages: Int) -> IndexResult {
+    private static func extract(kind: DocumentKind, maxBytes: Int, maxPages: Int, ocrBudget: Int) -> IndexResult {
         var metadata = stat()
         guard fstat(0, &metadata) == 0,
               metadata.st_mode & S_IFMT == S_IFREG,
@@ -133,9 +138,14 @@ private enum IndexMode {
         }
         switch kind {
         case .pdf:
-            return extractPDF(data: data, maxBytes: maxBytes, maxPages: maxPages)
+            return extractPDF(data: data, maxBytes: maxBytes, maxPages: maxPages, ocrBudget: ocrBudget)
         case .docx, .doc, .rtf, .odt:
             return extractOffice(kind: kind, data: data, maxBytes: maxBytes)
+        case .pptx, .xlsx:
+            guard let result = OfficeExtract.extract(data, slides: kind == .pptx, maxBytes: maxBytes, maxSections: maxPages) else {
+                return IndexResult(status: "unreadable")
+            }
+            return IndexResult(status: result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "empty" : "text", text: result.text, partial: result.partial)
         }
     }
 
@@ -177,26 +187,55 @@ private enum IndexMode {
 
     // MARK: PDF
 
-    private static func extractPDF(data: Data, maxBytes: Int, maxPages: Int) -> IndexResult {
+    private static func extractPDF(data: Data, maxBytes: Int, maxPages: Int, ocrBudget: Int) -> IndexResult {
         guard let document = PDFDocument(data: data) else { return IndexResult(status: "unreadable") }
         if document.isLocked || (document.isEncrypted && !document.unlock(withPassword: "")) {
             return IndexResult(status: "locked")
         }
         var text = Data()
         var pagesExamined = 0
+        var ocrPages: [Int] = []
+        var attempted = 0
+        var partial = document.pageCount > maxPages
         let upperBound = min(document.pageCount, maxPages)
         for index in 0..<upperBound {
             pagesExamined += 1
-            let sanitized = sanitize(document.page(at: index)?.string ?? "")
+            if index > 0 { appendTruncated("\u{c}", into: &text, budget: maxBytes) }
+            guard let page = document.page(at: index) else { partial = true; continue }
+            var pageText = page.string ?? ""
+            if pageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if attempted < ocrBudget {
+                    attempted += 1
+                    pageText = autoreleasepool { recognize(page) }
+                    if !pageText.isEmpty { ocrPages.append(index + 1) }
+                }
+                if pageText.isEmpty { partial = true }
+            }
+            let sanitized = sanitize(pageText)
+            if sanitized.utf8.count > maxBytes - text.count { partial = true }
             appendTruncated(sanitized, into: &text, budget: maxBytes)
-            appendTruncated("\n", into: &text, budget: maxBytes)
-            if text.count >= maxBytes { break }
+            if text.count >= maxBytes { partial = partial || index + 1 < document.pageCount; break }
         }
         let extracted = String(decoding: text, as: UTF8.self)
         guard !extracted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return IndexResult(status: "empty", pages: pagesExamined)
         }
-        return IndexResult(status: "text", text: extracted, pages: pagesExamined)
+        return IndexResult(status: "text", text: extracted, pages: pagesExamined, partial: partial, ocrPages: ocrPages)
+    }
+
+    private static func recognize(_ page: PDFPage) -> String {
+        let bounds = page.bounds(for: .mediaBox)
+        guard bounds.width.isFinite, bounds.height.isFinite, bounds.width > 0, bounds.height > 0 else { return "" }
+        let scale = min(2.0, 2048 / max(bounds.width, bounds.height))
+        let image = page.thumbnail(of: NSSize(width: bounds.width * scale, height: bounds.height * scale), for: .mediaBox)
+        var rect = NSRect(origin: .zero, size: image.size)
+        guard let cgImage = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return "" }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = true
+        request.automaticallyDetectsLanguage = true
+        do { try VNImageRequestHandler(cgImage: cgImage).perform([request]) } catch { return "" }
+        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
     }
 
     // MARK: Office documents
@@ -208,7 +247,7 @@ private enum IndexMode {
         case .doc: documentType = .docFormat
         case .rtf: documentType = .rtf
         case .odt: documentType = .openDocument
-        case .pdf: preconditionFailure("PDF handled separately")
+        case .pdf, .pptx, .xlsx: preconditionFailure("Handled separately")
         }
         guard let attributed = try? NSAttributedString(
             data: data, options: [.documentType: documentType], documentAttributes: nil
@@ -220,7 +259,7 @@ private enum IndexMode {
         guard !truncated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return IndexResult(status: "empty")
         }
-        return IndexResult(status: "text", text: truncated)
+        return IndexResult(status: "text", text: truncated, partial: sanitized.utf8.count > maxBytes)
     }
 
     // MARK: Text handling
@@ -267,7 +306,7 @@ private enum IndexMode {
     /// Encodes and writes exactly one JSON line. If the encoded response would exceed the
     /// protocol's response cap (escaping can inflate text — e.g. every byte a newline),
     /// the text is halved repeatedly until it fits; this is a defensive backstop since
-    /// maxBytes is capped at 64 KiB by argument validation and never gets close in practice.
+    /// maxBytes is capped at 2 MiB by argument validation.
     private static func emit(_ result: IndexResult) {
         var candidate = result
         for _ in 0..<24 {
@@ -283,6 +322,7 @@ private enum IndexMode {
                 candidate.status = "empty"
             } else {
                 candidate.text = shortened
+                candidate.partial = true
             }
         }
         write(Data(#"{"status":"unreadable"}"#.utf8))

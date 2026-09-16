@@ -74,7 +74,7 @@ def main() -> int:
     output.mkdir(parents=True)
 
     cargo_home = Path(os.environ.get("CARGO_HOME", str(Path.home() / ".cargo")))
-    lock_files = [root / "core" / "Cargo.lock", root / "helpers" / "vector-worker" / "Cargo.lock"]
+    lock_files = [root / "Cargo.lock", root / "helpers" / "vector-worker" / "Cargo.lock"]
     packages: dict[tuple[str, str], Path | None] = {}
     for lock_file in lock_files:
         if lock_file.exists():
@@ -117,7 +117,7 @@ def main() -> int:
     report = output / "COLLECTION.txt"
     report.write_text(
         "Blindspot release license collection\n"
-        "Source: locally installed packages named by core/Cargo.lock and "
+        "Source: locally installed packages named by Cargo.lock and "
         "helpers/vector-worker/Cargo.lock\n"
         f"License files copied: {copied}\n"
         f"Packages covered by checked-in supplemental licenses: {len(covered)}\n"

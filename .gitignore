@@ -1,4 +1,6 @@
-# Rust build output
+# Rust build output: the workspace root since the retrieval crate split, and the
+# pre-split core/target, which cargo no longer writes to.
+/target/
 core/target/
 
 # Hand-assembled app bundle

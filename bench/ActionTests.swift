@@ -48,7 +48,55 @@ enum ActionTests {
         precondition(LocalRequest.parse("show everything listening on localhost")?.query == ":localhost")
         precondition(LocalRequest.parse("documents about genetec")?.query == ":content kind:documents genetec")
         precondition(LocalRequest.parse("my schedule") == .schedule && LocalRequest.parse(":schedule") == .schedule)
-        precondition(LocalRequest.parse("join my next meeting") == .schedule && LocalRequest.parse("schedule a meeting") == nil)
+        if let editor = Editor.preferred() {
+            let (tool, arguments) = editor.command("/tmp/notes.rs", line: 340)
+            precondition(FileManager.default.isExecutableFile(atPath: tool), tool)
+            precondition(arguments.contains { $0.contains("/tmp/notes.rs:340") || $0 == "340" }, "\(arguments)")
+        }
+        let passage = Match(id: 3, name: "store.rs", kind: .file, path: "/tmp/store.rs", score: 0,
+                            timestamp: 0, width: 0, height: 0, detail: "", highlights: [], line: 42)
+        let plain = Match(id: 4, name: "store.rs", kind: .file, path: "/tmp/store.rs", score: 0,
+                          timestamp: 0, width: 0, height: 0, detail: "", highlights: [])
+        // Through the registry, which is how the panel reaches the file provider.
+        let files = ActionRegistry()
+        let opensAt = { (row: Match) in
+            files.actions(for: row).contains { $0.label.hasPrefix("Open at Line") }
+        }
+        precondition(opensAt(passage) == (Editor.preferred() != nil), "a passage offers its line")
+        precondition(!opensAt(plain), "a whole-file row does not")
+        precondition(LocalRequest.parse("join my next meeting") == .schedule)
+        func draft(_ text: String) -> EventDraft? {
+            if case .createEvent(let draft) = LocalRequest.parse(text) { return draft }
+            return nil
+        }
+        let calendar = Calendar.current
+        let hour = { (date: Date?) in date.map { calendar.component(.hour, from: $0) } }
+        for typed in ["schedule a meeting today about an exam at 6pm", ">schedule a meeting today about an exam at 6pm"] {
+            let exam = draft(typed)
+            precondition(exam?.title == "Meeting about exam" && hour(exam?.start) == 18 && exam?.allDay == false, typed)
+            precondition(exam.flatMap { $0.start }.map(calendar.isDateInToday) == true && exam.flatMap { d in d.end.map { $0.timeIntervalSince(d.start!) } } == 3600)
+        }
+        let tomorrow = draft("schedule a meeting for tomorrow at 6pm")
+        precondition(tomorrow?.title == "Meeting" && hour(tomorrow?.start) == 18 && tomorrow.flatMap { $0.start }.map(calendar.isDateInTomorrow) == true)
+        precondition(draft("add dentist appointment tomorrow at 3pm")?.title == "Dentist appointment")
+        let lunch = draft("book lunch with Sarah friday at noon")
+        precondition(lunch?.title == "Lunch with Sarah" && hour(lunch?.start) == 12 && lunch.flatMap { $0.start }.map { calendar.component(.weekday, from: $0) } == 6)
+        let study = draft("schedule study session tomorrow 2-4pm")
+        precondition(study?.title == "Study session" && study.flatMap { d in d.end.map { $0.timeIntervalSince(d.start!) } } == 7200)
+        let call = draft("schedule call with Alex on Sept 20 at 10:30 for 30 minutes")
+        precondition(call?.title == "Call with Alex" && call.flatMap { d in d.end.map { $0.timeIntervalSince(d.start!) } } == 1800)
+        let exam = draft("schedule exam tomorrow")
+        precondition(exam?.title == "Exam" && exam?.allDay == true)
+        let undated = draft("schedule a meeting")
+        precondition(undated?.title == "Meeting" && undated?.start == nil)
+        for other in ["create a file tomorrow", "add milk to the list", "schedule today", "my schedule", "find meeting notes tomorrow", "set a timer for 10 minutes"] {
+            precondition(draft(other) == nil, other)
+        }
+        precondition(LocalRequest.parse("schedule today") == .schedule)
+        let path = ScheduleProvider.addPath(EventDraft(title: "Meeting about exam", start: Date(timeIntervalSince1970: 1_800_000_000),
+                                                       end: Date(timeIntervalSince1970: 1_800_003_600), allDay: false),
+                                            start: Date(timeIntervalSince1970: 1_800_000_000), end: Date(timeIntervalSince1970: 1_800_003_600))
+        precondition(path.hasPrefix(ScheduleProvider.addEventPrefix) && path.contains("title=Meeting%20about%20exam") && path.contains("start=1800000000"), path)
         for question in [">do i have smth on my calendar today", "Do I have anything on my calendar tomorrow?",
                          "when is my next meeting", "> any meetings this afternoon", "what\u{2019}s on my agenda today"] {
             precondition(LocalRequest.parse(question) == .schedule, question)

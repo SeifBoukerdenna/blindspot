@@ -13,6 +13,7 @@ pub const COMMANDS: &[SystemCommand] = &[
     SystemCommand { id: "sleep", title: "Sleep", detail: "System · puts this Mac to sleep", keywords: &["sleep"] },
     SystemCommand { id: "sleep-displays", title: "Sleep Displays", detail: "System · turns the displays off", keywords: &["displays off", "screen off"] },
     SystemCommand { id: "screensaver", title: "Start Screen Saver", detail: "System", keywords: &["screen saver", "screensaver"] },
+    SystemCommand { id: "capture-text", title: "Copy Text from Screen", detail: "System · select an area and copy its text, read on this Mac", keywords: &["ocr", "screenshot to text", "text from screen", "grab text", "capture text", "scan text", "copy text"] },
     SystemCommand { id: "restart", title: "Restart…", detail: "System · asks first; apps can cancel", keywords: &["restart", "reboot"] },
     SystemCommand { id: "shutdown", title: "Shut Down…", detail: "System · asks first; apps can cancel", keywords: &["shut down", "shutdown", "power off"] },
     SystemCommand { id: "logout", title: "Log Out…", detail: "System · asks first; apps can cancel", keywords: &["log out", "logout", "sign out"] },

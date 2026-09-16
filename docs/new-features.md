@@ -3,6 +3,10 @@
 **Release: 0.2.8.** This guide describes implemented features, not the full proposed roadmap.
 The release notes at the end distinguish new behavior from platform limitations.
 
+**Local search upgrade, September 16 (unreleased):** passage embeddings, blended ranking,
+code folders, PPTX/XLSX extraction, opt-in scanned-PDF OCR, PDF page previews, and Copy/Ask
+Passage. The release version is unchanged; no tag or publication was made.
+
 ## 1. Open, navigate, and run actions
 
 | Shortcut | Behavior |
@@ -74,6 +78,31 @@ separately, so text results can arrive first. Missing semantic models/helpers fa
 to conventional text search. Ordinary search can also append content matches; use
 `:content` when you specifically want content rather than filenames.
 
+**Passage search.** Indexed files are also split into passages of roughly 1,000 bytes, overlapping
+slightly so a sentence spanning a boundary still matches, and search ranks those passages rather
+than whole files. Content search shows up to two distinct passages per file; ordinary launcher
+search still shows one file row, so one long file cannot fill the list.
+Prose, code and paged documents are split differently: code breaks at declarations and carries the
+surrounding function or type names, prose keeps its nearest heading, PDFs keep real page numbers,
+and PPTX keeps slide order. Word text does not claim page numbers. Very large files stop at
+400 passages or 2 MiB and appear as partly indexed.
+
+A passage result names the place to open: **p. 12** for a page, **line 31** for a line. With such a
+row selected, ⌘K offers **Open at Line N**, which opens the file at that line in Zed, VS Code,
+Cursor or Sublime Text if one is installed, and otherwise in iTerm using your `$EDITOR`.
+The iTerm fallback accepts `vim`, `nvim`, `vi` or `nano` and may require Automation permission;
+otherwise choose **Open**. PDF Return and ⌘Y use Blindspot's page-aware preview; **Open** in ⌘K
+still uses the default application. Slide rows show the slide number but open the whole deck.
+⌘K also offers **Copy Passage** and **Ask About This Passage…**. These use the stored passage,
+not the short result subtitle; an obsolete chunk is refused after reindexing.
+
+If a query's words never all appear together, search retries with any of them rather than returning
+nothing. On a disposable 134-document checkout index and 47 golden queries, blended retrieval
+scored **89% hit@5 / 0.66 MRR@10**, versus **66% / 0.49** for passage words alone and **36% / 0.34**
+for whole-document words. Blended p95 was 37 ms. These are checkout measurements, not a claim
+about a million-document library. `make bench-search DB=... HELPERS=... BENCH_FLAGS=--check`
+uses the shipping pipeline and fails a ranking-regression gate; output contains local paths.
+
 **Content filters** use the same syntax as file search, placed anywhere after `:content`:
 
 | Query | Meaning |
@@ -98,38 +127,48 @@ Add a project/notes folder rather than your entire home directory where practica
 Supported indexed text/code extensions:
 `txt md markdown rst csv tsv json toml yaml yml xml html css rs swift py js jsx ts tsx go java c h cpp hpp rb sh sql`.
 
-**Search by meaning** (Settings → Content → **Search by meaning**) uses Apple's installed
-on-device English *contextual* embedding model, mean-pooled over the start of each document
-(filename plus roughly the first 1,200 characters). It is separate from your Qwen/Ollama choice.
-Model assets are never requested or downloaded; without them Blindspot uses exact-word search only.
+**Search by meaning** uses the installed Ollama **Embedding model**, default `embeddinggemma:300m`,
+one vector per passage. It is separate from the model answering AI questions. Empty selects
+Apple's installed English contextual model. If Ollama is unavailable at indexing time, Apple is
+tried automatically; if no usable backend/generation is available, word search remains usable.
+No model is downloaded. Use Index → Refresh after starting Ollama or installing a model yourself.
 
-- **What gets embedded:** prose and extracted documents only — `txt md markdown rst html` and PDFs
-  that produced text. Code, JSON, CSV, YAML, TOML and other data files are **exact-word only**:
-  on this Mac's 41k-document index the model ranked them no better than noise.
-- **How results are ordered:** files containing your words always come first; the meaning signal
-  only reorders those by agreement. After them, at most **8** documents that matched by meaning
-  alone are appended with the detail **Related by meaning · approximate, no exact word match**.
+- **What gets embedded:** prose, extracted PDF/Word/PPTX text, and code under explicitly selected
+  **Code folders** (empty by default). Code elsewhere remains word-searchable. JSON, CSV, TSV,
+  XML, YAML, TOML and XLSX remain exact-text only. `.gitignore` is not used; generated/dependency
+  directory exclusions still apply.
+- **How results are ordered:** one deterministic blended list, labelled **Words**, **Meaning**,
+  or **Words + meaning**. Vectors from different models are never compared. New model generations
+  build in the same database and activate after completion; older published generations remain
+  available. Compact can retire inactive completed non-Apple generations.
 - **Good for:** concepts whose words are not in the file. On real folders,
   `:content video surveillance security cameras` surfaced WebRTC camera examples and streaming
   API PDFs. **Not good for:** proper nouns, IDs and error codes — use exact words (`genetec`);
-  the related tail can be unrelated.
+  meaning matches can be unrelated.
 - A new or edited note is searchable by meaning as soon as it is embedded, before the cache rebuild.
 - The index contains bounded excerpts, so a word appearing only beyond the excerpt may not match.
 
 **PDF content indexing** is enabled by **Index PDF documents** in Content settings.
-It extracts up to 64 KiB across the first 100 pages through an isolated local helper.
+It extracts up to 2 MiB across the first 100 pages through an isolated local helper.
 The default PDF source limit is 32 MiB, configurable from 1 to 128 MiB. New PDFs join
 text and semantic search after their extraction/indexing pass; existing text indexes are reused.
 
 Locked, image-only, oversized and unreadable PDFs have no newly extracted body. If an
 older body was indexed successfully, it is retained as a fallback and may be out of date.
-A later reconciliation retries unsuccessful extraction. No PDF OCR is performed.
+A changed document is retried. Turn on **Read scanned PDF pages** to revisit existing PDFs and
+recognize pages with no usable text locally. OCR is off by default, attempts 20 pages per PDF by
+default (configurable 1–100), and marks recognized passages **Read by OCR**. Limits can leave a
+document partly indexed. The helper has a 20-second watchdog.
 **Word, RTF and OpenDocument text** (DOCX, DOC, RTF, ODT) are indexed the same way when
 **Index PDF and Word documents** is on. The extraction helper runs with network access removed
 by the macOS sandbox before it reads a document. Before enabling this, Apple's importers were
 tested with documents referencing remote images, templates, hyperlinks and INCLUDEPICTURE
-fields: they made no network requests. Presentations, spreadsheets and images are not indexed,
-and no OCR is performed. PDF filename search and explicit PDF text extraction actions remain.
+fields: they made no network requests. **PPTX** slide text and **XLSX** cached cells also use the
+no-network helper. Workbook sheet names and cell addresses are included in the text; formulas
+are not evaluated, external links are not followed, and worksheets are never merged together.
+Encrypted, corrupt, excessively expanded or unsupported archives are marked unreadable.
+Native Pages/Keynote/Numbers and standalone image indexing are not supported; export to PDF,
+PPTX or XLSX. Office opening is whole-file; PDF page and source-code line navigation are supported.
 
 ### What indexing status means
 
@@ -139,11 +178,11 @@ second while open; **Settings → Content → Open index** jumps there.
 | Part | What it tells you |
 |---|---|
 | Header | Up to date, Indexing, Paused or Off; while indexing, the stage, elapsed time and folder; otherwise when the last pass finished and how long it took. **Refresh** starts a full reconciliation |
-| Meaning bar | Notes and PDFs searchable by meaning out of those eligible, and how many are still waiting |
-| Tiles | Documents stored, PDFs with text, documents searchable by meaning, disk used (database plus semantic cache) |
+| Meaning bar | Active-model vectors out of all stored passages; not a completion percentage because some kinds stay word-only |
+| Tiles | Documents stored, extracted documents with text, passages searchable by meaning, disk used (database plus semantic cache) |
 | Busy-folder banner | A folder whose files changed at least 20 times in five minutes. **Exclude folder** asks first, then adds it to Content → Excluded paths |
 | What's indexed | Documents by kind (notes, PDFs, code, data, web) and by top-level folder, with sizes. Click a folder to reveal it in Finder |
-| Needs attention | PDFs without text, locked, over the size limit or unreadable. Click to reveal |
+| Needs attention | Documents without text, locked, oversized, unreadable or partly indexed. Click to reveal |
 | Recently changed | The most recently modified indexed files |
 | Activity | This pass's checked, updated, unchanged, skipped and unreadable counts; what was embedded; watched folders; when counts were sampled |
 | Resources | Blindspot and each helper (semantic model, vector search, PDF extraction) with memory and CPU %, and the current pace |
@@ -164,7 +203,7 @@ Detailed terms:
 | Updated | Documents newly written or changed during this pass, not the total index size |
 | Source bytes | Combined source-file size for documents updated in this pass; not database, vector-cache or RAM size |
 | Documents / embeddings | Sampled totals stored in the index, distinct from this pass's updates |
-| DB / vector catalog | SQLite main-file size and bytes recorded for published vector shards; catalog size excludes orphan files |
+| DB / vector cache | SQLite main-file size and actual regular vector-file sizes, including unpublished artifacts |
 | PDF extraction issues | Stored no-text, locked, oversized or unreadable statuses; a previously indexed body may still be retained |
 | Unchanged | Documents whose stored content fingerprint was reusable |
 | Skipped / failed | Entries excluded by policy or unavailable to read; not all visited entries become documents |
@@ -178,7 +217,7 @@ Detailed terms:
 
 Storage/count diagnostics are sampled in the background; they are not instantaneous totals.
 **Settings → Status → Content storage** separates database, WAL and SHM sizes from the
-published vector catalog. File sizes are logical sizes, not a total filesystem allocation
+vector files. File sizes are logical sizes, not a total filesystem allocation
 measurement. App resident memory is shown separately under **App resources**.
 
 There is no reliable final percentage until the eligible work is known. Each counter is
@@ -203,7 +242,11 @@ Upgrading the app normally reuses the separate on-disk index and compatible embe
 - Separate PDF source limit: **32 MiB**, configurable up to **128 MiB**; at most 100 pages.
 - **Low-impact indexing** increases pauses between scan batches from 10 ms to 50 ms.
   This slows reconciliation; it is not a measured CPU reduction or a hard quota.
-- Indexed excerpt: at most **64 KiB per source**; maximum traversal depth: **64**.
+- Searchable passages: at most **2 MiB / 400 passages per source**; a legacy 64 KiB excerpt is
+  retained for compatibility. Maximum traversal depth: **64**.
+- **Index budget (MiB)** defaults to 3072 and pauses new work when database, journals and vector
+  files reach the target. Shard builds reserve an estimate first. In-flight batches may overshoot;
+  this is not a hard disk quota. Increase the budget, narrow scope or Compact to resume.
 - Up to **32 roots** and **128 exclusions**; work is batched and cancellable.
 - Common sensitive/hidden/generated paths, symlinks, cloud placeholders and network
   volumes are skipped. Examples include Library, node_modules, target, DerivedData,
@@ -412,6 +455,7 @@ the results. `:system` lists them all.
 | `lock` | **Lock Screen.** Uses ⌃⌘Q when Accessibility is allowed; otherwise it turns the displays off, which locks when a password is required after sleep (the macOS default) |
 | `sleep` / `sleep displays` | Sleep the Mac, or just the displays |
 | `screen saver` | Start the screen saver |
+| `ocr`, `copy text from screen`, `grab text` | **Copy Text from Screen.** Select an area and its text is copied; a short notice says how many words. Recognition runs on this Mac with the same engine as Live Text, and the screenshot is deleted straight away. The first use asks for Screen Recording permission |
 | `restart`, `shut down`, `log out` | **Asks first**, then asks macOS as the Apple menu does, so apps with unsaved work can still cancel |
 | `empty trash` | **Asks first**; deletes the Trash permanently through Finder |
 | `eject` | Eject removable and network disks; reports any that are in use |
@@ -442,8 +486,28 @@ or documents, are not captured.
   Links to other sites are never offered as Join.
 - **Other events:** Return opens Calendar.
 
-Events are read on this Mac each time the list is shown, and nothing is stored or sent. Blindspot
-does not create or edit events.
+Events are read on this Mac each time the list is shown, and nothing is stored or sent.
+
+**Adding events:** type what you want, plainly or after `>`, and press Return on the preview.
+
+| Type | Preview |
+|---|---|
+| `schedule a meeting today about an exam at 6pm` | Meeting about exam · Today 6:00–7:00 PM |
+| `schedule a meeting for tomorrow at 6pm` | Meeting · Tomorrow 6:00–7:00 PM |
+| `book lunch with Sarah friday at noon` | Lunch with Sarah · Friday 12:00–1:00 PM |
+| `schedule study session tomorrow 2-4pm` | Study session · Tomorrow 2:00–4:00 PM |
+| `add dentist appointment tomorrow at 3pm for 30 minutes` | Dentist appointment · 3:00–3:30 PM |
+| `schedule exam tomorrow` | Exam · Tomorrow, all day |
+
+- **How it's read:** the date and time come from macOS's own date detector on this Mac, not the AI.
+  The preview row shows exactly what will be saved, in your default calendar for new events, and lists
+  that day's existing events so a clash is visible.
+- **Defaults:** events last an hour unless you give a range (`2-4pm`) or a length (`for 30 minutes`).
+- **After adding:** the row changes to *Added* and Return opens Calendar. To edit or delete the event,
+  use Calendar.
+- **What counts:** requests starting with `schedule` or `book`, or with `add`, `create`, `plan` or
+  `set up` plus the word meeting, event, appointment, call or calendar. `schedule today` still shows
+  your schedule, and anything about files, notes, reminders or timers is left alone.
 
 ## 11. Calculator and utilities
 
@@ -464,12 +528,41 @@ Type these in normal search; select the desired output and press Return to copy.
 | `90s`, `1h 30m`, `250ms` | Durations, seconds and milliseconds |
 | `180cm`, `5 ft 11 in`, `10 miles` | Metric/imperial lengths |
 | `70kg`, `150 lbs`, `1 lb 8 oz` | Metric/imperial weights |
+| `72f`, `-40c`, `300 kelvin` | Temperatures: Celsius, Fahrenheit, kelvin |
+| `2 L`, `1 cup`, `12 fl oz`, `3 tbsp` | Volumes, metric and US measures |
+| `1 acre`, `1000 sq ft`, `50 m²` | Areas |
+| `100 km/h`, `60 mph`, `20 knots` | Speeds |
+| `32 psi`, `1 atm` | Pressure |
+| `500 kcal`, `3 kWh`, `150 hp` | Energy and power |
+| `90°`, `2.4 GHz` | Angles and frequencies |
+| `100 Mbps`, `50 MB/s` | Data rates, with how long 1 GB takes |
+| `30 mpg`, `7 L/100 km` | Fuel economy |
+| `5 km to miles`, `72f in c`, `90 min to hours` | Convert to one unit you name |
+| `time in paris`, `tokyo time` | The current time somewhere else |
+| `3pm montreal in tokyo`, `9am to london`, `noon in delhi` | Time zone conversion |
 | `https://example.com` | Open/copy URL or extract its domain |
 
 Byte units include B/KB/MB/GB/TB/PB and KiB/MiB/GiB/TiB/PiB. Duration units include
 ns/us/ms/s/min/h/d and common spelled-out forms. Lengths include mm/cm/m/km/in/ft/yd/mi;
 weights include mg/g/kg/tonnes/oz/lb/stone. `m` alone can mean metres or minutes,
 so inspect the result label. Compound supported units can be combined.
+
+**More units:**
+- Volumes and areas answer in the other system: `2 L` shows quarts and gallons, `1 cup` shows millilitres.
+- Temperatures show the other two scales; the rest show the two most useful forms.
+- Add `to` or `in` and a unit for exactly one answer: `5 km to miles`, `1.5 cups to ml`.
+- US measures are used for cups, pints, quarts, gallons and mpg.
+- A lone `k` is not read as kelvin, because `5k` usually means five thousand.
+
+**Time zones:**
+- `time in paris` shows the time there, its zone and how far ahead or behind you it is.
+- `3pm montreal in tokyo` converts a time between two places and shows both clocks.
+- `3pm in tokyo` reads 3pm as Tokyo's time and shows yours; `3pm to tokyo` reads it as yours.
+- Places are city names from macOS's time-zone database (Tokyo, New York, São Paulo is `sao paulo`),
+  common cities and countries without a zone of their own (Montreal, San Francisco, India), and
+  abbreviations such as `pst`, `cet` and `utc`.
+- Daylight saving comes from the zone files macOS already keeps, so it is exact and works offline.
+- An unknown place shows nothing rather than a guess.
 
 ## 12. Settings and discovery
 
@@ -518,11 +611,14 @@ configuration/default; the origin label explains whether it was set in this wind
    filenames never mention Genetec appear because their extracted text does — verified with
    exported API-reference PDFs in `~/doc-capstone`.
 5. For related material that does not use the word itself, try
-   `:content video surveillance security cameras`. Rows marked **Related by meaning** are
-   approximate; exact matches are always listed above them.
+   `:content video surveillance security cameras`. Rows marked **Meaning** are approximate;
+   they are blended with word matches, not appended as a separate tail.
 6. If a document is missing, check **Settings → Index → Needs attention** (no text, locked, over
-   the size limit, unreadable) and the size limit. Scanned PDFs need OCR, which is not
-   performed. Word, RTF and ODT files are indexed like PDFs when document extraction is on.
+   the size limit, unreadable, partly indexed) and the size limit. For scanned PDFs, enable
+   **Read scanned PDF pages**, allow the reconciliation to finish, then try the query again.
+7. To search implementation concepts, add the repository under **Code folders**. Search
+   `:content kind:code rebuild vector shards`, then Return to the matching line. To inspect
+   workbook values, try `:content kind:xlsx renewal`; sheet/row/cell labels accompany cached values.
 
 ### Ask a question about your own documents
 
@@ -573,7 +669,7 @@ configuration/default; the origin label explains whether it was set in this wind
 
 1. Keep roots limited to folders you need. Exclude generated/private subfolders.
 2. Open **Settings → Index**. The header shows the stage and elapsed time; the meaning bar shows
-   how many documents are still waiting, and a falling count means embedding is progressing.
+   active-model passage coverage. **Embedded this pass** counts passages, not documents.
 3. If a busy-folder banner names generated data (logs, feeds, caches), choose **Exclude folder**.
    If **Resources** shows sustained CPU you do not want, turn on **Low-impact indexing**;
    passes take longer. Turning off **Search by meaning** stops embedding work entirely.
@@ -596,6 +692,15 @@ process visibility, selected-text access, last-opened metadata and atomic PID id
 
 - **In-app updates:** Settings → Status → Updates checks GitHub for the latest release, then
   downloads, verifies and installs it and relaunches, asking first.
+- **Add calendar events:** `schedule a meeting today about an exam at 6pm` shows a preview; Return
+  adds it. Calendar questions such as `do I have anything on my calendar today` show your schedule,
+  with or without `>`.
+- **App icon.**
+- **Time zones:** `time in paris`, `3pm montreal in tokyo`, daylight saving included, offline.
+- **Copy Text from Screen:** `ocr` or `copy text from screen`, then select an area.
+- **More conversions:** temperature, volume, area, speed, pressure, energy, power, angles,
+  frequencies, data rates and fuel economy, plus `5 km to miles`-style targets. Conversion labels
+  no longer wrap mid-word.
 
 **0.2.8 changes**
 
@@ -651,7 +756,7 @@ process visibility, selected-text access, last-opened metadata and atomic PID id
   module-cache files on this Mac. The old semantic cache is replaced. Source files are never modified.
 
 The Settings shortcuts, visible version, source-byte accounting and empty filtered-search
-explanations from 0.2.4 remain available. Still not included: OCR, presentations and spreadsheets, hard CPU/RAM
+explanations from 0.2.4 remain available. Still not included: native iWork extraction, Office deep links, hard CPU/RAM
 quotas, copying or deleting files from the agent, system-wide snippet expansion, creating or
 editing calendar events, and changing system settings beyond the commands listed in section 9. The
 related-by-meaning tail and document answers are approximate; check the cited sources.

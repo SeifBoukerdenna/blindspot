@@ -16,9 +16,9 @@ final class IndexDashboardView: NSView {
     private let dot = PlateView(fill: Theme.faint, radius: 4)
     private let title = IndexUI.label("Index", IndexUI.font(20, .semibold), Theme.ink)
     private let subtitle = IndexUI.label("", IndexUI.font(12), Theme.muted, breaking: .byTruncatingMiddle)
-    private let meter = MeterView(height: 5)
-    private let meterCaption = IndexUI.label("", IndexUI.font(11), Theme.muted)
     private let tiles = (0..<4).map { _ in Tile() }
+    private let semantic = Card()
+    private let storage = Card()
     private let busy = NSStackView()
     private let types = Card()
     private let folders = Card()
@@ -27,6 +27,8 @@ final class IndexDashboardView: NSView {
     private let activity = Card()
     private let resources = Card()
     private var last: IndexOverview?
+    private var refreshButton: ActionButton?
+    private var compactButton: ActionButton?
 
     init() {
         super.init(frame: .zero)
@@ -54,18 +56,20 @@ final class IndexDashboardView: NSView {
         pair.spacing = 12
 
         add(header(), after: 0)
-        add(meter, after: 14)
-        add(meterCaption, after: 6)
-        add(tileRow(), after: 16)
+        add(tileRow(), after: 18)
+        add(IndexUI.caption("Search by meaning"), after: 22)
+        add(semantic, after: 8)
         add(busy, after: 14)
-        add(IndexUI.caption("What's indexed"), after: 24)
-        add(pair, after: 8)
         add(IndexUI.caption("Needs attention"), after: 22)
         add(attention, after: 8)
+        add(IndexUI.caption("Indexer activity"), after: 22)
+        add(activity, after: 8)
+        add(IndexUI.caption("Storage"), after: 22)
+        add(storage, after: 8)
+        add(IndexUI.caption("What's indexed"), after: 22)
+        add(pair, after: 8)
         add(IndexUI.caption("Recently changed"), after: 22)
         add(recent, after: 8)
-        add(IndexUI.caption("Activity"), after: 22)
-        add(activity, after: 8)
         add(IndexUI.caption("Resources"), after: 22)
         add(resources, after: 8)
         update(nil)
@@ -95,6 +99,12 @@ final class IndexDashboardView: NSView {
         text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let refresh = ActionButton("Refresh", colour: Theme.accent) { [weak self] in self?.onRefresh?() }
         let compact = ActionButton("Compact", colour: Theme.muted) { [weak self] in self?.onCompact?() }
+        refresh.identifier = NSUserInterfaceItemIdentifier("index.refresh")
+        compact.identifier = NSUserInterfaceItemIdentifier("index.compact")
+        refresh.toolTip = "Rescan your selected folders and retry semantic indexing. No model downloads."
+        compact.toolTip = "Reclaim unused index space. A confirmation explains what will be removed."
+        refreshButton = refresh
+        compactButton = compact
         let row = NSStackView(views: [text, IndexUI.spacer(), compact, refresh])
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -112,9 +122,19 @@ final class IndexDashboardView: NSView {
 
     func update(_ overview: IndexOverview?) {
         guard let overview else {
+            last = nil
             title.stringValue = "Index status unavailable"
             dot.fill(Theme.faint)
-            subtitle.stringValue = "The content index has not reported yet."
+            subtitle.stringValue = "Waiting for an index snapshot. Previous counts are not shown."
+            refreshButton?.isEnabled = false
+            compactButton?.isEnabled = false
+            for (tile, name) in zip(tiles, ["Documents", "Passages", "Embedded", "On disk"]) {
+                tile.set(name, "—", "Waiting for index")
+            }
+            for card in [semantic, storage, types, folders, attention, recent, activity, resources] {
+                card.set([IndexUI.note("Waiting for index status…")])
+            }
+            rebuildBusy([])
             return
         }
         guard overview != last else { return }
@@ -122,21 +142,27 @@ final class IndexDashboardView: NSView {
         last = overview
         updateHeader(overview)
         updateTiles(overview)
+        refreshButton?.isEnabled = !["erasing", "compacting"].contains(overview.state)
+        compactButton?.isEnabled = overview.sampled && !["indexing", "erasing", "compacting", "erased"].contains(overview.state)
+        if previous?.semantic != overview.semantic || previous?.message != overview.message || previous?.sampled != overview.sampled {
+            semantic.set(semanticRows(overview))
+        }
         if previous?.busy != overview.busy { rebuildBusy(overview.busy) }
         if previous?.kinds != overview.kinds { types.set(typeRows(overview)) }
         if previous?.folders != overview.folders { folders.set(folderRows(overview)) }
-        if previous?.attention != overview.attention || previous?.pdfIssues != overview.pdfIssues || previous?.sampled != overview.sampled {
+        if previous?.attention != overview.attention || previous?.pdfIssues != overview.pdfIssues || previous?.sampled != overview.sampled || previous?.partialDocuments != overview.partialDocuments || previous?.semantic.passFailed != overview.semantic.passFailed || previous?.state != overview.state || previous?.message != overview.message || previous?.compactError != overview.compactError || previous?.pacing != overview.pacing {
             attention.set(attentionRows(overview))
         }
         if previous?.recent != overview.recent { recent.set(recentRows(overview)) }
         activity.set(activityRows(overview))
+        storage.set(storageRows(overview))
         resources.set(resourceRows(overview))
     }
 
     private func updateHeader(_ overview: IndexOverview) {
         let (text, colour): (String, NSColor) = switch overview.state {
         case "indexing": ("Indexing", Theme.accent)
-        case "ready": ("Up to date", Theme.ok)
+        case "ready": ("Index pass complete", Theme.ok)
         case "partial": ("Partly indexed", Theme.warn)
         case "paused": ("Paused", Theme.warn)
         case "needsRoots": ("Choose folders to index", Theme.warn)
@@ -167,32 +193,58 @@ final class IndexDashboardView: NSView {
         if overview.state != "indexing", !overview.roots.isEmpty { parts.append("Watching \(overview.roots.joined(separator: ", "))") }
         subtitle.stringValue = parts.joined(separator: "  ·  ")
 
-        let semantic = overview.semantic
-        if semantic.enabled, let eligible = semantic.eligible, let embedded = semantic.embedded, eligible > 0 {
-            meter.fraction = Double(embedded) / Double(eligible)
-            meter.tint(embedded >= eligible ? Theme.ok : Theme.accent)
-            let waiting = eligible > embedded ? "  ·  \(IndexUI.number(eligible - embedded)) waiting" : ""
-            meterCaption.stringValue = "\(IndexUI.number(embedded)) of \(IndexUI.number(eligible)) notes and PDFs searchable by meaning\(waiting)"
-        } else {
-            meter.fraction = 0
-            meterCaption.stringValue = semantic.enabled
-                ? "Search by meaning: counting eligible notes and PDFs…"
-                : "Search by meaning is off — exact-word search only"
-        }
+        subtitle.toolTip = subtitle.stringValue
     }
 
     private func updateTiles(_ overview: IndexOverview) {
-        let issues = overview.pdfIssues?.reduce(0, +) ?? 0
         tiles[0].set("Documents", IndexUI.number(overview.documents),
-                     "\(overview.kinds.count) kinds · \(overview.folders.count) top folders")
-        tiles[1].set("Docs with text", IndexUI.number(overview.pdfText),
-                     issues > 0 ? "\(IndexUI.number(issues)) need attention" : "none need attention")
-        tiles[2].set("By meaning", IndexUI.number(overview.semantic.enabled ? overview.semantic.embedded : nil),
-                     overview.semantic.enabled ? "notes and PDFs" : "off")
+                     "in your local library")
+        tiles[1].set("Passages", IndexUI.number(overview.semantic.eligible), "searchable text chunks")
+        tiles[2].set("Embedded", IndexUI.number(overview.semantic.embedded),
+                     overview.semantic.enabled ? "active-model vectors" : "meaning search is off")
         tiles[3].set("On disk", IndexUI.bytes(overview.disk.database + (overview.disk.cache ?? 0)),
                      (overview.reclaimable ?? 0) > 16 << 20
                          ? "\(IndexUI.bytes(overview.reclaimable ?? 0)) reclaimable"
                          : "cache \(IndexUI.bytes(overview.disk.cache ?? 0))")
+    }
+
+    private func semanticRows(_ overview: IndexOverview) -> [NSView] {
+        let state = overview.semantic
+        var rows = [IndexUI.row(symbol: "sparkles", tint: state.enabled ? Theme.accent : Theme.muted,
+                               title: state.enabled ? "Words + meaning" : "Exact-word search", trailing: "ON THIS MAC")]
+        if !state.enabled {
+            rows.append(IndexUI.note("Search by meaning is off. Stored vectors are retained; enable it in Content settings to use them."))
+        } else if let total = state.eligible, let embedded = state.embedded, overview.sampled {
+            let coverage = total > 0 ? min(Double(embedded) / Double(total), 1) : 0
+            rows.append(IndexUI.row(symbol: "square.stack.3d.up", tint: Theme.muted,
+                title: "\(IndexUI.number(embedded)) of \(IndexUI.number(total)) passages embedded",
+                trailing: total > 0 ? "\(Int(coverage * 100))%" : "—", fraction: coverage))
+            rows.append(IndexUI.note(total == 0
+                ? "No stored passages yet. Choose folders in Content settings, then Refresh to start indexing."
+                : "Coverage of stored passages, not a work queue. Data and spreadsheets stay word-only; code needs selected code folders."))
+        } else {
+            rows.append(IndexUI.note("Measuring passage coverage… Word search and meaning search have separate readiness."))
+        }
+        rows.append(IndexUI.pair("Worker report", overview.message.isEmpty ? "Waiting for worker status" : overview.message))
+        return rows
+    }
+
+    private func storageRows(_ overview: IndexOverview) -> [NSView] {
+        let used = overview.disk.database + (overview.disk.cache ?? 0)
+        var rows: [NSView] = []
+        if let budget = overview.budgetBytes, budget > 0 {
+            rows.append(IndexUI.row(symbol: "internaldrive", tint: Theme.muted,
+                title: "\(IndexUI.bytes(used)) of \(IndexUI.bytes(budget)) target",
+                trailing: used >= budget ? "AT TARGET" : "\(Int(Double(used) / Double(budget) * 100))%",
+                fraction: Double(used) / Double(budget), meterColour: used >= budget ? Theme.warn : Theme.accent))
+        }
+        rows.append(IndexUI.pair("Database", "\(IndexUI.bytes(overview.disk.database)) · includes write-ahead log and shared memory"))
+        rows.append(IndexUI.pair("Vector cache", overview.disk.cache.map(IndexUI.bytes) ?? "Measuring…"))
+        if let reclaimable = overview.reclaimable {
+            rows.append(IndexUI.pair("Reclaimable", "\(IndexUI.bytes(reclaimable)) · use Compact to free unused index space"))
+        }
+        rows.append(IndexUI.note("The storage target stops new batches, not an in-flight write. It is not a hard quota. Source files are never removed by Compact."))
+        return rows
     }
 
     private func rebuildBusy(_ items: [IndexOverview.Busy]) {
@@ -248,17 +300,34 @@ final class IndexDashboardView: NSView {
 
     private func attentionRows(_ overview: IndexOverview) -> [NSView] {
         guard overview.sampled else { return [IndexUI.note("Counting…")] }
-        guard !overview.attention.isEmpty else {
-            let text = overview.pacing.documents ? "Every indexed PDF and Word document produced text" : "PDF and Word extraction is off"
-            return [IndexUI.row(symbol: "checkmark.circle.fill", tint: Theme.ok, title: text)]
+        var rows: [NSView] = []
+        if ["failed", "partial", "eraseFailed"].contains(overview.state) {
+            rows.append(IndexUI.row(symbol: "exclamationmark.triangle.fill", tint: Theme.warn,
+                title: "Indexing needs attention", detail: "Review the worker report above. Refresh retries selected folders."))
         }
-        var rows = overview.attention.prefix(8).map { item in
+        if let failed = overview.semantic.passFailed, failed > 0 {
+            rows.append(IndexUI.row(symbol: "sparkles", tint: Theme.warn,
+                title: "\(IndexUI.number(failed)) passages could not be embedded this pass",
+                detail: "Their indexed text remains searchable by words."))
+        }
+        if let partial = overview.partialDocuments, partial > 0 {
+            rows.append(IndexUI.row(symbol: "doc.badge.ellipsis", tint: Theme.warn,
+                title: "\(IndexUI.number(partial)) documents are partly indexed",
+                detail: "A byte, passage, page or OCR limit was reached."))
+        }
+        if let error = overview.compactError { rows.append(IndexUI.pair("Compact failed", error)) }
+        rows += overview.attention.prefix(8).map { item in
             let path = item.path
             return IndexUI.row(symbol: "exclamationmark.triangle.fill", tint: Theme.warn, title: item.name,
                                detail: "\(item.reason) · \(item.folder)") { IndexUI.reveal(path) }
         }
         let total = Int(overview.pdfIssues?.reduce(0, +) ?? UInt64(overview.attention.count))
-        if total > rows.count { rows.append(IndexUI.note("and \(IndexUI.number(UInt64(total - rows.count))) more")) }
+        if total > min(8, overview.attention.count) { rows.append(IndexUI.note("and \(IndexUI.number(UInt64(total - min(8, overview.attention.count)))) more extraction issues")) }
+        if rows.isEmpty {
+            rows.append(IndexUI.row(symbol: overview.pacing.documents ? "checkmark.circle" : "info.circle", tint: Theme.muted,
+                title: overview.pacing.documents ? "No reported extraction issues" : "PDF and Office extraction is off",
+                detail: "This is worker status, not a database integrity check."))
+        }
         return rows
     }
 
@@ -285,13 +354,13 @@ final class IndexDashboardView: NSView {
         ]
         if pass.sourceBytes > 0 { rows.append(IndexUI.pair("Read this pass", IndexUI.bytes(pass.sourceBytes))) }
         if let embedded = overview.semantic.passEmbedded {
-            rows.append(IndexUI.pair("Embedded this pass", "\(IndexUI.number(embedded)) documents · \(IndexUI.number(overview.semantic.passFailed ?? 0)) failed"))
+            rows.append(IndexUI.pair("Embedded this pass", "\(IndexUI.number(embedded)) passages · \(IndexUI.number(overview.semantic.passFailed ?? 0)) failed"))
         }
         rows.append(IndexUI.pair("Watching", overview.roots.isEmpty ? "No folders" : overview.roots.joined(separator: ", ")))
+        if let text = overview.pdfText { rows.append(IndexUI.pair("Document text", "\(IndexUI.number(text)) PDF / Office documents extracted")) }
         if let compact = overview.compact {
             rows.append(IndexUI.pair("Last compact", "\(IndexUI.bytes(compact.before)) → \(IndexUI.bytes(compact.after)) · \(IndexUI.number(compact.removed)) unused vectors removed"))
         }
-        if let error = overview.compactError { rows.append(IndexUI.pair("Compact", error)) }
         rows.append(IndexUI.pair("Counts", overview.sampleAgo.map { "Sampled \(IndexUI.ago($0))" } ?? "Sampling…"))
         return rows
     }
@@ -302,7 +371,7 @@ final class IndexDashboardView: NSView {
             case "Blindspot": "Blindspot"
             case "semantic": "Semantic model"
             case "vectors": "Vector search"
-            case "extract": "PDF extraction"
+            case "extract": "Document extraction"
             default: process.name
             }
             let cpu = process.cpu.map { String(format: "%.1f%% CPU", $0) } ?? "—"
@@ -334,6 +403,7 @@ enum IndexUI {
         field.lineBreakMode = breaking
         field.maximumNumberOfLines = 1
         field.cell?.truncatesLastVisibleLine = true
+        field.toolTip = text
         field.translatesAutoresizingMaskIntoConstraints = false
         return field
     }
@@ -350,7 +420,7 @@ enum IndexUI {
 
     static func caption(_ text: String) -> NSTextField {
         let field = NSTextField(labelWithString: "")
-        field.attributedStringValue = Theme.label(text.uppercased(), size: 9.5, tracking: 0.12, color: Theme.faint, weight: .medium)
+        field.attributedStringValue = Theme.label(text.uppercased(), size: 10, tracking: 0.10, color: Theme.muted, weight: .medium)
         field.translatesAutoresizingMaskIntoConstraints = false
         return field
     }
@@ -377,7 +447,7 @@ enum IndexUI {
     static func symbolName(forKind label: String) -> String {
         switch label {
         case "Notes & text": "doc.text"
-        case "PDF & Word documents": "doc.richtext"
+        case "PDF & Word documents", "PDF & Office documents": "doc.richtext"
         case "Code": "chevron.left.forwardslash.chevron.right"
         case "Data & config": "tablecells"
         case "Web pages & styles": "globe"
@@ -387,7 +457,8 @@ enum IndexUI {
 
     static func symbolName(forFile name: String) -> String {
         switch (name as NSString).pathExtension.lowercased() {
-        case "pdf", "docx", "doc", "rtf", "odt": "doc.richtext"
+        case "pdf", "docx", "doc", "rtf", "odt", "pptx": "doc.richtext"
+        case "xlsx": "tablecells"
         case "md", "markdown", "txt", "rst": "doc.text"
         case "json", "csv", "tsv", "toml", "yaml", "yml", "xml": "tablecells"
         case "html", "css": "globe"
@@ -513,7 +584,7 @@ enum IndexUI {
 private struct Tile {
     let view = PlateView(fill: Theme.ground, radius: 10, border: Theme.hairline)
     private let caption = IndexUI.caption("")
-    private let value = IndexUI.label("—", IndexUI.font(21, .semibold), Theme.ink)
+    private let value = IndexUI.label("—", .monospacedDigitSystemFont(ofSize: 24, weight: .semibold), Theme.ink)
     private let detail = IndexUI.label("", IndexUI.font(10.5), Theme.muted)
 
     init() {
@@ -526,17 +597,19 @@ private struct Tile {
         detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         view.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 11),
-            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -11),
+            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
+            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -14),
             stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -10),
         ])
     }
 
     func set(_ title: String, _ figure: String, _ note: String) {
-        caption.attributedStringValue = Theme.label(title.uppercased(), size: 9.5, tracking: 0.12, color: Theme.faint, weight: .medium)
+        caption.attributedStringValue = Theme.label(title.uppercased(), size: 9.5, tracking: 0.10, color: Theme.muted, weight: .medium)
         value.stringValue = figure
         detail.stringValue = note
+        value.toolTip = figure
+        detail.toolTip = note
     }
 }
 
@@ -656,6 +729,7 @@ private final class ActionButton: NSButton {
         layer?.cornerCurve = .continuous
         layer?.borderWidth = 1
         layer?.borderColor = colour.withAlphaComponent(0.45).cgColor
+        setAccessibilityLabel(title)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 26).isActive = true
         setContentHuggingPriority(.required, for: .horizontal)

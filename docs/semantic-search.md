@@ -70,7 +70,7 @@ million-document nor ten-million-document native embedding generation has been m
 ```sh
 MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --release --manifest-path core/Cargo.toml \
   --example embedding_scan
-core/target/release/examples/embedding_scan 1000 \
+target/release/examples/embedding_scan 1000 \
   "$PWD/build/Blindspot.app/Contents/Helpers/blindspot-semantic"
 ```
 
@@ -220,7 +220,7 @@ claim against the standalone ANN probe's different query workload.
 ```sh
 MACOSX_DEPLOYMENT_TARGET=26.0 cargo build --release --manifest-path core/Cargo.toml \
   --example vector_roundtrip
-core/target/release/examples/vector_roundtrip 10000 \
+target/release/examples/vector_roundtrip 10000 \
   "$PWD/build/Blindspot.app/Contents/Helpers/blindspot-vectors"
 ```
 

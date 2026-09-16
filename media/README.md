@@ -37,6 +37,21 @@ shown belong to the small demo fixture; they are not a performance benchmark.
 
 [![1500 MB converted to GiB, GB and bytes](calculator.png)](calculator.png)
 
+### Time zones
+
+`3pm montreal in tokyo` converts between two places and shows both clocks, with daylight saving
+taken from the zone files macOS already keeps. `time in paris` shows the time there.
+
+[![Time zone conversion showing Tokyo, Montreal and the difference between them](time-zones.png)](time-zones.png)
+
+### Unit conversions
+
+`5 ft 11 in` answers in the other system. Temperatures, volumes, areas, speeds, pressure, energy,
+power, angles, frequencies, data rates and fuel economy convert the same way, and `5 km to miles`
+answers in one unit you name.
+
+[![Feet and inches converted to metres and centimetres](units.png)](units.png)
+
 ### Command catalog
 
 Type `:` to discover available commands and their descriptions.

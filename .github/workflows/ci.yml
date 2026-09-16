@@ -47,7 +47,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-registry-${{ runner.os }}-${{ hashFiles('core/Cargo.lock', 'helpers/vector-worker/Cargo.lock') }}
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'helpers/vector-worker/Cargo.lock') }}
           restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: Cache cbindgen
@@ -63,7 +63,7 @@ jobs:
 
       - name: Fetch locked dependencies
         run: |
-          cargo fetch --locked --manifest-path core/Cargo.toml
+          cargo fetch --locked
           cargo fetch --locked --manifest-path helpers/vector-worker/Cargo.toml
 
       - name: C header matches ffi.rs
@@ -74,6 +74,9 @@ jobs:
 
       - name: Core tests
         run: make test
+
+      - name: Retrieval tests
+        run: make test-retrieval
 
       - name: Build and sign the app (ad hoc)
         run: make sign SIGN_ID=-

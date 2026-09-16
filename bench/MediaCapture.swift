@@ -40,7 +40,11 @@ private final class Director: NSObject, NSApplicationDelegate {
     private let environment = ProcessInfo.processInfo.environment
     private lazy var output = URL(fileURLWithPath: environment["MEDIA_OUT"] ?? "media")
     private lazy var work = URL(fileURLWithPath: environment["MEDIA_WORK"] ?? "build/media")
-    private lazy var useModel = environment["MEDIA_AI"] == "1"
+    private lazy var useModel = environment["MEDIA_AI"] == "1" && wanted("ask-your-documents")
+    /// MEDIA_ONLY=time-zones,units re-takes part of the set without disturbing the rest.
+    private lazy var only = Set((environment["MEDIA_ONLY"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+
+    private func wanted(_ name: String) -> Bool { only.isEmpty || only.contains(name) }
 
     private var core: Core!
     private var watcher: ClipboardWatcher!
@@ -116,6 +120,16 @@ private final class Director: NSObject, NSApplicationDelegate {
             try await self.setQuery("1500MB")
             try await self.settle(minimum: 1)
             try await self.still("calculator")
+        }
+        await scene("time-zones") {
+            try await self.setQuery("3pm montreal in tokyo")
+            try await self.settle(minimum: 3)
+            try await self.still("time-zones")
+        }
+        await scene("units") {
+            try await self.setQuery("5 ft 11 in")
+            try await self.settle(minimum: 2)
+            try await self.still("units")
         }
         await scene("system-commands") {
             try await self.setQuery(":system")
@@ -370,6 +384,7 @@ private final class Director: NSObject, NSApplicationDelegate {
     // MARK: - Capture
 
     private func scene(_ name: String, _ body: @MainActor () async throws -> Void) async {
+        guard wanted(name) else { return }
         do {
             try await body()
             print("captured \(name)")
@@ -392,13 +407,17 @@ private final class Director: NSObject, NSApplicationDelegate {
     }
 
     private func still(_ name: String, window: NSWindow? = nil) async throws {
-        try await Task.sleep(for: .milliseconds(250))
+        // Without the insertion point, macOS's caret-attached hints (a Universal Clipboard offer,
+        // say) cannot float over the panel in a published screenshot.
+        if window == nil { panel.makeFirstResponder(nil) }
+        try await Task.sleep(for: .milliseconds(400))
         if window == nil, let found = leaks(results.matches).first {
             throw Failure("refusing to capture: \(found) points outside the demo home")
         }
         let target = output.appendingPathComponent("\(name).png").path
         let process = try launch(["-x", "-t", "png", "-R", region(around: window ?? panel), target])
         try await finish(process, "screenshot \(name)")
+        if window == nil { panel.makeFirstResponder(field) }
     }
 
     private func record(_ name: String, seconds: Int, height: CGFloat, _ body: @MainActor () async throws -> Void) async throws {

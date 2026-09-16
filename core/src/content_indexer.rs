@@ -1,7 +1,7 @@
 //! Incremental local text indexing. Call only from a background indexing worker.
 
 use crate::content::{
-    self, ContentStore, Document, Extraction, ScanOutcome, MAX_BATCH, MAX_BODY_BYTES,
+    self, ContentStore, Document, Extraction, ScanOutcome, MAX_BATCH, MAX_PASSAGE_BYTES,
 };
 use crate::ffi::index_native::{Directory, Kind};
 use std::io::Read;
@@ -33,7 +33,7 @@ const TEXT_EXTENSIONS: &[&str] = &[
     "css", "rs", "swift", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "cpp", "hpp",
     "rb", "sh", "sql",
 ];
-const DOCUMENT_EXTENSIONS: &[&str] = &["pdf", "docx", "doc", "rtf", "odt"];
+const DOCUMENT_EXTENSIONS: &[&str] = &["pdf", "docx", "doc", "rtf", "odt", "pptx", "xlsx"];
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -44,6 +44,8 @@ pub struct Policy {
     pub documents: bool,
     pub max_document_bytes: u64,
     pub extractor: Option<PathBuf>,
+    pub storage_budget_bytes: u64,
+    pub ocr_pages: u32,
 }
 
 impl Default for Policy {
@@ -56,6 +58,8 @@ impl Default for Policy {
             documents: false,
             max_document_bytes: 32 * 1_048_576,
             extractor: None,
+            storage_budget_bytes: 3 * 1024 * 1024 * 1024,
+            ocr_pages: 0,
         }
     }
 }
@@ -72,6 +76,7 @@ pub struct Progress {
     /// Written records the semantic stage would embed; zero lets a pass skip that stage.
     pub semantic_updates: u64,
     pub complete: bool,
+    pub budget_exhausted: bool,
 }
 
 struct Record {
@@ -83,6 +88,9 @@ struct Record {
     changed_ns: i64,
     bytes: u64,
     extraction: Extraction,
+    extraction_version: i64,
+    partial: bool,
+    ocr_pages: Vec<u32>,
 }
 
 impl Record {
@@ -184,6 +192,11 @@ fn walk(
             report(progress);
             pause(policy.batch_pause, cancel)?;
         }
+        if (progress.visited == 0 || progress.visited.is_multiple_of(MAX_BATCH as u64))
+            && store.storage_bytes()? >= policy.storage_budget_bytes {
+            progress.budget_exhausted=true;
+            return Ok(false);
+        }
         if progress.visited >= policy.max_entries {
             return Ok(false);
         }
@@ -225,7 +238,12 @@ fn walk(
                     continue;
                 }
                 match load(store, scan, directory, &child_path, &entry.name, policy, cancel) {
-                    Ok(Loaded::Record(record)) => batch.push(record),
+                    Ok(Loaded::Record(record)) => {
+                        batch.push(record);
+                        if batch.iter().map(|record| record.body.len()).sum::<usize>() >= 8 * 1024 * 1024 {
+                            flush(store, scan, batch, progress)?;
+                        }
+                    },
                     Ok(Loaded::Unchanged) => progress.unchanged += 1,
                     Ok(Loaded::Skipped) => progress.skipped += 1,
                     Err(content::Error::Io(_)) => {
@@ -277,6 +295,11 @@ pub fn scan_paths(
     let mut batch = Vec::<Record>::with_capacity(MAX_BATCH);
     let mut checkpoint = 0;
     for target in targets {
+        if store.storage_bytes()? >= policy.storage_budget_bytes {
+            progress.budget_exhausted=true;
+            complete=false;
+            break;
+        }
         if cancel.load(Ordering::Acquire) {
             return Err(content::Error::Cancelled);
         }
@@ -391,13 +414,15 @@ fn load(
     let identity = identity(&metadata)?;
     let modified_ns = modified_ns(&metadata);
     let changed_ns = changed_ns(&metadata);
-    if store.mark_unchanged(
+    let extraction_version=if path.extension().is_some_and(|ext|ext.eq_ignore_ascii_case("pdf")) && policy.ocr_pages>0 {1000+i64::from(policy.ocr_pages)} else {1};
+    if store.mark_unchanged_version(
         scan,
         &identity,
         path,
         modified_ns,
         changed_ns,
         metadata.len(),
+        extraction_version,
     )? {
         return Ok(Loaded::Unchanged);
     }
@@ -433,8 +458,8 @@ fn load(
             )?;
             return Ok(Loaded::Skipped);
         };
-        match extract_document(&file, extractor, kind, MAX_BODY_BYTES, cancel)? {
-            Ok((status, text)) => {
+        match extract_document(&file, extractor, kind, MAX_PASSAGE_BYTES, policy.ocr_pages, cancel)? {
+            Ok((status, text, partial, ocr_pages)) => {
                 if status == Extraction::Extracted {
                     let after = file.metadata()?;
                     if metadata.len() != after.len()
@@ -457,6 +482,9 @@ fn load(
                         changed_ns,
                         bytes: metadata.len(),
                         extraction: status,
+                        extraction_version,
+                        partial,
+                        ocr_pages,
                     }));
                 }
                 store.mark_extraction_failure(
@@ -488,7 +516,7 @@ fn load(
     }
     let mut bytes = Vec::new();
     (&mut file)
-        .take(MAX_BODY_BYTES as u64)
+        .take(MAX_PASSAGE_BYTES as u64)
         .read_to_end(&mut bytes)?;
     let end = match std::str::from_utf8(&bytes) {
         Ok(_) => bytes.len(),
@@ -523,6 +551,9 @@ fn load(
         changed_ns,
         bytes: metadata.len(),
         extraction: Extraction::Text,
+        extraction_version,
+        partial: metadata.len() > end as u64,
+        ocr_pages: Vec::new(),
     }))
 }
 
@@ -530,15 +561,22 @@ fn load(
 struct HelperResponse {
     status: String,
     text: Option<String>,
+    #[serde(default)]
+    partial: bool,
+    #[serde(default,rename="ocrPages")]
+    ocr_pages: Vec<u32>,
 }
+
+type ExtractionOutput = (Extraction,Option<String>,bool,Vec<u32>);
 
 fn extract_document(
     file: &std::fs::File,
     extractor: &Path,
     kind: &str,
     max_bytes: usize,
+    ocr_pages: u32,
     cancel: &AtomicBool,
-) -> content::Result<std::result::Result<(Extraction, Option<String>), Extraction>> {
+) -> content::Result<std::result::Result<ExtractionOutput, Extraction>> {
     if !extractor.is_absolute() || !extractor.is_file() {
         return Ok(Err(Extraction::Unreadable));
     }
@@ -548,7 +586,7 @@ fn extract_document(
         .set_read_timeout(Some(Duration::from_millis(25)))
         .map_err(content::Error::Io)?;
     let mut child = Command::new(extractor)
-        .args(["--index", kind, &max_bytes.to_string(), "100"])
+        .args(["--index", kind, &max_bytes.to_string(), "100", &ocr_pages.min(100).to_string()])
         .stdin(Stdio::from(input))
         .stdout(Stdio::from(OwnedFd::from(peer)))
         .stderr(Stdio::null())
@@ -580,7 +618,7 @@ fn extract_document(
                 Ok(0) => eof = true,
                 Ok(count) => {
                     bytes.extend_from_slice(&buffer[..count]);
-                    if bytes.len() > 262_144 {
+                    if bytes.len() > 16 * 1024 * 1024 {
                         let _ = child.kill();
                         let _ = child.wait();
                         return Ok(Err(Extraction::Unreadable));
@@ -639,11 +677,14 @@ fn extract_document(
     if response
         .text
         .as_ref()
-        .is_some_and(|text| text.len() > MAX_BODY_BYTES)
+        .is_some_and(|text| text.len() > max_bytes.min(MAX_PASSAGE_BYTES))
     {
         return Ok(Err(Extraction::Unreadable));
     }
-    Ok(Ok((status, response.text)))
+    if response.ocr_pages.len()>100 || response.ocr_pages.iter().any(|page| !(1..=100).contains(page)) {
+        return Ok(Err(Extraction::Unreadable));
+    }
+    Ok(Ok((status, response.text, response.partial, response.ocr_pages)))
 }
 
 fn flush(
@@ -655,12 +696,15 @@ fn flush(
     if batch.is_empty() {
         return Ok(());
     }
-    store.put_batch(
+    let ids=store.put_batch(
         scan,
         &batch.iter().map(Record::document).collect::<Vec<_>>(),
     )?;
+    for ((id,_),record) in ids.into_iter().zip(batch.iter()) {
+        store.set_extraction_metadata(id,record.extraction_version,record.partial,&record.ocr_pages)?;
+    }
     progress.indexed += batch.len() as u64;
-    progress.semantic_updates += batch.iter().filter(|record| content::semantic_eligible(&record.path, record.extraction)).count() as u64;
+    progress.semantic_updates += batch.iter().filter(|record| content::chunk_eligible(&record.path, record.extraction)).count() as u64;
     progress.indexed_bytes += batch.iter().map(|record| record.bytes).sum::<u64>();
     batch.clear();
     Ok(())
@@ -748,6 +792,7 @@ fn supported(path: &Path, documents: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::MAX_BODY_BYTES;
     use std::sync::Arc;
 
 
@@ -968,6 +1013,21 @@ mod tests {
     }
 
     #[test]
+    fn long_source_is_chunked_beyond_the_legacy_excerpt() {
+        let fixture = Fixture::new();
+        let root = fixture.root();
+        let mut store = fixture.store();
+        std::fs::write(root.join("long.md"), format!("{}\n\nlateuniquepassage", "ordinary paragraph\n\n".repeat(4000))).unwrap();
+        let policy = Policy::default();
+        assert_eq!(scan(&mut store, &root, &policy).indexed, 1);
+        assert!(find(&store, "lateuniquepassage").is_empty());
+        let passages = store.passages("lateuniquepassage", 10, Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(passages.len(), 1);
+        assert!(passages[0].line > 1);
+        assert_eq!(scan(&mut store, &root, &policy).unchanged, 1);
+    }
+
+    #[test]
     #[ignore = "requires the native PDF extraction helper"]
     fn native_pdf_is_indexed_and_searchable() {
         let fixture = Fixture::new();
@@ -1008,6 +1068,7 @@ mod tests {
             &helper,
             "pdf",
             MAX_BODY_BYTES,
+            0,
             &AtomicBool::new(false),
         )
         .expect("capture")
@@ -1037,7 +1098,7 @@ mod tests {
         });
         let started = std::time::Instant::now();
         assert!(matches!(
-            extract_document(&file, &helper, "pdf", MAX_BODY_BYTES, &cancel),
+            extract_document(&file, &helper, "pdf", MAX_BODY_BYTES, 0, &cancel),
             Err(content::Error::Cancelled)
         ));
         assert!(started.elapsed() < Duration::from_millis(500));

@@ -17,6 +17,8 @@
 
 #define MAX_BODY_BYTES 65536
 
+#define MAX_PASSAGE_BYTES ((2 * 1024) * 1024)
+
 #define MAX_BATCH 256
 
 #define MAX_CANDIDATES 10000
@@ -241,6 +243,19 @@
 #define SNIPPET_PREFIX '!'
 
 /**
+ * The largest batch this client accepts, so callers size their work without knowing which
+ * transport they hold. See [`Client::embed`] for the rest of the limits.
+ */
+#define Client_BATCH 8
+
+/**
+ * A batch large enough to keep the model busy and small enough that one failure costs little.
+ * The plan's 32–64 range, taken at its lower end because a chunk is far larger than a document
+ * title and the request body is bounded below.
+ */
+#define BATCH 32
+
+/**
  * Spotlight's usage score at or above which an app counts as recently used: one use four
  * weeks ago at the default 14-day half-life (`0.5^(28/14)`).
  */
@@ -288,6 +303,12 @@ typedef struct {
    */
   uint32_t width;
   uint32_t height;
+  /**
+   * Where a content passage sits in its file: page for an extracted document, line for text
+   * and code, zero when the row is not a passage. Swift shows it and opens there.
+   */
+  uint32_t page;
+  uint32_t line;
   /**
    * A tool row's subtitle — "binary", "ISO 8601", "decoded". NULL for everything else.
    * For an epoch, `timestamp` carries the instant too, because only Swift knows the
@@ -931,6 +952,16 @@ void bs_free_results(BsResults results);
  * with no other call on it in flight or afterwards.
  */
 void bs_shutdown(BsHandle *handle);
+
+/**
+ * Reads one immutable indexed passage. Call on a worker; free with `bs_free_blob`.
+ * Returns an empty blob when the row is stale, out of scope or unavailable.
+ *
+ * # Safety
+ * `handle` must be NULL or live for this call. `path` must be NULL or a valid
+ * NUL-terminated UTF-8 string. Concurrent calls are supported.
+ */
+BsBlob bs_content_passage(const BsHandle *handle, uint64_t row_id, const char *path);
 
 #ifdef __cplusplus
 }  // extern "C"

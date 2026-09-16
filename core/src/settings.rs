@@ -182,9 +182,34 @@ pub static SCHEMA: &[SettingDef] = &[
         key: "content.semantic",
         section: Section::Content,
         label: "Search by meaning",
-        help: "Add on-device semantic matches for indexed English text. Uses an installed local model; ordinary text search remains available. Off retains vectors until Erase index.",
+        help: "Search indexed passages with the installed Ollama embedding model, with Apple fallback. Off retains vectors; text search stays available.",
         kind: Kind::Flag,
         live: true,
+    },
+    SettingDef {
+        key: "content.embedding_model", section: Section::Content, label: "Embedding model",
+        help: "Installed Ollama model for passages, separate from the question model. Empty uses Apple. No models are downloaded.",
+        kind: Kind::Text, live: true,
+    },
+    SettingDef {
+        key: "content.ocr", section: Section::Content, label: "Read scanned PDF pages",
+        help: "Use local OCR only on PDF pages without usable text. Turning this on revisits previously indexed PDFs.",
+        kind:Kind::Flag,live:true,
+    },
+    SettingDef {
+        key: "content.ocr_pages", section: Section::Content, label: "OCR pages per PDF",
+        help: "Maximum scanned pages attempted per document, within the 100-page extraction limit. Unread pages are marked partly indexed.",
+        kind:Kind::Count {min:1,max:100},live:true,
+    },
+    SettingDef {
+        key: "content.index_budget_mb", section: Section::Content, label: "Index budget (MiB)",
+        help: "Pause new indexing when database, journal and vector files reach this target. In-flight batches may overshoot; existing results are retained.",
+        kind: Kind::Count { min:256,max:32768 }, live:true,
+    },
+    SettingDef {
+        key: "content.code_roots", section: Section::Content, label: "Code folders",
+        help: "Choose folders whose code may be embedded. Existing content folders keep exact code search. Generated folders are excluded; .gitignore is not applied.",
+        kind: Kind::Paths, live: true,
     },
     SettingDef {
         key: "content.roots",
@@ -206,7 +231,7 @@ pub static SCHEMA: &[SettingDef] = &[
         key: "content.max_file_mb",
         section: Section::Content,
         label: "Maximum source size (MiB)",
-        help: "Larger files are skipped. At most 64 KiB of text is indexed from each supported file.",
+        help: "Larger files are skipped. At most 2 MiB of text and 400 passages are indexed from each supported file.",
         kind: Kind::Count { min: 1, max: 16 },
         live: true,
     },
@@ -221,8 +246,8 @@ pub static SCHEMA: &[SettingDef] = &[
     SettingDef {
         key: "content.documents",
         section: Section::Content,
-        label: "Index PDF and Word documents",
-        help: "Extract text from PDF, DOCX, DOC, RTF and ODT files in the indexed folders using an isolated local helper with no network access. Scanned, locked and oversized documents are counted but have no searchable body.",
+        label: "Index PDF and Office documents",
+        help: "Extract PDF, DOCX, DOC, RTF, ODT, PPTX and cached XLSX text in an isolated no-network helper. Scanned PDFs need the separate OCR option; locked and oversized documents are counted.",
         kind: Kind::Flag,
         live: true,
     },
@@ -230,7 +255,7 @@ pub static SCHEMA: &[SettingDef] = &[
         key: "content.max_document_mb",
         section: Section::Content,
         label: "Maximum document size (MiB)",
-        help: "PDF files larger than this are listed by filename only. At most 64 KiB of text and 100 pages are indexed per document.",
+        help: "Documents larger than this are listed by filename only. At most 2 MiB of text, 400 passages and 100 PDF pages are indexed per document.",
         kind: Kind::Count { min: 1, max: 128 },
         live: true,
     },
@@ -410,6 +435,11 @@ pub fn read(config: &Config, key: &str) -> Option<String> {
         "clips.ocr" => config.clips.ocr.to_string(),
         "content.enabled" => config.content.enabled.to_string(),
         "content.semantic" => config.content.semantic.to_string(),
+        "content.embedding_model" => config.content.embedding_model.clone(),
+        "content.index_budget_mb" => config.content.index_budget_mb.to_string(),
+        "content.ocr" => config.content.ocr.to_string(),
+        "content.ocr_pages" => config.content.ocr_pages.to_string(),
+        "content.code_roots" => join(&config.content.code_roots),
         "content.roots" => join(&config.content.roots),
         "content.excluded_paths" => join(&config.content.excluded_paths),
         "content.max_file_mb" => config.content.max_file_mb.to_string(),
@@ -457,6 +487,11 @@ fn write(config: &mut Config, key: &str, value: &str) -> bool {
         "clips.ocr" => config.clips.ocr = value == "true",
         "content.enabled" => config.content.enabled = value == "true",
         "content.semantic" => config.content.semantic = value == "true",
+        "content.embedding_model" => config.content.embedding_model = value.trim().to_owned(),
+        "content.index_budget_mb" => match value.parse() { Ok(n)=>config.content.index_budget_mb=n,Err(_)=>return false },
+        "content.ocr" => config.content.ocr=value=="true",
+        "content.ocr_pages" => match value.parse() { Ok(n)=>config.content.ocr_pages=n,Err(_)=>return false },
+        "content.code_roots" => config.content.code_roots = split(value),
         "content.roots" => config.content.roots = split(value),
         "content.excluded_paths" => config.content.excluded_paths = split(value),
         "content.max_file_mb" => match value.parse() {
@@ -521,10 +556,15 @@ pub fn validate(def: &SettingDef, value: &str) -> Result<(), String> {
                 Err("must be an http or https address containing {query}, or empty".to_owned())
             }
         }
+        Kind::Text if def.key == "content.embedding_model" => {
+            if value.len() <= 96 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_:./".contains(&byte)) {
+                Ok(())
+            } else { Err("Use an installed model name of at most 96 ASCII characters, or empty for Apple".into()) }
+        }
         Kind::Text => Ok(()),
         Kind::Paths if def.key.starts_with("content.") => {
             let paths = split(value);
-            let limit = if def.key == "content.roots" { 32 } else { 128 };
+            let limit = if matches!(def.key,"content.roots"|"content.code_roots") { 32 } else { 128 };
             if paths.len() > limit
                 || paths.iter().any(|path| {
                     path.len() > 4096

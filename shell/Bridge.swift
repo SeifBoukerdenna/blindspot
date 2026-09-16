@@ -73,6 +73,10 @@ struct Match: Identifiable, Equatable {
     /// Which characters of `name` the query matched, as Unicode scalar offsets. Empty
     /// for every row nothing was typed at.
     let highlights: [Int]
+    /// Where a content passage sits in its file: page for an extracted document, line for text
+    /// and code. Zero for every row that is not a passage.
+    var page: Int = 0
+    var line: Int = 0
     var processPID: UInt32 = 0
     var portNumber: UInt16 = 0
     var targetPID: UInt64 { processPID == 0 ? id : UInt64(processPID) }
@@ -187,6 +191,7 @@ final class Core {
 
     /// The one entry point safe to call off the main thread. See `ClipSink`.
     nonisolated let clipSink: ClipSink
+    nonisolated var passageReader: PassageReader { PassageReader(owner: clipSink.owner) }
 
     /// Fails only if the core could not initialise at all. A malformed config is not a
     /// failure — Rust falls back to defaults and logs, because a typo in a TOML file
@@ -438,6 +443,7 @@ final class Core {
                 height: Int(result.height),
                 detail: string(result.detail, result.detail_len),
                 highlights: offsets(result.highlights, result.highlights_len),
+                page: Int(result.page), line: Int(result.line),
                 processPID: result.process_pid, portNumber: result.network_port
             )
         }
@@ -579,6 +585,8 @@ struct IndexOverview: Decodable, Sendable, Equatable {
     let roots: [String]
     let semantic: Semantic
     let documents, pdfText: UInt64?
+    var partialDocuments: UInt64? = nil
+    var budgetBytes: UInt64? = nil
     let pdfIssues: [UInt64]?
     let disk: Disk
     let processes: [Process]
@@ -703,6 +711,20 @@ struct ClipSink: Sendable {
                         height: UInt32(clamping: height))
                     withHandle { bs_clip_add($0, &clip) }
                 }
+            }
+        }
+    }
+}
+
+struct PassageReader: Sendable {
+    fileprivate let owner: NativeCoreOwner
+    func text(rowID: UInt64, path: String) -> String? {
+        withExtendedLifetime(owner) {
+            path.withCString { path in
+                let blob = bs_content_passage(owner.handle, rowID, path)
+                defer { bs_free_blob(blob) }
+                guard let bytes = blob.data, blob.len > 0, blob.len <= 8192 else { return nil }
+                return String(decoding: UnsafeBufferPointer(start: bytes, count: blob.len), as: UTF8.self)
             }
         }
     }

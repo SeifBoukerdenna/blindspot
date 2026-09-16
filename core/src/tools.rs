@@ -1,5 +1,6 @@
-//! Converters, alongside the calculator: epochs; bytes, durations, lengths and weights;
-//! encoders and IDs.
+//! Converters, alongside the calculator: epochs; units (bytes, durations, lengths, weights,
+//! temperature, volume, area, speed, pressure, energy, power, angles, frequencies, data rates and
+//! fuel economy); time zones; encoders and IDs.
 //!
 //! Each tool is a detector keyed on the *shape* of the query — `@1757548800`, `1500MB`,
 //! `b64 …` — never on natural language, which CLAUDE.md rules out. A detector returns several
@@ -7,6 +8,8 @@
 //! count is wanted in GiB for a dashboard and as a raw integer for a config file.
 
 use std::io::Read;
+
+mod timezones;
 
 /// One copyable answer. `value` is what Enter copies; `detail` is the row's subtitle.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,7 +41,7 @@ pub fn evaluate(query: &str) -> Vec<ToolRow> {
         && !query.chars().any(char::is_whitespace) {
         return vec![ToolRow::new(query.to_owned(),"URL · Return to open; actions to copy or extract domain")];
     }
-    let detectors: [Detector; 10] = [
+    let detectors: [Detector; 11] = [
         epoch,
         now,
         uuid,
@@ -49,6 +52,7 @@ pub fn evaluate(query: &str) -> Vec<ToolRow> {
         hex_tool,
         hex_literal,
         units,
+        time_zones,
     ];
     detectors
         .into_iter()
@@ -488,7 +492,9 @@ fn integer_rows(value: f64, from_hex: bool) -> Option<Vec<ToolRow>> {
 /// matter. For a length or a weight that means the other system — metric in, imperial out,
 /// and the reverse.
 fn units(query: &str) -> Option<Vec<ToolRow>> {
-    let pairs = pairs(query)?;
+    let normalized = normalize_units(query);
+    let (source, target) = explicit_target(&normalized);
+    let pairs = pairs(source)?;
     let mut readings: Vec<Vec<Unit>> = Vec::with_capacity(pairs.len());
     for (i, (_, name)) in pairs.iter().enumerate() {
         let options = if name.is_empty() {
@@ -518,11 +524,24 @@ fn units(query: &str) -> Option<Vec<ToolRow>> {
         else {
             continue;
         };
-        let total: f64 = pairs
-            .iter()
-            .zip(&units)
-            .map(|((n, _), u)| n * u.factor)
-            .sum();
+        // Offsets and reciprocal scales do not add up (`5c 3f` means nothing), and only a
+        // temperature is meaningfully below zero.
+        if pairs.len() > 1 && units.iter().any(|u| !u.linear()) {
+            continue;
+        }
+        if dimension != Dimension::Temperature && pairs.iter().any(|(n, _)| *n < 0.0) {
+            continue;
+        }
+        let total: f64 = pairs.iter().zip(&units).map(|((n, _), u)| u.to_base(*n)).sum();
+        if !total.is_finite() {
+            continue;
+        }
+        if let Some((typed, choices)) = &target {
+            if let Some(unit) = choices.iter().find(|u| u.dimension == dimension) {
+                rows.push(target_row(total, *unit, typed));
+            }
+            continue;
+        }
         let from_imperial = units.iter().all(|u| u.imperial);
         let from_metric = units.iter().all(|u| !u.imperial);
         rows.extend(match dimension {
@@ -542,9 +561,15 @@ fn units(query: &str) -> Option<Vec<ToolRow>> {
                 imperial_mass,
                 metric_mass,
             ),
+            Dimension::DataRate => data_rate_rows(total, &units),
+            other => display_rows(other, total, &units),
         });
     }
     (!rows.is_empty()).then_some(rows)
+}
+
+fn time_zones(query: &str) -> Option<Vec<ToolRow>> {
+    timezones::evaluate(query)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -553,32 +578,87 @@ enum Dimension {
     Duration,
     Length,
     Mass,
+    Temperature,
+    Volume,
+    Area,
+    Speed,
+    Pressure,
+    Energy,
+    Power,
+    Angle,
+    Frequency,
+    DataRate,
+    Fuel,
 }
 
-/// A unit's size in its dimension's base — bytes, seconds, metres, kilograms — and whether
-/// it is imperial, which decides which way a length or a weight converts.
+/// A unit's size in its dimension's base, and whether it is imperial, which decides which way a
+/// length, weight, volume or area converts. Bases: bytes, seconds, metres, kilograms, kelvin,
+/// litres, square metres, metres per second, pascals, joules, watts, radians, hertz, bits per
+/// second and litres per 100 km. For data rates `imperial` marks bytes per second.
 #[derive(Clone, Copy, Debug)]
 struct Unit {
     dimension: Dimension,
     factor: f64,
     imperial: bool,
+    /// Added after scaling: only temperatures have one.
+    offset: f64,
+    /// `base = factor / amount`: fuel economy in mpg or km/L against L/100 km.
+    inverse: bool,
+}
+
+impl Unit {
+    fn to_base(self, amount: f64) -> f64 {
+        if self.inverse {
+            self.factor / amount
+        } else {
+            amount * self.factor + self.offset
+        }
+    }
+
+    fn in_unit(self, base: f64) -> f64 {
+        if self.inverse {
+            self.factor / base
+        } else {
+            (base - self.offset) / self.factor
+        }
+    }
+
+    fn linear(self) -> bool {
+        self.offset == 0.0 && !self.inverse
+    }
+
+    fn same(self, other: Unit) -> bool {
+        self.dimension == other.dimension
+            && self.factor == other.factor
+            && self.offset == other.offset
+            && self.inverse == other.inverse
+    }
 }
 
 /// Every reading of a unit name. One, except for `m`: metres and minutes are both `m`, and
 /// a launcher cannot know which you meant. Metres come first — the SI meaning, and the one
 /// a conversion is usually wanted for — with minutes after, so `90m` still says `1h 30m`.
 fn readings_of(name: &str) -> Vec<Unit> {
-    use Dimension::{Bytes, Duration, Length, Mass};
+    use Dimension::{
+        Angle, Area, Bytes, DataRate, Duration, Energy, Frequency, Fuel, Length, Mass, Power,
+        Pressure, Speed, Temperature, Volume,
+    };
     let si = |dimension, factor| Unit {
         dimension,
         factor,
         imperial: false,
+        offset: 0.0,
+        inverse: false,
     };
     let imperial = |dimension, factor| Unit {
         dimension,
         factor,
         imperial: true,
+        offset: 0.0,
+        inverse: false,
     };
+    // The US gallon is exactly 231 cubic inches; the smaller US measures divide it exactly.
+    const GALLON: f64 = 3.785_411_784;
     let unit = match name.to_ascii_lowercase().as_str() {
         "m" => return vec![si(Length, 1.0), si(Duration, 60.0)],
 
@@ -624,6 +704,87 @@ fn readings_of(name: &str) -> Vec<Unit> {
         "lb" | "lbs" | "pound" | "pounds" => imperial(Mass, 0.453_592_37),
         "st" | "stone" | "stones" => imperial(Mass, 0.453_592_37 * 14.0),
 
+        // Not a lone `k`: `5k` means five thousand far more often than five kelvin.
+        "c" | "\u{b0}c" | "celsius" => Unit {
+            offset: 273.15,
+            ..si(Temperature, 1.0)
+        },
+        "f" | "\u{b0}f" | "fahrenheit" => Unit {
+            offset: 273.15 - 32.0 * 5.0 / 9.0,
+            ..imperial(Temperature, 5.0 / 9.0)
+        },
+        "kelvin" | "kelvins" | "\u{b0}k" => si(Temperature, 1.0),
+
+        "\u{b0}" | "deg" | "degree" | "degrees" => si(Angle, std::f64::consts::PI / 180.0),
+        "rad" | "radian" | "radians" => si(Angle, 1.0),
+
+        "ml" | "milliliter" | "milliliters" | "millilitre" | "millilitres" => si(Volume, 1e-3),
+        "cl" => si(Volume, 1e-2),
+        "dl" => si(Volume, 1e-1),
+        "l" | "liter" | "liters" | "litre" | "litres" => si(Volume, 1.0),
+        "tsp" | "teaspoon" | "teaspoons" => imperial(Volume, GALLON / 768.0),
+        "tbsp" | "tablespoon" | "tablespoons" => imperial(Volume, GALLON / 256.0),
+        "floz" => imperial(Volume, GALLON / 128.0),
+        "cup" | "cups" => imperial(Volume, GALLON / 16.0),
+        "pt" | "pint" | "pints" => imperial(Volume, GALLON / 8.0),
+        "qt" | "quart" | "quarts" => imperial(Volume, GALLON / 4.0),
+        "gal" | "gallon" | "gallons" => imperial(Volume, GALLON),
+
+        "sqm" => si(Area, 1.0),
+        "ha" | "hectare" | "hectares" => si(Area, 1e4),
+        "sqkm" => si(Area, 1e6),
+        "sqft" => imperial(Area, 0.092_903_04),
+        "acre" | "acres" => imperial(Area, 4_046.856_422_4),
+        "sqmi" => imperial(Area, 2_589_988.110_336),
+
+        "kmh" => si(Speed, 1.0 / 3.6),
+        "mps" => si(Speed, 1.0),
+        "mph" => imperial(Speed, 0.447_04),
+        "kn" | "kt" | "knot" | "knots" => si(Speed, 1_852.0 / 3_600.0),
+
+        "pa" => si(Pressure, 1.0),
+        "hpa" | "mbar" => si(Pressure, 100.0),
+        "kpa" => si(Pressure, 1e3),
+        "bar" => si(Pressure, 1e5),
+        "atm" => si(Pressure, 101_325.0),
+        "mmhg" => si(Pressure, 133.322_387_415),
+        "psi" => imperial(Pressure, 6_894.757_293_168),
+
+        "j" | "joule" | "joules" => si(Energy, 1.0),
+        "kj" => si(Energy, 1e3),
+        "cal" | "calorie" | "calories" => si(Energy, 4.184),
+        "kcal" => si(Energy, 4_184.0),
+        "wh" => si(Energy, 3_600.0),
+        "kwh" => si(Energy, 3.6e6),
+        "btu" => imperial(Energy, 1_055.055_852_62),
+
+        "w" | "watt" | "watts" => si(Power, 1.0),
+        "kw" => si(Power, 1e3),
+        "hp" | "horsepower" => imperial(Power, 745.699_872),
+
+        "hz" => si(Frequency, 1.0),
+        "khz" => si(Frequency, 1e3),
+        "mhz" => si(Frequency, 1e6),
+        "ghz" => si(Frequency, 1e9),
+
+        "bps" => si(DataRate, 1.0),
+        "kbps" => si(DataRate, 1e3),
+        "mbps" => si(DataRate, 1e6),
+        "gbps" => si(DataRate, 1e9),
+        "mbyteps" => imperial(DataRate, 8e6),
+        "gbyteps" => imperial(DataRate, 8e9),
+
+        // 235.214583… is 100 × the US gallon in litres ÷ the mile in kilometres.
+        "lper100km" => si(Fuel, 1.0),
+        "mpg" => Unit {
+            inverse: true,
+            ..imperial(Fuel, 100.0 * GALLON / 1.609_344)
+        },
+        "kml" => Unit {
+            inverse: true,
+            ..si(Fuel, 100.0)
+        },
+
         _ => return Vec::new(),
     };
     vec![unit]
@@ -635,12 +796,17 @@ fn is_feet(name: &str) -> bool {
         .any(|u| u.dimension == Dimension::Length && u.factor == 0.3048)
 }
 
-/// `5ft 11in`, `1h 30m`, `5'11"`, `3.5 GiB` as (amount, unit) pairs. `None` unless the
+/// `5ft 11in`, `1h 30m`, `5'11"`, `3.5 GiB`, `-40c` as (amount, unit) pairs. `None` unless the
 /// whole query is pairs, so `5 apples` and `4 in a row` stay searches.
 fn pairs(query: &str) -> Option<Vec<(f64, &str)>> {
     let mut rest = query.trim();
     let mut out = Vec::new();
     while !rest.is_empty() {
+        // Only the first amount may be negative: `-40c`, never `5 ft -3 in`.
+        let negative = out.is_empty() && rest.starts_with('-');
+        if negative {
+            rest = &rest[1..];
+        }
         let digits = rest
             .find(|c: char| !(c.is_ascii_digit() || c == '.'))
             .unwrap_or(rest.len());
@@ -648,6 +814,7 @@ fn pairs(query: &str) -> Option<Vec<(f64, &str)>> {
             return None;
         }
         let amount: f64 = rest[..digits].parse().ok()?;
+        let amount = if negative { -amount } else { amount };
         rest = rest[digits..].trim_start();
         let unit_len = unit_len(rest);
         out.push((amount, &rest[..unit_len]));
@@ -656,16 +823,285 @@ fn pairs(query: &str) -> Option<Vec<(f64, &str)>> {
     (!out.is_empty()).then_some(out)
 }
 
-/// A quote mark is a whole unit by itself, so `5'11"` splits; anything else runs to the
-/// end of the letters.
+/// A quote mark is a whole unit by itself, so `5'11"` splits; a degree sign takes the letters
+/// after it (`°C`, or none for an angle); anything else runs to the end of the letters.
 fn unit_len(s: &str) -> usize {
     if s.starts_with("''") {
         return 2;
     }
     match s.chars().next() {
         Some(c @ ('\'' | '"' | '\u{2019}' | '\u{2032}' | '\u{201d}' | '\u{2033}')) => c.len_utf8(),
+        Some(degree @ '\u{b0}') => {
+            let rest = &s[degree.len_utf8()..];
+            degree.len_utf8() + rest.find(|c: char| !c.is_alphabetic()).unwrap_or(rest.len())
+        }
         _ => s.find(|c: char| !c.is_alphabetic()).unwrap_or(s.len()),
     }
+}
+
+/// Unit names with spaces, slashes or superscripts, rewritten to the single words `readings_of`
+/// knows, so the pair parser keeps its one rule: a number, then letters. Longer phrases come
+/// first, so `sq mi` is not read as `sq m` followed by `i`.
+const UNIT_PHRASES: &[(&str, &str)] = &[
+    ("fluid ounces", "floz"),
+    ("fluid ounce", "floz"),
+    ("fl. oz", "floz"),
+    ("fl oz", "floz"),
+    ("square kilometres", "sqkm"),
+    ("square kilometers", "sqkm"),
+    ("square metres", "sqm"),
+    ("square meters", "sqm"),
+    ("square metre", "sqm"),
+    ("square meter", "sqm"),
+    ("square miles", "sqmi"),
+    ("square mile", "sqmi"),
+    ("square feet", "sqft"),
+    ("square foot", "sqft"),
+    ("sq km", "sqkm"),
+    ("sq mi", "sqmi"),
+    ("sq ft", "sqft"),
+    ("sq m", "sqm"),
+    ("km\u{b2}", "sqkm"),
+    ("mi\u{b2}", "sqmi"),
+    ("ft\u{b2}", "sqft"),
+    ("m\u{b2}", "sqm"),
+    ("km2", "sqkm"),
+    ("mi2", "sqmi"),
+    ("ft2", "sqft"),
+    ("m2", "sqm"),
+    ("kilometres per hour", "kmh"),
+    ("kilometers per hour", "kmh"),
+    ("miles per hour", "mph"),
+    ("km/h", "kmh"),
+    ("kph", "kmh"),
+    ("m/s", "mps"),
+    ("l/100 km", "lper100km"),
+    ("l/100km", "lper100km"),
+    ("km/l", "kml"),
+    ("mb/s", "mbyteps"),
+    ("gb/s", "gbyteps"),
+];
+
+fn normalize_units(query: &str) -> String {
+    let mut text = query.trim().to_lowercase().replace('\u{ba}', "\u{b0}");
+    for &(phrase, word) in UNIT_PHRASES {
+        let mut from = 0;
+        while let Some(found) = text.get(from..).and_then(|rest| rest.find(phrase)) {
+            let start = from + found;
+            let end = start + phrase.len();
+            let before = text[..start].chars().next_back();
+            let after = text[end..].chars().next();
+            let bounded = before.is_none_or(|c| c.is_whitespace() || c.is_ascii_digit() || c == '.')
+                && after.is_none_or(|c| !c.is_alphanumeric());
+            if bounded {
+                text.replace_range(start..end, word);
+                from = start + word.len();
+            } else {
+                from = end;
+            }
+        }
+    }
+    text
+}
+
+/// `5 km to miles`, `72f in c`: the amount before the last ` to ` or ` in `, and that unit. Only
+/// when what follows is a unit, so `4 in a row` stays a search and `5 ft 11 in` stays a height.
+fn explicit_target(query: &str) -> (&str, Option<(&str, Vec<Unit>)>) {
+    let split = [" to ", " in "]
+        .into_iter()
+        .filter_map(|word| query.rfind(word).map(|at| (at, word.len())))
+        .max_by_key(|&(at, _)| at);
+    if let Some((at, len)) = split {
+        let (amount, typed) = (query[..at].trim(), query[at + len..].trim());
+        let choices = readings_of(typed);
+        if !amount.is_empty() && !choices.is_empty() {
+            return (amount, Some((typed, choices)));
+        }
+    }
+    (query, None)
+}
+
+/// How each newer dimension is shown: (symbol, rail label, the name `readings_of` knows it by),
+/// smallest first within each system.
+fn display_units(dimension: Dimension) -> &'static [(&'static str, &'static str, &'static str)] {
+    match dimension {
+        Dimension::Temperature => &[
+            ("\u{b0}C", "celsius", "c"),
+            ("\u{b0}F", "fahrenheit", "f"),
+            ("K", "kelvin", "kelvin"),
+        ],
+        Dimension::Volume => &[
+            ("mL", "millilitres", "ml"),
+            ("L", "litres", "l"),
+            ("tsp", "teaspoons", "tsp"),
+            ("tbsp", "tablespoons", "tbsp"),
+            ("fl oz", "fluid oz", "floz"),
+            ("cups", "US cups", "cup"),
+            ("pt", "US pints", "pt"),
+            ("qt", "US quarts", "qt"),
+            ("gal", "US gallons", "gal"),
+        ],
+        Dimension::Area => &[
+            ("m\u{b2}", "sq metres", "sqm"),
+            ("ha", "hectares", "ha"),
+            ("km\u{b2}", "sq km", "sqkm"),
+            ("sq ft", "sq feet", "sqft"),
+            ("acres", "acres", "acre"),
+            ("sq mi", "sq miles", "sqmi"),
+        ],
+        Dimension::Speed => &[
+            ("km/h", "km per hour", "kmh"),
+            ("mph", "miles per hour", "mph"),
+            ("m/s", "m per second", "mps"),
+            ("kn", "knots", "kn"),
+        ],
+        Dimension::Pressure => &[
+            ("kPa", "kilopascals", "kpa"),
+            ("bar", "bar", "bar"),
+            ("psi", "psi", "psi"),
+            ("atm", "atmospheres", "atm"),
+        ],
+        Dimension::Energy => &[
+            ("kJ", "kilojoules", "kj"),
+            ("kWh", "kilowatt hours", "kwh"),
+            ("kcal", "food calories", "kcal"),
+            ("J", "joules", "j"),
+            ("cal", "calories", "cal"),
+            ("BTU", "BTU", "btu"),
+        ],
+        Dimension::Power => &[
+            ("kW", "kilowatts", "kw"),
+            ("hp", "horsepower", "hp"),
+            ("W", "watts", "w"),
+        ],
+        Dimension::Angle => &[("\u{b0}", "degrees", "deg"), ("rad", "radians", "rad")],
+        Dimension::Frequency => &[
+            ("Hz", "hertz", "hz"),
+            ("kHz", "kilohertz", "khz"),
+            ("MHz", "megahertz", "mhz"),
+            ("GHz", "gigahertz", "ghz"),
+        ],
+        Dimension::Fuel => &[
+            ("L/100 km", "fuel use", "lper100km"),
+            ("mpg", "US mpg", "mpg"),
+            ("km/L", "km per litre", "kml"),
+        ],
+        Dimension::Bytes
+        | Dimension::Duration
+        | Dimension::Length
+        | Dimension::Mass
+        | Dimension::DataRate => &[],
+    }
+}
+
+/// Volume and area convert to the other system, in the largest unit that is at least one and
+/// the next one up when it is still a useful fraction (`2 L` is `2.11 qt` and `0.528 gal`).
+/// Temperature shows the other two scales; frequency its natural scale; the rest the first two
+/// listed units at a readable size.
+fn display_rows(dimension: Dimension, base: f64, sources: &[Unit]) -> Vec<ToolRow> {
+    let shown: Vec<(&str, &str, Unit, f64)> = display_units(dimension)
+        .iter()
+        .filter_map(|&(symbol, label, name)| {
+            let unit = readings_of(name).into_iter().find(|u| u.dimension == dimension)?;
+            let value = unit.in_unit(base);
+            (!sources.iter().any(|s| s.same(unit)) && value.is_finite())
+                .then_some((symbol, label, unit, value))
+        })
+        .collect();
+    let row = |&(symbol, label, _, value): &(&str, &str, Unit, f64)| {
+        ToolRow::new(quantity(value, symbol), label)
+    };
+    match dimension {
+        Dimension::Volume | Dimension::Area => {
+            let from_imperial = sources.iter().all(|u| u.imperial);
+            let other: Vec<_> = shown
+                .iter()
+                .filter(|(_, _, unit, _)| unit.imperial != from_imperial)
+                .collect();
+            let best = other
+                .iter()
+                .rposition(|(_, _, _, value)| value.abs() >= 1.0)
+                .unwrap_or(0);
+            let mut rows: Vec<ToolRow> = other.get(best).map(|shown| row(shown)).into_iter().collect();
+            if let Some(next) = other.get(best + 1).filter(|(_, _, _, value)| value.abs() >= 0.1) {
+                rows.push(row(next));
+            }
+            rows
+        }
+        Dimension::Temperature => shown.iter().take(2).map(row).collect(),
+        Dimension::Frequency => shown
+            .iter()
+            .filter(|(_, _, _, value)| (1.0..1e6).contains(&value.abs()))
+            .take(1)
+            .map(row)
+            .collect(),
+        _ => shown
+            .iter()
+            .filter(|(_, _, _, value)| *value == 0.0 || (1e-3..1e9).contains(&value.abs()))
+            .take(2)
+            .map(row)
+            .collect(),
+    }
+}
+
+/// The single row for `… to unit`: the unit's own symbol when it has one, otherwise the unit as
+/// typed (`3.11 miles`).
+fn target_row(base: f64, unit: Unit, typed: &str) -> ToolRow {
+    let value = unit.in_unit(base);
+    let known = display_units(unit.dimension).iter().find(|(_, _, name)| {
+        readings_of(name).into_iter().any(|candidate| candidate.same(unit))
+    });
+    match known {
+        Some(&(symbol, label, _)) => ToolRow::new(quantity(value, symbol), label),
+        None => ToolRow::new(format!("{} {typed}", sig(value)), typed),
+    }
+}
+
+/// A line speed and a transfer speed are the same number eight times over, so each converts
+/// to the other, with how long a gigabyte takes at that rate.
+fn data_rate_rows(bits: f64, sources: &[Unit]) -> Vec<ToolRow> {
+    if bits <= 0.0 {
+        return Vec::new();
+    }
+    let speed = if sources.iter().all(|u| u.imperial) {
+        ToolRow::new(
+            scaled(bits, 1000.0, &["bps", "Kbps", "Mbps", "Gbps", "Tbps"]),
+            "line speed",
+        )
+    } else {
+        ToolRow::new(
+            scaled(bits / 8.0, 1000.0, &["B/s", "KB/s", "MB/s", "GB/s", "TB/s"]),
+            "transfer",
+        )
+    };
+    vec![
+        speed,
+        ToolRow::new(format!("1 GB in {}", human_duration(8e9 / bits)), "per GB"),
+    ]
+}
+
+fn quantity(value: f64, symbol: &str) -> String {
+    if symbol == "\u{b0}" {
+        format!("{}\u{b0}", sig(value))
+    } else {
+        format!("{} {symbol}", sig(value))
+    }
+}
+
+/// Enough digits to be useful at any size: one decimal from 100, two from 1, and at least two
+/// significant digits below 1, so `0.00405 km²` does not round to zero.
+fn sig(value: f64) -> String {
+    let size = value.abs();
+    let decimals = if size == 0.0 || size >= 100.0 {
+        1
+    } else if size >= 1.0 {
+        2
+    } else {
+        (2 - size.log10().floor() as i32).clamp(2, 6) as usize
+    };
+    let formatted = format!("{value:.decimals$}");
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+    if trimmed == "-0" { "0".to_owned() } else { trimmed.to_owned() }
 }
 
 /// Rows in the system the value was not given in; both, for a mix like `1ft 10cm`.
@@ -1101,6 +1537,46 @@ mod tests {
     fn rounding_carries_into_the_larger_unit() {
         assert_eq!(feet_and_inches(71.97), "6 ft");
         assert_eq!(pounds_and_ounces(1.999_99), "2 lb");
+    }
+
+    #[test]
+    fn temperatures_volumes_and_areas_convert() {
+        assert_eq!(values("72f"), ["22.22 \u{b0}C", "295.4 K"]);
+        assert_eq!(values("-40c")[0], "-40 \u{b0}F");
+        assert_eq!(values("100 \u{b0}C")[0], "212 \u{b0}F");
+        assert_eq!(values("300 kelvin"), ["26.85 \u{b0}C", "80.33 \u{b0}F"]);
+        assert_eq!(values("2 L"), ["2.11 qt", "0.528 gal"]);
+        assert_eq!(values("1 cup"), ["236.6 mL", "0.237 L"]);
+        assert_eq!(values("12 fl oz"), ["354.9 mL", "0.355 L"]);
+        assert_eq!(values("1 acre"), ["4046.9 m\u{b2}", "0.405 ha"]);
+        assert_eq!(values("1000 sq ft"), ["92.9 m\u{b2}"]);
+    }
+
+    #[test]
+    fn speeds_pressures_energy_power_angles_rates_and_fuel_convert() {
+        assert_eq!(values("100 km/h"), ["62.14 mph", "27.78 m/s"]);
+        assert_eq!(values("60 mph"), ["96.56 km/h", "26.82 m/s"]);
+        assert_eq!(values("20 knots"), ["37.04 km/h", "23.02 mph"]);
+        assert_eq!(values("32 psi"), ["220.6 kPa", "2.21 bar"]);
+        assert_eq!(values("500 kcal"), ["2092 kJ", "0.581 kWh"]);
+        assert_eq!(values("150 hp")[0], "111.9 kW");
+        assert_eq!(values("90\u{b0}"), ["1.57 rad"]);
+        assert_eq!(values("2.4 ghz"), ["2400 MHz"]);
+        assert_eq!(values("100 mbps"), ["12.5 MB/s", "1 GB in 1m 20s"]);
+        assert_eq!(values("50 MB/s"), ["400 Mbps", "1 GB in 20s"]);
+        assert_eq!(values("30 mpg"), ["7.84 L/100 km", "12.75 km/L"]);
+    }
+
+    #[test]
+    fn to_and_in_choose_the_unit() {
+        assert_eq!(values("5 km to miles"), ["3.11 miles"]);
+        assert_eq!(values("72f in c"), ["22.22 \u{b0}C"]);
+        assert_eq!(values("1.5 cups to ml"), ["354.9 mL"]);
+        assert_eq!(values("90 min to hours"), ["1.5 hours"]);
+        assert_eq!(values("10 in in cm"), ["25.4 cm"]);
+        assert_eq!(values("5 ft 11 in to cm"), ["180.3 cm"]);
+        assert!(evaluate("5 km to paris").is_empty());
+        assert!(evaluate("3 cups of flour").is_empty());
     }
 
     #[test]

@@ -39,9 +39,12 @@ only contacts GitHub when you press the button.
 | `;tracking` | Something you copied earlier, from your clipboard history |
 | `fix grammar` | Select text anywhere first, and it comes back corrected (also `make shorter`, `bullet points`…) |
 | `my schedule` | Today's and tomorrow's events. Press Return on one to join its Zoom, Meet or Teams call |
+| `schedule lunch with Sam friday at noon` | A preview of the event; Return adds it to your calendar |
 | `lock`, `sleep`, `dark mode`, `empty trash` | Control your Mac. Anything destructive asks first |
 | `:3000` | What's using port 3000, and a safe way to stop it |
-| `15% * 89`, `150 lbs`, `uuid` | Quick maths, unit conversions and developer utilities |
+| `15% * 89`, `72f`, `5 km to miles`, `uuid` | Quick maths, unit conversions and developer utilities |
+| `3pm montreal in tokyo`, `time in paris` | Time zones, daylight saving included |
+| `ocr` | Select part of the screen and copy the text in it |
 | `!sig` | Paste a snippet you saved with `:snippet sig Best regards…` |
 
 Type **:** to see every command. **⌘K** shows more actions for any result, **⌘Y** previews a
@@ -69,6 +72,8 @@ Click a screenshot to view it at full size. For still images without animation, 
 | [![Index dashboard showing status, document counts, folders and storage](media/index-dashboard.png)](media/index-dashboard.png) | [![Converting 1500 MB into GiB, GB and bytes](media/calculator.png)](media/calculator.png) |
 | **Command catalog** | **System commands** |
 | [![Discoverable command catalog opened with a colon](media/commands.png)](media/commands.png) | [![System commands including lock, sleep and operations that ask for confirmation](media/system-commands.png)](media/system-commands.png) |
+| **Time zones** | **Unit conversions** |
+| [![Time zone conversion between Montreal and Tokyo](media/time-zones.png)](media/time-zones.png) | [![Feet and inches converted to metres and centimetres](media/units.png)](media/units.png) |
 | **Saved snippets** | **Ask your documents** |
 | [![Named text snippets ready to paste](media/snippets.png)](media/snippets.png) | [![Local answer to a question about the demo documents, citing its sources](media/ask-your-documents.png)](media/ask-your-documents.png) |
 
