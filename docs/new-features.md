@@ -1,6 +1,6 @@
 # Blindspot — complete feature guide and workflows
 
-**Release: 0.2.8.** This guide describes implemented features, not the full proposed roadmap.
+**Release: 0.2.9.** This guide describes implemented features, not the full proposed roadmap.
 The release notes at the end distinguish new behavior from platform limitations.
 
 **Local search upgrade, September 16 (unreleased):** passage embeddings, blended ranking,
@@ -677,7 +677,7 @@ configuration/default; the origin label explains whether it was set in this wind
 5. Let a running pass finish. Use Refresh for a reconciliation, not as a progress refresh button.
 6. Upgrade the app normally. Do not erase the index merely to install a new build.
 
-## 14. Privacy, limitations, and 0.2.8 release notes
+## 14. Privacy, limitations, and 0.2.9 release notes
 
 Data and inference remain local by default. No cloud dependency or custom third-party
 extension setup is added. The local model service must be running. This is a locally

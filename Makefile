@@ -5,7 +5,7 @@
 
 APP        := Blindspot
 BUNDLE_ID  := com.seifboukerdenna.blindspot
-VERSION    := 0.2.8
+VERSION    := 0.2.9
 # Where Settings → Status looks for updates (shell/Updater.swift). Forks set their own.
 RELEASE_REPO ?= SeifBoukerdenna/blindspot
 
