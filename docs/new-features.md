@@ -1,6 +1,6 @@
 # Blindspot — complete feature guide and workflows
 
-**Release: 0.3.0.** This guide describes implemented features, not the full proposed roadmap.
+**Release: 0.3.1.** This guide describes implemented features, not the full proposed roadmap.
 The release notes at the end distinguish new behavior from platform limitations.
 
 **0.3.0 interface:** translucent native surfaces, a search-scope menu, readable passage rows,
@@ -28,13 +28,15 @@ automatically replaces glass with an opaque surface; **Reduce Motion** disables 
 | ↑ / ↓ or Tab / ⇧Tab | Select a result; Tab accepts a selected command completion |
 | Return | Runs the selected result's default action |
 | ⌘K | Opens the selected result's action menu |
-| ⌘Y | Quick Look for supported file results |
+| ⌘Y | Read an indexed passage; Quick Look for ordinary file results |
 | ⌘Return | Reveal a file/app/executable where offered; copies an Agent command |
 | ⌥Return | Copy path where offered; copies an Agent command |
 | ⌃Return | Quit an app or request process termination where offered |
 | ⌘1 / ⌘2 / ⌘3 / ⌘4 | Apps/mixed search, Files, Clipboard, Agent |
 | ⌘M | Local model chooser in explicit Agent mode |
 | ⌘, | Opens Settings while interacting with Blindspot |
+| ⌘W | Closes Settings or the passage reader without quitting Blindspot |
+| ⌘[ / ⌘] | Previous/next result inside the passage reader |
 | ⌘⇧, | Opens Blindspot Settings globally, subject to macOS shortcut registration |
 | Escape | Cancels current work or closes the launcher/preview |
 
@@ -103,10 +105,21 @@ A passage result names the place to open: **p. 12** for a page, **line 31** for 
 row selected, ⌘K offers **Open at Line N**, which opens the file at that line in Zed, VS Code,
 Cursor or Sublime Text if one is installed, and otherwise in iTerm using your `$EDITOR`.
 The iTerm fallback accepts `vim`, `nvim`, `vi` or `nano` and may require Automation permission;
-otherwise choose **Open**. PDF Return and ⌘Y use Blindspot's page-aware preview; **Open** in ⌘K
+otherwise choose **Open**. PDF Return uses Blindspot's page-aware preview; **Open** in ⌘K
 still uses the default application. Slide rows show the slide number but open the whole deck.
 ⌘K also offers **Copy Passage** and **Ask About This Passage…**. These use the stored passage,
 not the short result subtitle; an obsolete chunk is refused after reindexing.
+
+**Read without opening the source:** select a passage and press **⌘Y** (or ⌘K → Quick Look).
+The reading window shows its full stored text, source path and page/slide/line. Literal query words
+are highlighted; semantic-only matches may have no highlight. Use the arrow buttons or **⌘[ / ⌘]**
+to move through the current passage results (up to 50), including results from other files.
+This is a fixed snapshot of result order, not a search through every passage in the library.
+**View document** switches to the PDF page preview or whole-file Quick Look. **Escape**, **⌘Y**
+or **⌘W** closes the reader and returns to the launcher. Text can be selected and copied normally.
+Only the selected stored passage is read (up to 8 KiB), not the entire document or neighboring
+chunks. If reindexing replaces it, the reader asks you to search again instead of displaying a
+different passage. Stored excerpts may lag source-file edits until indexing catches up.
 
 If a query's words never all appear together, search retries with any of them rather than returning
 nothing. On a disposable 134-document checkout index and 47 golden queries, blended retrieval
@@ -143,7 +156,16 @@ Supported indexed text/code extensions:
 one vector per passage. It is separate from the model answering AI questions. Empty selects
 Apple's installed English contextual model. If Ollama is unavailable at indexing time, Apple is
 tried automatically; if no usable backend/generation is available, word search remains usable.
-No model is downloaded. Use Index → Overview → Rescan folders after starting Ollama or installing a model yourself, once the current pass has stopped.
+No model is downloaded. **Index → Overview → Check model** tests the configured local backend
+with a fixed phrase, showing availability, dimensions and duration. Its compatibility report
+compares model name, revision and dimensions with an active generation; it does not pin model
+weights by digest or detect replaced weights with the same identity and dimensions.
+
+After an unavailable backend or Apple fallback, automatic checks back off from about 30 seconds
+to 15 minutes. They run even with Settings closed, but wait during active indexing or a manual/
+power-policy pause. Recovery embeds missing passages without rescanning files, retains existing
+search data, and activates a usable generation. A manual check can bring a waiting retry forward.
+Checking alone does not rebuild the index; background recovery still follows indexing settings.
 
 - **What gets embedded:** prose, extracted PDF/Word/PPTX text, and code under explicitly selected
   **Code folders** (empty by default). Code elsewhere remains word-searchable. JSON, CSV, TSV,
@@ -189,14 +211,15 @@ second while open; **Settings → Content → Open index** jumps there.
 
 | Part | What it tells you |
 |---|---|
-| Overview → live work | Actual stage, elapsed stage time, current root folder and this pass's checked/updated counts. The moving bar indicates activity, not percent complete. Pauses show their reason and automatic-resume behavior |
+| Overview → live work | Actual stage, elapsed stage time, current root folder and pass counters. Scanning is indeterminate; counted embedding work has its own attempted/remaining meter. A finished embedding meter is not whole-index completion: cache preparation follows |
 | Overview → Your library | Documents, stored passages and disk used (database plus vector cache); active-model embeddings are separate from pass progress because some kinds stay word-only |
 | Overview → Indexing settings… | Opens the indexing controls in Content |
-| Folders → Search locations | Watched roots; **Manage folders…** opens folder controls, exclusions and code roots in Content |
+| Folders → Search locations | Watched roots, each with **Rescan**; **Manage folders…** opens folder controls, exclusions and code roots in Content |
 | Folders → busy-folder warning | A folder whose files changed at least 20 times in five minutes. **Exclude folder** asks first, then adds it to Content → Excluded paths |
 | Folders → Indexed folders / File types | Documents by top-level folder and kind, with sizes. Click an indexed folder to reveal it in Finder |
 | Folders → Recently changed | The most recently modified indexed files |
-| Diagnostics → Needs attention | Extraction problems, partly indexed documents and embedding failures. File rows reveal the source |
+| Diagnostics → Needs attention | Extraction problems, partly indexed documents and embedding failures. File rows reveal the source; **Retry failed items** retries recorded problem files and missing embeddings |
+| Diagnostics → Check a file… | Explains scope, exclusions, type/size limits, last extraction, metadata freshness and active-generation passage coverage for one selected file; never repairs or reindexes by itself |
 | Diagnostics → Last reported pass | Checked, updated, unchanged, skipped and unreadable counts; what was embedded; watched folders; when counts were sampled |
 | Diagnostics → Storage / Resources | Disk usage and storage target; Blindspot and each helper (semantic model, vector search, PDF extraction) with memory and sampled CPU %, and the current pace |
 
@@ -231,20 +254,53 @@ Detailed terms:
 | Active path | Current configured root; `~` means the home folder, not one particular file |
 | Ready | The pass finished |
 | Partial | Some work could not complete; previous records are retained where necessary |
-| Paused | A named power/thermal condition is preventing background work |
+| Paused | You paused indexing, or a named power/thermal condition is preventing background work |
 
 Storage/count diagnostics are sampled in the background; they are not instantaneous totals.
 **Settings → About → Content storage** separates database, WAL and SHM sizes from the
 vector files. File sizes are logical sizes, not a total filesystem allocation
 measurement. App resident memory is shown separately under **App resources**.
 
-There is no reliable total, final percentage or ETA until the eligible work is known.
+Scanning has no reliable total or ETA. Pending eligible embeddings are counted in bounded pages
+before the embedding pass, then attempted and remaining counts update per batch. Failures and
+stale passages count as attempted, not successfully embedded; new filesystem changes belong to
+a later pass. Stored library coverage is separate from these work counters.
 The Erase row describes erasure and only shows erase progress during an erase.
 
 **Rescan folders** (formerly Refresh) requests reconciliation from Overview. It is unavailable
 while work is running or paused; the dashboard updates automatically without it. Paused work
 resumes when the named power/thermal condition clears. Filesystem changes normally trigger
 updates automatically; committed documents and embeddings remain reusable.
+
+**Pause indexing / Resume indexing** controls your manual pause for this app session. Existing
+results remain searchable and completed work is reused on resume. Resume clears only your
+manual pause; Low Power Mode, battery policy and thermal protection still apply. Quitting the
+app clears the manual pause. Settings changes and filesystem events do not silently resume it.
+
+**Folders → Rescan** reconciles just the selected watched root, including subfolders, without
+scanning or removing records from other roots. It respects exclusions and document/resource
+settings. Rescan and Retry are unavailable during active work or pauses.
+
+**Diagnostics → Retry failed items** re-reads recorded extraction failures and partial documents
+even if their source metadata is unchanged, then retries missing eligible passage embeddings.
+Successful files and vectors are reused. Unchanged locks, permissions and configured limits may
+still prevent success. Unrecorded filesystem/traversal failures require a folder rescan; retry
+does not broaden your search scope, raise limits, or erase the index.
+
+**Why can’t I find this file?** Open **Index → Diagnostics → Check a file…** and choose the
+source, for example your bicycle route notes. Read the explanation and suggested next step;
+**Open relevant settings…** jumps to a control where applicable. Checks run off the UI thread
+and read metadata plus stored status, not document contents. They do not upload, extract, download
+cloud placeholders, follow symlinks inside roots, or change folders/settings. A generic
+“unavailable” result covers access, missing/local availability and link/volume restrictions;
+it does not pretend to distinguish every filesystem failure. An unrecorded file has no certain
+failure reason. A retained failed extraction can still have older, stale passages.
+
+“Indexed for word search” confirms stored passages, not an FTS integrity test or a guarantee
+that a query ranks this file. Try a distinctive phrase without filters. Active-generation
+embedding counts exclude unfinished generations and do not prove model/cache availability;
+use **Overview → Check model** separately. The check is a point-in-time report: select the file
+again after changing its settings, source or index.
 
 **Disable indexing:** stops it and hides content results, retaining stored data.
 **Erase content index:** after confirmation, disables indexing and removes stored excerpts,
@@ -708,6 +764,13 @@ arbitrary process restart, complete browser automation, public extension distrib
 hard CPU/RAM quotas, or validated 10-million-record production operation. macOS limits
 process visibility, selected-text access, last-opened metadata and atomic PID identity checks.
 
+**0.3.1 changes**
+
+- **Why can’t I find this file?** Read-only per-file diagnostics in Index → Diagnostics, with actionable explanations and direct settings links.
+- **Passage reader:** full stored text, literal-word highlights, page/line context, previous/next result navigation, and a document-view button. Stale loaders cannot replace newer results.
+- **⌘W closes Settings** through the native menu, including with text-field focus, without quitting Blindspot.
+- Reuses the existing index and preferences; no migration or rebuild is required.
+
 **0.3.0 changes**
 
 - Native translucent launcher and Settings, with opaque accessibility fallbacks.
@@ -715,6 +778,7 @@ process visibility, selected-text access, last-opened metadata and atomic PID id
 - Flat results with an inset selection; document paths and excerpts have separate lines.
 - Resizable sidebar Settings with native switches and keyboard-accessible shortcut/palette controls.
 - Index has pinned Overview / Folders / Diagnostics navigation, direct links to controls, explicit live stages and pause reasons, with stored embedding coverage separate from progress.
+- Manual pause/resume, watched-folder rescans, recorded-failure retries, counted embedding progress, local model health checks and backed-off embedding-only recovery.
 - Existing index, embeddings, roots, exclusions, history and configuration are reused; no UI migration or rebuild is required.
 
 **0.2.9 changes**

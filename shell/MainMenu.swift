@@ -38,8 +38,12 @@ enum MainMenu {
         editMenu.addItem(
             withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
+        let fileMenu = NSMenu(title: "File")
+        fileMenu.addItem(
+            withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+
         let main = NSMenu()
-        for submenu in [appMenu, editMenu] {
+        for submenu in [appMenu, fileMenu, editMenu] {
             let item = NSMenuItem()
             item.submenu = submenu
             main.addItem(item)

@@ -239,6 +239,19 @@ final class Core {
 
     func refreshContent() { bs_content_refresh(handle) }
 
+    var indexControls: IndexControls? {
+        let blob = bs_index_controls(handle)
+        defer { bs_free_blob(blob) }
+        guard let bytes = blob.data, blob.len > 0, blob.len <= 256 * 1024 else { return nil }
+        return try? JSONDecoder().decode(IndexControls.self, from: Data(bytes: bytes, count: blob.len))
+    }
+
+    func indexAction(_ action: String, folder: String = "") -> String? {
+        action.withCString { action in folder.withCString { Self.message(bs_index_action(handle, action, $0)) } }
+    }
+
+    func recoverContentModel() { _ = indexAction("tick") }
+
     /// Runs a `:link` / `:snippet` / `:unlink` / `:unsnippet` command; nil on success, else why not.
     func applyShortcut(_ command: String) -> String? {
         command.withCString { Self.message(bs_shortcut_apply(handle, $0)) }
@@ -600,6 +613,21 @@ struct IndexOverview: Decodable, Sendable, Equatable {
     let recent: [Recent]
 }
 
+struct IndexControls: Decodable, Sendable, Equatable {
+    struct Health: Decodable, Sendable, Equatable {
+        let available: Bool
+        let model: String
+        let dimensions: Int?
+        let milliseconds: UInt64
+        let message: String
+    }
+    let manualPause, policyPause, canPause, canRun, checking, recoveryNeeded: Bool
+    let health: Health?
+    let retrySeconds, embeddingTotal, embeddingRemaining: UInt64?
+    let embeddingDone: UInt64
+    let roots: [String]
+}
+
 enum ContentPauseReason: UInt8, Sendable {
     case none = 0
     case lowPower = 1
@@ -718,6 +746,18 @@ struct ClipSink: Sendable {
 
 struct PassageReader: Sendable {
     fileprivate let owner: NativeCoreOwner
+    func inspect(path: String) -> FileInspection? {
+        guard !Task.isCancelled, path.utf8.count <= 4096, !path.contains("\0") else { return nil }
+        return withExtendedLifetime(owner) {
+            path.withCString { path in
+                let blob = bs_content_inspect(owner.handle, path)
+                defer { bs_free_blob(blob) }
+                guard !Task.isCancelled, let bytes = blob.data, blob.len > 0, blob.len <= 32 * 1024 else { return nil }
+                return try? JSONDecoder().decode(FileInspection.self, from: Data(bytes: bytes, count: blob.len))
+            }
+        }
+    }
+
     func text(rowID: UInt64, path: String) -> String? {
         withExtendedLifetime(owner) {
             path.withCString { path in
@@ -728,4 +768,10 @@ struct PassageReader: Sendable {
             }
         }
     }
+}
+
+struct FileInspection: Decodable, Sendable {
+    let title, detail, next, setting: String
+    let root: String?
+    let passages, embedded: UInt64?
 }

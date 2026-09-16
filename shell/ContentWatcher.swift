@@ -10,10 +10,12 @@ protocol ContentMonitoring: AnyObject {
     func refreshContent()
     func refreshContent(paths: [String])
     func contentEventRelevant(_ path: String) -> Bool
+    func recoverContentModel()
 }
 
 extension ContentMonitoring {
     func refreshContent(paths: [String]) { refreshContent() }
+    func recoverContentModel() {}
 }
 
 extension Core: ContentMonitoring {}
@@ -26,6 +28,7 @@ final class ContentWatcher {
     }
 
     private let core: any ContentMonitoring
+    private let policyInterval: Duration
     private var stream: FSEventStreamRef?
     private var watched: [String] = []
     private var powerSource: CFRunLoopSource?
@@ -50,7 +53,10 @@ final class ContentWatcher {
     var isMonitoring: Bool { stream != nil && !watched.isEmpty }
     var onIndexChanged: (() -> Void)?
 
-    init(core: any ContentMonitoring) { self.core = core }
+    init(core: any ContentMonitoring, policyInterval: Duration = .seconds(30)) {
+        self.core = core
+        self.policyInterval = policyInterval
+    }
     isolated deinit { stop() }
 
     func configure() {
@@ -124,11 +130,13 @@ final class ContentWatcher {
 
     private func startPolicyRefresh() {
         policyTask?.cancel()
+        let interval = policyInterval
         policyTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(30)) } catch { return }
+                do { try await Task.sleep(for: interval) } catch { return }
                 guard let self, self.enabled else { return }
                 self.applyPowerPolicy()
+                self.core.recoverContentModel()
             }
         }
     }

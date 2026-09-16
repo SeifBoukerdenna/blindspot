@@ -153,6 +153,9 @@ impl Client {
         if vectors.iter().flatten().any(|value| !value.is_finite()) {
             return Err(Failure::InvalidResponse);
         }
+        if vectors.iter().any(|vector| vector.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() <= 0.0) {
+            return Err(Failure::InvalidResponse);
+        }
         if self.dimensions.is_some_and(|known| known != dimensions) {
             return Err(Failure::InvalidResponse);
         }
@@ -275,6 +278,7 @@ mod tests {
             r#"{"embeddings":[[1.0,0.0]]}"#,
             r#"{"embeddings":[[1.0,0.0],[0.0]]}"#,
             r#"{"embeddings":[[1.0,0.0],[0.0,null]]}"#,
+            r#"{"embeddings":[[0.0,0.0],[0.0,1.0]]}"#,
             r#"{"model":"x"}"#,
             r#"{"error":"model not found"}"#,
         ] {

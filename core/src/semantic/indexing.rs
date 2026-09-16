@@ -11,6 +11,7 @@ use std::time::Duration;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Progress {
+    pub pending_total: Option<u64>,
     pub examined: u64,
     pub current: u64,
     pub written: u64,
@@ -163,6 +164,17 @@ pub fn run_chunks_with_budget(
     let key = model_key(&model)?;
     let size = embedder.batch().max(1);
     let mut progress = Progress::default();
+    let mut cursor = 0;
+    let mut pending_total = 0;
+    loop {
+        check(&cancel)?;
+        let page = store.chunk_embedding_page(cursor, &key, model.dimensions, Arc::clone(&cancel))?;
+        if page.scanned == 0 { break; }
+        cursor = page.after;
+        pending_total += page.pending.iter().filter(|chunk| eligible(Path::new(&chunk.path))).count() as u64;
+    }
+    progress.pending_total = Some(pending_total);
+    report(&progress);
     let mut after = 0;
     loop {
         check(&cancel)?;
@@ -646,6 +658,7 @@ mod pass_tests {
         )
         .expect("a pass");
         assert_eq!(progress.written, 40, "{progress:?}");
+        assert_eq!(progress.pending_total, Some(40));
         assert_eq!(progress.failed, 0);
         assert_eq!(awaiting(&store, "embeddinggemma:300m", 4), 0);
         let first = served.load(Ordering::Relaxed);
@@ -653,6 +666,7 @@ mod pass_tests {
         // Everything already has a current vector, so a second pass sends no batches at all.
         let again = run_chunks(&mut store, &mut embedder, cancel, |_| true, |_| {}).expect("again");
         assert_eq!(again.written, 0);
+        assert_eq!(again.pending_total, Some(0));
         assert_eq!(again.current, 40, "{again:?}");
         assert_eq!(
             served.load(Ordering::Relaxed) - first,
@@ -696,6 +710,7 @@ mod pass_tests {
         )
         .expect("a pass");
         assert_eq!(progress.excluded, 3);
+        assert_eq!(progress.pending_total, Some(0));
         assert_eq!(progress.written, 0);
         assert_eq!(awaiting(&store, "m", 4), 3, "nothing was embedded");
         assert_eq!(

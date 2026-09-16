@@ -1,6 +1,9 @@
 //! Owns the opt-in indexing and query lifetimes; all disk access stays on workers.
 
 pub mod passage_engine;
+pub mod controls;
+pub mod inspection;
+use controls::{Work, HealthRequest, Health, Recovery};
 
 use crate::{
     config::Content,
@@ -44,6 +47,7 @@ pub enum PauseReason {
     Thermal,
     Battery,
     Unavailable,
+    Manual,
 }
 
 impl PauseReason {
@@ -52,7 +56,7 @@ impl PauseReason {
     }
 
     fn label(self) -> &'static str {
-        match self { Self::None => "", Self::LowPower => "Low Power Mode", Self::Thermal => "Thermal protection", Self::Battery => "Battery power", Self::Unavailable => "Power state unavailable" }
+        match self { Self::None => "", Self::LowPower => "Low Power Mode", Self::Thermal => "Thermal protection", Self::Battery => "Battery power", Self::Unavailable => "Power state unavailable", Self::Manual => "Paused by you" }
     }
 }
 
@@ -69,6 +73,7 @@ pub struct Snapshot {
     /// Wall-clock end and duration of the last pass that ran to completion.
     pub last_pass: Option<(std::time::SystemTime, std::time::Duration)>,
     pub semantic_progress: Option<semantic::indexing::Progress>,
+    pub recovery: Recovery,
     pub last_compact: Option<crate::content::CompactReport>,
     pub compact_error: Option<&'static str>,
     semantic_enabled: bool,
@@ -93,6 +98,7 @@ impl Default for Snapshot {
             pass_started: None,
             last_pass: None,
             semantic_progress: None,
+            recovery: Recovery::default(),
             last_compact: None,
             compact_error: None,
             semantic_enabled: false,
@@ -108,6 +114,7 @@ impl Default for Snapshot {
 
 #[derive(Clone)]
 struct IndexRequest {
+    work: Work,
     epoch: u64,
     erase: bool,
     compact: bool,
@@ -149,6 +156,10 @@ impl PartialEq for SemanticRequest {
 impl Eq for SemanticRequest {}
 
 struct Control {
+    manual_pause: bool,
+    work: Work,
+    health_request: Option<HealthRequest>,
+    health_serial: u64,
     config: Content,
     epoch: u64,
     paused: bool,
@@ -158,6 +169,7 @@ struct Control {
 }
 
 pub struct ContentService {
+    health: Latest<HealthRequest, Health>,
     path: Option<PathBuf>,
     control: Mutex<Control>,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -179,8 +191,13 @@ impl ContentService {
     pub fn with_helpers(path: Option<PathBuf>, helpers: Option<Helpers>) -> Self {
         let query_engine=Arc::new(Mutex::new(helpers.clone().map(|helpers| Engine::new(helpers, Content::default().embedding_host))));
         Self {
+            health: Latest::default(),
             path,
             control: Mutex::new(Control {
+                manual_pause: false,
+                work: Work::Reconcile,
+                health_request: None,
+                health_serial: 0,
                 config: Content::default(),
                 epoch: 0,
                 paused: true,
@@ -205,6 +222,9 @@ impl ContentService {
         }
         control.config = config.clone();
         control.configured = true;
+        control.work = Work::Reconcile;
+        control.health_request = None;
+        self.health.cancel();
         self.queue(&mut control, false, None);
     }
 
@@ -216,17 +236,23 @@ impl ContentService {
         }
         control.paused = paused;
         control.pause_reason = if paused { reason } else { PauseReason::None };
+        if paused {
+            self.health.cancel();
+            control.health_request = None;
+        }
         self.queue(&mut control, true, None);
     }
 
     pub fn refresh(&self) {
         let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        control.work = Work::Reconcile;
         self.snapshot.lock().unwrap_or_else(PoisonError::into_inner).semantic_clean = false;
         self.queue(&mut control, true, None);
     }
 
     pub fn refresh_paths(&self, paths: Vec<PathBuf>) {
         let mut control = self.control.lock().unwrap_or_else(PoisonError::into_inner);
+        control.work = Work::Reconcile;
         {
             let mut activity = self.activity.lock().unwrap_or_else(PoisonError::into_inner);
             let now = std::time::Instant::now();
@@ -261,7 +287,7 @@ impl ContentService {
         snapshot.semantic_enabled=control.config.semantic && control.config.enabled;
         snapshot.semantic_revision=0;
         snapshot.semantic_status=if snapshot.semantic_enabled {"Semantic indexing queued".into()} else {String::new()};
-        snapshot.pause_reason = if control.paused { control.pause_reason } else { PauseReason::None };
+        snapshot.pause_reason = if control.manual_pause { PauseReason::Manual } else if control.paused { control.pause_reason } else { PauseReason::None };
         snapshot.current_path = None;
         snapshot.stage = "";
         snapshot.pass_started = None;
@@ -270,7 +296,7 @@ impl ContentService {
             Phase::Disabled
         } else if control.config.roots.is_empty() && control.config.code_roots.is_empty() {
             Phase::NeedsRoots
-        } else if control.paused {
+        } else if control.paused || control.manual_pause {
             Phase::Paused
         } else {
             Phase::Indexing
@@ -280,7 +306,7 @@ impl ContentService {
         }
         if snapshot.phase != Phase::Indexing {
             if !snapshot.semantic_enabled {
-                let request=IndexRequest {epoch:control.epoch,erase:false,compact:false,stop:true,changed_paths:None,
+                let request=IndexRequest {work:Work::Reconcile,epoch:control.epoch,erase:false,compact:false,stop:true,changed_paths:None,
                     helpers:self.helpers.clone(),query_engine:Arc::clone(&self.query_engine),
                     path:self.path.clone().unwrap_or_default(),config:control.config.clone(),snapshot:Arc::clone(&self.snapshot)};
                 control.request=Some(request.clone());
@@ -295,6 +321,7 @@ impl ContentService {
             return;
         };
         let request = IndexRequest {
+            work: control.work.clone(),
             epoch: control.epoch,
             erase: false,
             compact: false,
@@ -334,6 +361,7 @@ impl ContentService {
             epoch: control.epoch, phase: Phase::Erasing, ..Snapshot::default()
         };
         let request = IndexRequest {
+            work: Work::Reconcile,
             epoch: control.epoch, erase: true, compact: false, stop: false, changed_paths: None, path: path.clone(),
             helpers: self.helpers.clone(), query_engine: Arc::clone(&self.query_engine),
             config: control.config.clone(), snapshot: Arc::clone(&self.snapshot),
@@ -367,6 +395,7 @@ impl ContentService {
             snapshot.compact_error = None;
         }
         let request = IndexRequest {
+            work: Work::Reconcile,
             epoch: control.epoch, erase: false, compact: true, stop: false, changed_paths: None, path: path.clone(),
             helpers: self.helpers.clone(), query_engine: Arc::clone(&self.query_engine),
             config: control.config.clone(), snapshot: Arc::clone(&self.snapshot),
@@ -435,7 +464,8 @@ impl ContentService {
             Phase::NeedsRoots => "Choose folders to index".into(),
             Phase::Paused => {
                 let reason = snapshot.pause_reason.label();
-                if reason.is_empty() { "Paused by resource policy".into() } else { format!("Paused by resource policy · {reason}") }
+                if snapshot.pause_reason == PauseReason::Manual { "Paused by you — existing results remain searchable".into() }
+                else if reason.is_empty() { "Paused by resource policy".into() } else { format!("Paused by resource policy · {reason}") }
             },
             Phase::Indexing => format!(
                 "Indexing · {} visited · {} updated · {} source bytes",
@@ -745,7 +775,12 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
     }
     publish(request, &cancel, |snapshot| {
         snapshot.ready = true;
-        snapshot.stage = if config.documents { "Scanning folders and extracting PDFs" } else { "Scanning folders" };
+        snapshot.stage = match request.work {
+            Work::RetryFailures => "Retrying recorded extraction failures",
+            Work::SemanticOnly => "Checking embedding model",
+            _ if config.documents => "Scanning folders and extracting documents",
+            _ => "Scanning folders",
+        };
         snapshot.pass_started = Some(std::time::SystemTime::now());
         snapshot.roots = roots.clone();
         snapshot.exclusions = exclusions.clone();
@@ -766,6 +801,8 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
         ..Progress::default()
     };
     for root in &roots {
+        if matches!(request.work, Work::RetryFailures | Work::SemanticOnly)
+            || matches!(&request.work, Work::Folder(folder) if folder != root) { continue; }
         if request.changed_paths.as_ref().is_some_and(|paths| !paths.iter().any(|path| path.starts_with(root) || root.starts_with(path))) {
             continue;
         }
@@ -801,7 +838,11 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
         }
     }
     total.complete = failed == 0;
-    if total.complete {
+    if request.work == Work::RetryFailures {
+        total = controls::retry_extraction(request, &mut store, &roots, &policy, &cancel)?;
+        total.complete &= failed == 0;
+    }
+    if total.complete && request.work == Work::Reconcile {
         total.removed += store.retain_roots(&roots, &cancel).map_err(|error| match error {
             crate::content::Error::Cancelled => Failure::Cancelled,
             _ => Failure::Unavailable,
@@ -813,13 +854,24 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
     let semantic_clean = request.snapshot.lock().unwrap_or_else(PoisonError::into_inner).semantic_clean;
     if config.semantic && !total.budget_exhausted && (total.semantic_updates > 0 || !semantic_clean) {
         let outcome=(||->Result<(),semantic::indexing::Error> {
+            publish(request,&cancel,|snapshot| {
+                snapshot.stage="Checking embedding model";
+                snapshot.current_path=None;
+                snapshot.pass_started=Some(std::time::SystemTime::now());
+            });
             let helpers=request.helpers.as_ref().ok_or(semantic::Failure::Unavailable)?;
             let (mut client,model,fallback)=passage_engine::select(helpers,&config.embedding_host,&config.embedding_model,&cancel)?;
+            if fallback && !config.embedding_model.is_empty() && request.work == Work::SemanticOnly {
+                return Err(semantic::Failure::Unavailable.into());
+            }
             let key=semantic::indexing::model_key(&model)?;
             store.begin_passage_model(&key,model.dimensions)?;
             let code_roots:Vec<_>=config.expanded_code_roots().into_iter().filter_map(|root|root.canonicalize().ok()).collect();
+            publish(request,&cancel,|snapshot| snapshot.stage="Counting pending embeddings");
             let progress=semantic::indexing::run_chunks_with_budget(&mut store,&mut client,Arc::clone(&cancel),
-                |path|within_scope(path,&roots,&policy) && passage_engine::eligible_path(path,&code_roots),|progress|publish(request,&cancel,|snapshot| {
+                |path|within_scope(path,&roots,&policy) && passage_engine::eligible_path(path,&code_roots)
+                    && !matches!(&request.work, Work::Folder(folder) if !path.starts_with(folder)),|progress|publish(request,&cancel,|snapshot| {
+                    if snapshot.stage!="Embedding passages" {snapshot.pass_started=Some(std::time::SystemTime::now());}
                     snapshot.stage="Embedding passages";
                     snapshot.semantic_status=format!("Embedding · {} written · {} current",progress.written,progress.current);
                     snapshot.semantic_progress=Some(progress.clone());
@@ -827,6 +879,7 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
             client.close();
             passage_engine::maintain_with_budget(&store,&request.path,&helpers.vectors,&model,Arc::clone(&cancel),|built,reused| {
                 publish(request,&cancel,|snapshot| {
+                    if snapshot.stage!="Building semantic cache" {snapshot.pass_started=Some(std::time::SystemTime::now());}
                     snapshot.stage="Building semantic cache";
                     snapshot.semantic_status=format!("Passage cache · {built} built · {reused} reused");
                     snapshot.semantic_revision=built as u64+1;
@@ -836,6 +889,10 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
             publish(request,&cancel,|snapshot|{snapshot.semantic_progress=Some(progress.clone());snapshot.semantic_clean=progress.stale==0;snapshot.semantic_status=if progress.failed>0 {
                 format!("Semantic ready · {} text items unavailable",progress.failed)
             } else {format!("Semantic ready · {}{}",model.identifier,if fallback {" · Apple fallback"} else {""})};});
+            publish(request,&cancel,|snapshot| {
+                if fallback && !config.embedding_model.is_empty() {snapshot.recovery.defer();}
+                else {snapshot.recovery.clear();}
+            });
             Ok(())
         })();
         match outcome {
@@ -845,7 +902,7 @@ fn run_index(request: &IndexRequest, cancel: Arc<AtomicBool>) -> Result<(), Fail
                 total.complete=false;
                 publish(request,&cancel,|snapshot|{snapshot.semantic_clean=false;snapshot.semantic_status="Storage budget reached; text search and prior vectors retained".into();});
             },
-            Err(_)=>publish(request,&cancel,|snapshot|{snapshot.semantic_clean=false;snapshot.semantic_status="Semantic unavailable; text search ready".into();}),
+            Err(_)=>publish(request,&cancel,|snapshot|{snapshot.semantic_clean=false;snapshot.semantic_status="Semantic unavailable; text search ready".into();snapshot.recovery.defer();}),
             Ok(())=>{},
         }
     }
@@ -951,7 +1008,7 @@ mod tests {
         }
         assert!(within_scope(std::path::Path::new("/fixture/project/notes.md"),&roots,&policy));
     }
-    fn wait(service: &ContentService) {
+    pub(super) fn wait(service: &ContentService) {
         let started = std::time::Instant::now();
         while (matches!(service.snapshot().phase, Phase::Indexing | Phase::Erasing) || service.erasing())
             && started.elapsed() < Duration::from_secs(5)

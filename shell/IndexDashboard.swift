@@ -17,6 +17,11 @@ final class IndexDashboardView: NSView {
     var onExclude: ((String) -> Void)?
     var onCompact: (() -> Void)?
     var onOpenSetting: ((String) -> Void)?
+    var onAction: ((String, String) -> String?)?
+    var inspectFile: (@Sendable (String) -> FileInspection?)? {
+        didSet { fileCheck.inspect = inspectFile }
+    }
+    private let fileCheck = FileInspectionView()
 
     private let column = IndexPageStack()
     private let pages = (0..<3).map { _ in IndexPageStack() }
@@ -30,6 +35,14 @@ final class IndexDashboardView: NSView {
     private let passSummary = IndexUI.wrapping("", IndexUI.font(12), Theme.inkSoft, width: 560)
     private let progressNote = IndexUI.wrapping("", IndexUI.font(12), Theme.muted, width: 560)
     private let progress = NSProgressIndicator()
+    private let embeddingMeter = MeterView(height: 4)
+    private let embeddingWork = IndexUI.wrapping("", IndexUI.font(12), Theme.inkSoft, width: 560)
+    private let modelHealth = IndexUI.wrapping("", IndexUI.font(12), Theme.muted, width: 560)
+    private let actionError = IndexUI.wrapping("", IndexUI.font(12), Theme.danger, width: 560)
+    private var controls: IndexControls?
+    private var pauseButton: ActionButton?
+    private var retryButton: ActionButton?
+    private var checkButton: ActionButton?
     private let issueSummary = IndexUI.wrapping("", IndexUI.font(12), Theme.muted, width: 560)
     private let inventory = IndexUI.wrapping("Waiting for index", IndexUI.font(12), Theme.muted, width: 600)
     private let roots = Card()
@@ -106,9 +119,24 @@ final class IndexDashboardView: NSView {
         progress.isDisplayedWhenStopped = false
         progress.setAccessibilityLabel("Indexing activity; total work is not known")
         add(progress, after: 16)
+        embeddingMeter.identifier = NSUserInterfaceItemIdentifier("index.embeddingProgress")
+        embeddingMeter.setAccessibilityElement(true)
+        embeddingMeter.setAccessibilityRole(.progressIndicator)
+        embeddingMeter.setAccessibilityLabel("Embedding pass progress")
+        add(embeddingMeter, after: 0)
         add(currentWork, after: 12)
         add(passSummary, after: 8)
+        add(embeddingWork, after: 8)
         add(progressNote, after: 8)
+        let pause = ActionButton("Pause indexing", colour: Theme.accent) { [weak self] in
+            guard let self else { return }
+            self.perform(self.controls?.manualPause == true ? "resume" : "pause")
+        }
+        pause.identifier = NSUserInterfaceItemIdentifier("index.pause")
+        pauseButton = pause
+        add(NSStackView(views: [pause, IndexUI.spacer()]), after: 8)
+        actionError.isHidden = true
+        add(actionError, after: 8)
         add(IndexUI.caption("Your library"), after: 24)
         add(inventory, after: 8)
         add(semantic, after: 8)
@@ -118,6 +146,11 @@ final class IndexDashboardView: NSView {
         let settings = ActionButton("Indexing settings…", colour: Theme.muted) { [weak self] in self?.onOpenSetting?("content.enabled") }
         settings.identifier = NSUserInterfaceItemIdentifier("index.settings")
         add(NSStackView(views: [issues, IndexUI.spacer(), settings]), after: 12)
+        let check = ActionButton("Check model", colour: Theme.accent) { [weak self] in self?.perform("check") }
+        check.identifier = NSUserInterfaceItemIdentifier("index.checkModel")
+        checkButton = check
+        add(NSStackView(views: [IndexUI.caption("Embedding model"), IndexUI.spacer(), check]), after: 20)
+        add(modelHealth, after: 8)
 
         let manage = ActionButton("Manage folders…", colour: Theme.accent) { [weak self] in self?.onOpenSetting?("content.roots") }
         manage.identifier = NSUserInterfaceItemIdentifier("index.manageFolders")
@@ -134,7 +167,13 @@ final class IndexDashboardView: NSView {
         compact.identifier = NSUserInterfaceItemIdentifier("index.compact")
         compact.toolTip = "Reclaim unused index space. A confirmation explains what will be removed."
         compactButton = compact
-        add(NSStackView(views: [IndexUI.caption("Needs attention"), IndexUI.spacer(), compact]), page: 2, after: 0)
+        let retry = ActionButton("Retry failed items", colour: Theme.accent) { [weak self] in self?.perform("retry") }
+        retry.identifier = NSUserInterfaceItemIdentifier("index.retry")
+        retry.toolTip = "Retry recorded extraction problems and missing embeddings. Successful files and vectors are reused."
+        retryButton = retry
+        fileCheck.onOpenSetting = { [weak self] key in self?.onOpenSetting?(key) }
+        add(fileCheck, page: 2, after: 0)
+        add(NSStackView(views: [IndexUI.caption("Needs attention"), IndexUI.spacer(), retry, compact]), page: 2, after: 24)
         add(attention, page: 2, after: 8)
         add(IndexDisclosure("Last reported pass", content: activity), page: 2, after: 16)
         add(IndexDisclosure("Storage", content: storage), page: 2, after: 12)
@@ -189,7 +228,15 @@ final class IndexDashboardView: NSView {
         return row
     }
 
-    func update(_ overview: IndexOverview?) {
+    private func perform(_ action: String, folder: String = "") {
+        actionError.stringValue = onAction?(action, folder) ?? ""
+        actionError.isHidden = actionError.stringValue.isEmpty
+        if !actionError.isHidden { showPage(0) }
+    }
+
+    func update(_ overview: IndexOverview?, controls: IndexControls? = nil) {
+        let oldControls = self.controls
+        self.controls = controls
         guard let overview else {
             last = nil
             title.stringValue = "Index status unavailable"
@@ -197,6 +244,12 @@ final class IndexDashboardView: NSView {
             subtitle.stringValue = "Waiting for an index snapshot. Previous counts are not shown."
             refreshButton?.isEnabled = false
             compactButton?.isEnabled = false
+            pauseButton?.isEnabled = false
+            retryButton?.isEnabled = false
+            checkButton?.isEnabled = false
+            modelHealth.stringValue = "Waiting for model status"
+            embeddingWork.isHidden = true
+            embeddingMeter.isHidden = true
             inventory.stringValue = "Waiting for index"
             currentWork.stringValue = ""
             passSummary.stringValue = ""
@@ -213,20 +266,45 @@ final class IndexDashboardView: NSView {
             rebuildBusy([])
             return
         }
-        guard overview != last else { return }
+        guard overview != last || controls != oldControls else { return }
         let previous = last
         last = overview
         updateHeader(overview)
         inventory.stringValue = "\(IndexUI.number(overview.documents)) documents  ·  \(IndexUI.number(overview.semantic.eligible)) passages  ·  \(IndexUI.bytes(overview.disk.database + (overview.disk.cache ?? 0))) on disk"
         refreshButton?.isEnabled = ["ready", "partial", "failed"].contains(overview.state)
+            && (controls?.canRun ?? true)
+        pauseButton?.showTitle(controls?.manualPause == true ? "Resume indexing" : "Pause indexing", colour: Theme.accent)
+        pauseButton?.isEnabled = controls?.canPause == true
+        retryButton?.isEnabled = controls?.canRun == true
+        checkButton?.showTitle(controls?.checking == true ? "Checking…" : "Check model", colour: Theme.accent)
+        checkButton?.isEnabled = controls != nil && controls?.checking == false && !["erasing", "compacting"].contains(overview.state)
+        var healthText = controls?.health.map { health in
+            "Last check: \(health.model)\(health.dimensions.map { " · \($0) dimensions" } ?? "") · \(health.milliseconds) ms\n\(health.message)"
+        } ?? "Checks your selected embedding model locally with a short test phrase. No documents are sent and no model is downloaded."
+        if controls?.checking == true { healthText = "Checking the selected model locally…" }
+        if controls?.recoveryNeeded == true {
+            healthText += controls?.manualPause == true || controls?.policyPause == true
+                ? "\nAutomatic recovery waits until indexing is resumed and power policy allows it."
+                : overview.state == "indexing" ? "\nAutomatic recovery waits for the current pass to finish."
+                : "\nAutomatic recovery checks again in about \(IndexUI.duration(Double(controls?.retrySeconds ?? 0)))."
+        }
+        modelHealth.stringValue = healthText
         compactButton?.isEnabled = overview.sampled && !["indexing", "erasing", "compacting", "erased"].contains(overview.state)
         if previous?.semantic != overview.semantic || previous?.message != overview.message || previous?.sampled != overview.sampled || previous?.state != overview.state {
             semantic.set(semanticRows(overview))
         }
         if previous?.busy != overview.busy { rebuildBusy(overview.busy) }
-        if previous?.roots != overview.roots {
+        if previous?.roots != overview.roots || oldControls?.roots != controls?.roots || oldControls?.canRun != controls?.canRun {
             roots.set(overview.roots.isEmpty ? [IndexUI.note("No folders selected. Choose Manage folders to get started.")]
-                : overview.roots.map { IndexUI.row(symbol: "folder", tint: Theme.muted, title: $0) })
+                : (controls?.roots ?? overview.roots).map { path in
+                    let label = IndexUI.label((path as NSString).abbreviatingWithTildeInPath, IndexUI.font(13), Theme.ink, breaking: .byTruncatingMiddle)
+                    label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                    let rescan = ActionButton("Rescan", colour: Theme.muted) { [weak self] in self?.perform("folder", folder: path) }
+                    rescan.identifier = NSUserInterfaceItemIdentifier("index.rescanFolder")
+                    rescan.setAccessibilityLabel("Rescan \(path)")
+                    rescan.isEnabled = controls?.canRun == true
+                    return NSStackView(views: [IndexUI.symbol("folder", Theme.muted), label, IndexUI.spacer(), rescan])
+                })
         }
         if previous?.kinds != overview.kinds { types.set(typeRows(overview)) }
         if previous?.folders != overview.folders { folders.set(folderRows(overview)) }
@@ -264,13 +342,18 @@ final class IndexDashboardView: NSView {
         title.stringValue = text
         dot.fill(colour)
         let working = ["indexing", "compacting", "erasing"].contains(overview.state)
-        progress.isHidden = !working
-        if working && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { progress.startAnimation(nil) }
+        let embeddingTotal = overview.stage == "Embedding passages" ? controls?.embeddingTotal : nil
+        embeddingMeter.isHidden = !working || embeddingTotal == nil
+        embeddingMeter.fraction = Double(controls?.embeddingDone ?? 0) / Double(max(1, embeddingTotal ?? 1))
+        embeddingMeter.setAccessibilityValue("\(controls?.embeddingDone ?? 0) of \(embeddingTotal ?? 0) passages attempted")
+        progress.isHidden = !working || embeddingTotal != nil
+        if working && embeddingTotal == nil && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { progress.startAnimation(nil) }
         else { progress.stopAnimation(nil) }
         currentWork.stringValue = overview.state == "indexing"
             ? overview.currentFolder.map { "Working in \($0)" } ?? "Preparing the next batch…" : ""
         currentWork.isHidden = currentWork.stringValue.isEmpty
         passSummary.stringValue = ""
+        embeddingWork.stringValue = ""
         progressNote.stringValue = ""
         var parts: [String] = []
         switch overview.state {
@@ -282,6 +365,10 @@ final class IndexDashboardView: NSView {
                 passSummary.stringValue += " · \(IndexUI.number(written)) passages embedded"
             }
             progressNote.stringValue = "Work is still being counted. No reliable total or time estimate yet. This view updates automatically."
+            if let total = embeddingTotal {
+                embeddingWork.stringValue = "Embedding: \(IndexUI.number(controls?.embeddingDone)) of \(IndexUI.number(total)) passages attempted · \(IndexUI.number(controls?.embeddingRemaining)) remaining"
+                progressNote.stringValue = "This embedding pass only; failed passages are counted as attempted, not successful. Cache preparation follows."
+            }
         case "compacting":
             parts.append(overview.stage.isEmpty ? "Starting" : overview.stage)
             progressNote.stringValue = "Indexing and content search resume when compaction finishes. Your source files are not changed."
@@ -290,7 +377,9 @@ final class IndexDashboardView: NSView {
             progressNote.stringValue = "Stored search data is being removed. Source files are not deleted."
         case "paused":
             parts.append(overview.message)
-            progressNote.stringValue = "Resumes automatically when the power or thermal condition clears. No need to rescan."
+            progressNote.stringValue = controls?.manualPause == true
+                ? "Paused by you for this app session. Resume indexing keeps completed work; power and thermal protection still apply."
+                : "Resumes automatically when the power or thermal condition clears. No need to rescan."
         case "off", "erased", "needsRoots":
             parts.append(overview.message)
             progressNote.stringValue = "Use Folders to choose what to search, then Indexing settings to enable indexing."
@@ -306,6 +395,7 @@ final class IndexDashboardView: NSView {
             parts.append(overview.message)
         }
         passSummary.isHidden = passSummary.stringValue.isEmpty
+        embeddingWork.isHidden = embeddingWork.stringValue.isEmpty
         progressNote.isHidden = progressNote.stringValue.isEmpty
         subtitle.stringValue = parts.joined(separator: "  ·  ")
 
@@ -488,6 +578,97 @@ final class IndexDashboardView: NSView {
         rows.append(IndexUI.note("Ollama models run as a separate process and are not counted here. macOS has no per-app CPU or memory quota; Low-impact indexing spreads the work out."))
         return rows
     }
+}
+
+@MainActor
+final class FileInspectionView: NSStackView {
+    var inspect: (@Sendable (String) -> FileInspection?)?
+    var onOpenSetting: ((String) -> Void)?
+    private var task: Task<Void, Never>?
+    private var generation = UUID()
+    private var setting = ""
+    private let result = IndexUI.wrapping("Choose a file to check its scope, extraction and embedding coverage. This does not change the index.", IndexUI.font(12), Theme.muted, width: 550)
+    private let filename = IndexUI.label("", IndexUI.font(12, .medium), Theme.ink, breaking: .byTruncatingMiddle)
+    private let settings = NSButton(title: "Open relevant settings…", target: nil, action: nil)
+
+    init() {
+        super.init(frame: .zero)
+        orientation = .vertical
+        alignment = .leading
+        spacing = 10
+        translatesAutoresizingMaskIntoConstraints = false
+        let choose = NSButton(title: "Check a file…", target: self, action: #selector(chooseFile))
+        choose.identifier = NSUserInterfaceItemIdentifier("index.checkFile")
+        choose.bezelStyle = .rounded
+        let heading = NSStackView(views: [IndexUI.caption("Why can’t I find this file?"), IndexUI.spacer(), choose])
+        for view in [heading, filename, result] {
+            addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: widthAnchor).isActive = true
+        }
+        result.identifier = NSUserInterfaceItemIdentifier("index.fileResult")
+        filename.isHidden = true
+        settings.isBordered = false
+        settings.contentTintColor = Theme.accent
+        settings.target = self
+        settings.action = #selector(openSettings)
+        settings.identifier = NSUserInterfaceItemIdentifier("index.fileSettings")
+        settings.isHidden = true
+        addArrangedSubview(settings)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
+
+    isolated deinit { task?.cancel() }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { task?.cancel(); generation = UUID() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
+    @objc private func chooseFile() {
+        guard let window else { return }
+        let picker = NSOpenPanel()
+        picker.title = "Check a file in Blindspot"
+        picker.prompt = "Check file"
+        picker.canChooseDirectories = false
+        picker.allowsMultipleSelection = false
+        picker.resolvesAliases = false
+        picker.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = picker.url else { return }
+            self?.check(url)
+        }
+    }
+
+    func check(_ url: URL) {
+        guard url.isFileURL, let inspect else { return }
+        task?.cancel()
+        generation = UUID()
+        let expected = generation
+        filename.stringValue = url.lastPathComponent
+        filename.toolTip = url.path
+        filename.isHidden = false
+        settings.isHidden = true
+        result.stringValue = "Checking this file locally…"
+        let path = url.path
+        task = Task { [weak self] in
+            let worker = Task.detached(priority: .userInitiated) { inspect(path) }
+            let report = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+            guard !Task.isCancelled, let self, self.generation == expected else { return }
+            guard let report else {
+                self.result.stringValue = "The check is unavailable. Try again after current indexing work finishes."
+                return
+            }
+            self.result.stringValue = "\(report.title)\n\n\(report.detail)\n\n\(report.next)"
+            if let passages = report.passages, let embedded = report.embedded {
+                self.result.stringValue += "\n\n\(passages) stored passages · \(embedded) with active-generation embeddings"
+            }
+            self.setting = report.setting
+            self.settings.isHidden = report.setting.isEmpty
+        }
+    }
+
+    @objc private func openSettings() { if !setting.isEmpty { onOpenSetting?(setting) } }
 }
 
 /// Formatting and small view builders shared by the Index page.
@@ -867,4 +1048,9 @@ private final class ActionButton: NSButton {
     }
 
     @objc private func fire() { handler() }
+
+    func showTitle(_ title: String, colour: NSColor) {
+        attributedTitle = Theme.label(title, size: 12, tracking: 0, color: colour, weight: .medium)
+        setAccessibilityLabel(title)
+    }
 }

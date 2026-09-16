@@ -1,6 +1,20 @@
 import AppKit
 import Carbon.HIToolbox
 
+@MainActor
+private final class SettingsFrame: NSWindow {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .numericPad, .function])
+        if flags == .command, event.charactersIgnoringModifiers == "w" {
+            guard attachedSheet == nil else { return false }
+            performClose(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 /// A stack that lays out from the top.
 ///
 /// An `NSScrollView`'s document view has a bottom-left origin unless it says otherwise, so
@@ -1049,7 +1063,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         sections = Self.sections(of: settings)
         tabs = SettingsSidebar(titles: sections)
 
-        window = NSWindow(
+        window = SettingsFrame(
             contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.height),
             styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -1353,6 +1367,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         }
         if section == Self.index {
             let view = IndexDashboardView()
+            let reader = core.passageReader
+            view.inspectFile = { path in reader.inspect(path: path) }
             view.onRefresh = { [weak self] in
                 self?.core.refreshContent()
                 self?.core.refreshDiagnostics()
@@ -1360,12 +1376,20 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             view.onExclude = { [weak self] path in self?.exclude(path) }
             view.onCompact = { [weak self] in self?.confirmCompact() }
             view.onOpenSetting = { [weak self] key in self?.show(settingKey: key) }
+            view.onAction = { [weak self, weak view] action, folder in
+                guard let self else { return "Settings is unavailable" }
+                let error = self.core.indexAction(action, folder: folder)
+                let controls = self.core.indexControls
+                view?.update(self.core.contentState?.overview, controls: controls)
+                return error
+            }
             rows.addArrangedSubview(view)
             view.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
             view.heightAnchor.constraint(equalTo: scroll.contentView.heightAnchor).isActive = true
             dashboard = view
             core.refreshDiagnostics()
-            view.update(core.contentState?.overview)
+            let controls = core.indexControls
+            view.update(core.contentState?.overview, controls: controls)
             startIndexPolling()
             rows.layoutSubtreeIfNeeded()
             scroll.contentView.scroll(to: .zero)
@@ -1565,7 +1589,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self, !Task.isCancelled, self.window.isVisible, let dashboard = self.dashboard else { return }
-                dashboard.update(self.core.contentState?.overview)
+                let controls = self.core.indexControls
+                dashboard.update(self.core.contentState?.overview, controls: controls)
             }
         }
     }

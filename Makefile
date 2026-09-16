@@ -5,7 +5,7 @@
 
 APP        := Blindspot
 BUNDLE_ID  := com.seifboukerdenna.blindspot
-VERSION    := 0.3.0
+VERSION    := 0.3.1
 # Where Settings → Status looks for updates (shell/Updater.swift). Forks set their own.
 RELEASE_REPO ?= SeifBoukerdenna/blindspot
 
@@ -62,7 +62,7 @@ $(CORE_LIB): $(CORE_SRC) $(RETRIEVAL_SRC) $(CORE_DIR)/Cargo.toml Cargo.lock Make
 
 header: $(HEADER)
 
-$(HEADER): $(CORE_DIR)/src/ffi.rs $(CORE_DIR)/cbindgen.toml
+$(HEADER): $(CORE_DIR)/src/ffi.rs $(wildcard $(CORE_DIR)/src/ffi/*.rs) $(CORE_DIR)/cbindgen.toml
 	@mkdir -p include
 	cbindgen --config $(CORE_DIR)/cbindgen.toml --crate blindspot_core --output $@ $(CORE_DIR)
 

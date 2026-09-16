@@ -4,12 +4,12 @@ import AppKit
 @MainActor
 enum IndexDashboardTests {
     static func fixture(_ state: String = "ready", enabled: Bool = true, sampled: Bool = true,
-                        empty: Bool = false, failed: UInt64 = 0, stage: String? = nil) throws -> IndexOverview {
+                        empty: Bool = false, failed: UInt64 = 0, stage: String? = nil, written: UInt64 = 420) throws -> IndexOverview {
         let object: [String: Any] = [
             "state": state, "stage": stage ?? (state == "indexing" ? "Embedding passages" : ""),
             "message": state == "failed" ? "Semantic unavailable; text search ready"
                 : state == "paused" ? "Paused by resource policy · Low Power Mode · Semantic indexing queued"
-                : state == "indexing" ? "Embedding · 420 written · 18,004 current"
+                : state == "indexing" ? "Embedding · \(written) written · 18,004 current"
                 : "Semantic ready · embeddinggemma:300m",
             "stageSeconds": 38, "lastPassAgo": 42, "lastPassSeconds": 12.4,
             "currentFolder": "~/Documents/Research", "reclaimable": 32 * 1_048_576,
@@ -17,7 +17,7 @@ enum IndexDashboardTests {
                      "unchanged": 1128, "skipped": 36, "unreadable": 2, "removed": 3],
             "roots": ["~/Documents", "~/Projects"],
             "semantic": ["enabled": enabled, "embedded": empty ? 0 : 18424,
-                         "eligible": empty ? 0 : 24180, "passEmbedded": 420, "passFailed": failed],
+                         "eligible": empty ? 0 : 24180, "passEmbedded": written, "passFailed": failed],
             "documents": empty ? 0 : 14522, "pdfText": 216,
             "partialDocuments": state == "partial" ? 3 : 0, "budgetBytes": 3_221_225_472,
             "pdfIssues": [0, 0, 0, 0], "disk": ["database": 780_000_000, "cache": 43_000_000],
@@ -46,6 +46,16 @@ enum IndexDashboardTests {
     static func visibleText(_ view: NSView) -> String {
         descendants(view).filter { !$0.isHiddenOrHasHiddenAncestor }
             .compactMap { ($0 as? NSTextField)?.stringValue }.joined(separator: "\n")
+    }
+
+    static func controls(manual: Bool = false, policy: Bool = false, running: Bool = false,
+                         checking: Bool = false, recovery: Bool = false, total: UInt64? = nil,
+                         health: IndexControls.Health? = nil) -> IndexControls {
+        IndexControls(manualPause: manual, policyPause: policy, canPause: true,
+            canRun: !manual && !policy && !running, checking: checking, recoveryNeeded: recovery,
+            health: health, retrySeconds: recovery ? 60 : nil, embeddingTotal: total,
+            embeddingRemaining: total.map { $0 - 40 }, embeddingDone: total == nil ? 0 : 40,
+            roots: ["/fixture/Documents", "/fixture/Projects"])
     }
 
     static func render(_ dashboard: IndexDashboardView, name: String, directory: URL) throws {
@@ -205,7 +215,50 @@ enum IndexDashboardTests {
             dashboard.update(try fixture())
             precondition(allText().contains("embeddinggemma"))
             cases += 5
+            navigation.selectedSegment = 0
+            _ = navigation.sendAction(navigation.action, to: navigation.target)
+            var actions: [(String, String)] = []
+            dashboard.onAction = { action, folder in actions.append((action, folder)); return nil }
+            dashboard.update(try fixture("indexing", written: 40), controls: controls(running: true, total: 100))
+            precondition(visibleText(dashboard).contains("40 of 100 passages attempted · 60 remaining"))
+            let indicator = descendants(dashboard).compactMap { $0 as? NSProgressIndicator }.first!
+            let meter = descendants(dashboard).first { $0.identifier?.rawValue == "index.embeddingProgress" }!
+            precondition(indicator.isHidden && !meter.isHidden)
+            try render(dashboard, name: name + "-embedding-progress", directory: directory)
+            precondition(abs(meter.subviews.last!.frame.width - meter.bounds.width * 0.4) <= 1)
+            let pause = descendants(dashboard).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "index.pause" }!
+            pause.performClick(nil)
+            precondition(actions.last?.0 == "pause")
+            dashboard.update(try fixture("paused"), controls: controls(manual: true, policy: true, recovery: true))
+            precondition(pause.title == "Resume indexing" && visibleText(dashboard).contains("Paused by you for this app session"))
+            pause.performClick(nil)
+            precondition(actions.last?.0 == "resume")
+            dashboard.update(try fixture(), controls: controls(checking: true))
+            let check = descendants(dashboard).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "index.checkModel" }!
+            precondition(!check.isEnabled && check.title == "Checking…")
+            let health = IndexControls.Health(available: true, model: "fixture-model", dimensions: 768, milliseconds: 12, message: "Available · matches active model name, revision and dimensions")
+            dashboard.update(try fixture(), controls: controls(health: health))
+            precondition(visibleText(dashboard).contains("768 dimensions · 12 ms"))
+            check.performClick(nil)
+            precondition(actions.last?.0 == "check")
+            try render(dashboard, name: name + "-model-health", directory: directory)
+            navigation.selectedSegment = 1
+            _ = navigation.sendAction(navigation.action, to: navigation.target)
+            let rescan = descendants(dashboard).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "index.rescanFolder" }!
+            rescan.performClick(nil)
+            precondition(actions.last?.0 == "folder" && actions.last?.1 == "/fixture/Documents")
+            navigation.selectedSegment = 2
+            _ = navigation.sendAction(navigation.action, to: navigation.target)
+            let retry = descendants(dashboard).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "index.retry" }!
+            retry.performClick(nil)
+            precondition(actions.last?.0 == "retry")
+            dashboard.update(try fixture("paused"), controls: controls(policy: true))
+            precondition(!retry.isEnabled)
+            dashboard.update(nil)
+            precondition(!check.isEnabled && !pause.isEnabled)
+            precondition(!visibleText(dashboard).contains("fixture-model"))
+            cases += 7
         }
-        print("PASS: \(cases) dashboard states across dark/light palettes; pinned navigation, settings links, honest progress, pause handling, stale-state clearing, disclosure persistence, accessibility fallbacks, layout bounds; 14 PNG renders")
+        print("PASS: \(cases) dashboard states across dark/light palettes; pinned navigation, settings links, measurable embedding progress, pause/resume/retry/folder/check actions, stale-state clearing, accessibility fallbacks, layout bounds; 18 PNG renders")
     }
 }

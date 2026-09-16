@@ -3,8 +3,22 @@ import AppKit
 @main
 @MainActor
 enum PanelSmoke {
-    static func main() async {
+    private static let appDelegate = SmokeAppDelegate()
+
+    static func main() {
+        Task { @MainActor in
+            await run()
+            exit(0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { fatalError("Panel smoke timed out") }
+        NSApplication.shared.run()
+        fatalError("Application loop ended before the fixture completed")
+    }
+
+    static func run() async {
         NSApplication.shared.setActivationPolicy(.accessory)
+        NSApplication.shared.delegate = appDelegate
+        NSApplication.shared.mainMenu = MainMenu.make()
         precondition(ProcessInfo.processInfo.environment["HOME"] == nil,
                      "Run with env -u HOME so this fixture cannot open live Blindspot stores")
         Theme.current = .ember
@@ -67,6 +81,18 @@ enum PanelSmoke {
         let indexSection = findRow(in: content, key: "settings.section.Index") as! NSButton
         indexSection.performClick(nil)
         let navigation = findRow(in: content, key: "index.navigation") as! NSSegmentedControl
+        navigation.selectedSegment = 2
+        _ = navigation.sendAction(navigation.action, to: navigation.target)
+        guard let inspector = findRow(in: content, key: "index.checkFile")?.superview?.superview as? FileInspectionView else {
+            fatalError("File diagnostic control missing")
+        }
+        inspector.check(URL(fileURLWithPath: "/fixture/no-file.md"))
+        for _ in 0..<40 {
+            if visibleText(inspector).contains("Outside your indexed folders") { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        precondition(visibleText(inspector).contains("Outside your indexed folders"))
+        snapshot(content, name: "settings-file-diagnostic")
         navigation.selectedSegment = 1
         _ = navigation.sendAction(navigation.action, to: navigation.target)
         content.layoutSubtreeIfNeeded()
@@ -104,7 +130,28 @@ enum PanelSmoke {
         settings.show(settingKey: "status.version")
         guard let updates = findRow(in: content, key: "updates"),
               findButton(in: updates, title: "Check for updates") != nil else { fatalError("Updates row missing from Status") }
-        window.close()
+        let closeEvent = NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .command,
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, characters: "w", charactersIgnoringModifiers: "w", isARepeat: false, keyCode: 13)!
+        precondition(window.performKeyEquivalent(with: closeEvent))
+        for _ in 0..<40 {
+            if !window.isVisible { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        precondition(!window.isVisible, "Command-W must close Settings")
+        settings.show(settingKey: "agent.host")
+        content.layoutSubtreeIfNeeded()
+        guard let hostRow = findRow(in: content, key: "agent.host"),
+              let hostField = editableField(in: hostRow) else { fatalError("Host text field missing") }
+        precondition(window.isVisible && window.makeFirstResponder(hostField))
+        precondition(hostField.currentEditor() != nil)
+        precondition(window.performKeyEquivalent(with: closeEvent))
+        for _ in 0..<40 {
+            if !window.isVisible { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        precondition(!window.isVisible, "Command-W must also close Settings while editing text")
         panel.standDown()
         panel.show()
         precondition(panel.isVisible && panel.query.isEmpty)
@@ -132,8 +179,53 @@ enum PanelSmoke {
         panel.contentView?.layoutSubtreeIfNeeded()
         precondition(!visibleText(results).contains("Higashiyama"), "Pooled rows must clear old excerpts")
         panel.standDown()
+        await checkPassagePreview()
         print("Panel show/reopen, 14 queries, command Tab completion, setting Return navigation, content erasure confirmation cancellation, Status updates row, bounded rows and arrow routing: passed")
         print("Five search scopes with keyboard focus, eight sidebar sections, Index folder/settings navigation, resizable native glass surfaces: passed; persistent stores disabled")
+        print("Settings Command-W close, reopen and close with text-field focus: passed")
+        print("File diagnostic bridge and Settings presentation: passed")
+        print("Passage preview navigation, Unicode highlighting, stale-result rejection and close: passed")
+    }
+
+    private static func checkPassagePreview() async {
+        let first = PassagePreview.Item(id: 1, path: "/fixture/cycling.md", title: "Cycling route", page: 0, line: 12)
+        let second = PassagePreview.Item(id: 2, path: "/fixture/café.pdf", title: "Café stops", page: 3, line: 0)
+        let preview = PassagePreview()
+        var closed = 0
+        preview.onClose = { closed += 1 }
+        let text = "🚲 A café beside the canal. Repair your bicycle brakes before leaving."
+        let ranges = PassagePreview.highlights(in: text, query: ":content kind:pdf CAFÉ bicycle")
+        precondition(ranges.map { (text as NSString).substring(with: $0) } == ["café", "bicycle"])
+        precondition(PassagePreview.highlights(in: "plain text", query: "a kind:pdf").isEmpty)
+        precondition(preview.toggle(items: [first, second], selected: first, query: "bicycle café") { item in
+            if item.id == 1 { Thread.sleep(forTimeInterval: 0.15); return "Old bicycle passage" }
+            return text
+        })
+        preview.move(by: 1)
+        guard let window = NSApp.windows.first(where: { $0.title == "Passage preview" && $0.isVisible }),
+              let content = window.contentView,
+              let body = findRow(in: content, key: "passage.text") as? NSTextView else { fatalError("Reading window missing") }
+        for _ in 0..<40 {
+            if body.string == text { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        try? await Task.sleep(for: .milliseconds(200))
+        precondition(body.string == text, "Previous loader must not replace a newer result")
+        precondition((findRow(in: content, key: "passage.next") as? NSButton)?.isEnabled == false)
+        precondition(visibleText(content).contains("Page 3"))
+        content.layoutSubtreeIfNeeded()
+        precondition(!content.hasAmbiguousLayout)
+        snapshot(content, name: "passage-preview")
+        preview.close()
+        precondition(!preview.isShowing && closed == 1 && body.string.isEmpty)
+        precondition(preview.toggle(items: [first], selected: first, query: "route") { _ in nil })
+        for _ in 0..<40 {
+            if body.string.contains("no longer available") { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        precondition(body.string.contains("no longer available"))
+        preview.close()
+        precondition(closed == 2)
     }
 
     private static func snapshot(_ view: NSView, name: String) {
@@ -157,5 +249,19 @@ enum PanelSmoke {
     private static func findButton(in view: NSView, title: String) -> NSButton? {
         if let button = view as? NSButton, button.title.caseInsensitiveCompare(title) == .orderedSame { return button }
         return view.subviews.lazy.compactMap { findButton(in: $0, title: title) }.first
+    }
+
+    private static func editableField(in view: NSView) -> NSTextField? {
+        if let field = view as? NSTextField, field.isEditable { return field }
+        return view.subviews.lazy.compactMap { editableField(in: $0) }.first
+    }
+}
+
+@MainActor
+private final class SmokeAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        fatalError("Closing Settings must not terminate the app")
     }
 }

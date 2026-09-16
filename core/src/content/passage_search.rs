@@ -10,7 +10,33 @@ pub struct Match {
     pub words: bool,
 }
 
+pub struct FileStatus {
+    pub modified: i64,
+    pub changed: i64,
+    pub bytes: u64,
+    pub extraction: u8,
+    pub partial: bool,
+    pub passages: u64,
+    pub embedded: u64,
+}
+
 impl ContentStore {
+    pub fn file_status(&self, path: &Path) -> Result<Option<FileStatus>> {
+        let path = validated_path(path)?;
+        self.passage_read(Arc::new(AtomicBool::new(false)), || {
+            Ok(self.connection.query_row(
+                "SELECT modified_ns,changed_ns,bytes,extraction,partial,
+                 (SELECT count(*) FROM chunks c WHERE c.document_id=d.id),
+                 (SELECT count(*) FROM chunks c WHERE c.document_id=d.id AND EXISTS(
+                    SELECT 1 FROM chunk_embeddings e JOIN passage_models m ON m.model=e.model
+                    WHERE e.chunk_id=c.id AND m.active=1 AND m.complete=1 AND e.dimensions=m.dimensions))
+                 FROM documents d WHERE path=?1", [path], |r| Ok(FileStatus {
+                    modified:r.get(0)?, changed:r.get(1)?, bytes:r.get::<_,i64>(2)?.max(0) as u64, extraction:r.get(3)?,
+                    partial:r.get(4)?, passages:r.get::<_,i64>(5)?.max(0) as u64, embedded:r.get::<_,i64>(6)?.max(0) as u64,
+                 })).optional()?)
+        })
+    }
+
     pub fn stored_passage(&self, id:i64,path:&Path,roots:&[PathBuf],exclusions:&[PathBuf],cancel:Arc<AtomicBool>)->Result<Option<String>> {
         let path=validated_path(path)?;
         let scope=scope_sql(roots,exclusions)?;

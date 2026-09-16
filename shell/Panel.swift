@@ -82,6 +82,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     private let ghost = NSTextField(labelWithString: "")
     private let results: ResultsView
     private let preview = Preview()
+    private let passagePreview = PassagePreview()
     /// True while Quick Look is up. The preview takes key status, and without this the
     /// panel would tear itself down from `windowDidResignKey` with the query still in it.
     private var previewing = false
@@ -193,6 +194,12 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         buildContentView()
         results.onActivate = { [weak self] in self?.launchSelected() }
         preview.onClose = { [weak self] in self?.previewClosed() }
+        passagePreview.onClose = { [weak self] in self?.previewClosed() }
+        passagePreview.onDocument = { [weak self] item in
+            guard let self else { return }
+            self.previewing = true
+            self.previewing = self.preview.toggle(item.path, page: item.page)
+        }
         ActionHint.startTracking()
     }
 
@@ -481,7 +488,19 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // after `windowDidResignKey` had already dismissed the panel. Measured exactly
         // that way round.
         previewing = true
-        previewing = preview.toggle(match.path, page: match.page)
+        showPreview(match)
+    }
+
+    private func showPreview(_ match: Match) {
+        if match.kind == .file && (match.page > 0 || match.line > 0) {
+            let reader = core.passageReader
+            let item = { (match: Match) in PassagePreview.Item(id: match.id, path: match.path, title: match.name, page: match.page, line: match.line) }
+            let candidates = results.matches.filter { $0.kind == .file && ($0.page > 0 || $0.line > 0) }.map(item)
+            previewing = passagePreview.toggle(items: candidates.contains(item(match)) ? candidates : [item(match)],
+                selected: item(match), query: field.stringValue) { item in reader.text(rowID: item.id, path: item.path) }
+        } else {
+            previewing = preview.toggle(match.path, page: match.page)
+        }
     }
 
     /// `restoringFocus` is false when dismissing because the user launched something:
@@ -669,7 +688,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         }
         tabBar.show(status: plan?.status ?? Self.status(for: mode, in: matches))
         agentWorking = pending && effectiveQuery.hasPrefix(">")
-        if !(poll && matches == results.matches) {
+        if !passagePreview.isShowing && !(poll && matches == results.matches) {
             // Rows animate in where rows actually *arrive*: the panel opening, a change of
             // mode, and a new step landing. Counting rows rather than asking "is this a
             // poll in agent mode" — the model streams characters, so the command on the
@@ -768,7 +787,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             self.previewing = action.presentsModal
             defer {
                 self.actionTask = nil
-                self.previewing = self.preview.isShowing
+                    self.previewing = self.preview.isShowing || self.passagePreview.isShowing
             }
             do {
                 let effect = try await self.actionRegistry.perform(action, on: match, confirmed: true)
@@ -784,10 +803,12 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
                 case .none: self.refresh()
                 case .preview(let path):
                     self.previewing = true
-                    self.previewing = self.preview.toggle(path)
+                    if path == match.path { self.showPreview(match) }
+                    else { self.previewing = self.preview.toggle(path) }
                 case .previewPage(let path, let page):
                     self.previewing = true
-                    self.previewing = self.preview.toggle(path, page: page)
+                    if action.id.operation == "preview" { self.showPreview(match) }
+                    else { self.previewing = self.preview.toggle(path, page: page) }
                 case .dismiss(let restoringFocus): self.dismiss(restoringFocus: restoringFocus)
                 case .localAI(let request, let reference):
                     self.field.stringValue = ">" + request

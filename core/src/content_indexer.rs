@@ -46,6 +46,7 @@ pub struct Policy {
     pub extractor: Option<PathBuf>,
     pub storage_budget_bytes: u64,
     pub ocr_pages: u32,
+    pub force_reload: bool,
 }
 
 impl Default for Policy {
@@ -60,6 +61,7 @@ impl Default for Policy {
             extractor: None,
             storage_budget_bytes: 3 * 1024 * 1024 * 1024,
             ocr_pages: 0,
+            force_reload: false,
         }
     }
 }
@@ -415,7 +417,7 @@ fn load(
     let modified_ns = modified_ns(&metadata);
     let changed_ns = changed_ns(&metadata);
     let extraction_version=if path.extension().is_some_and(|ext|ext.eq_ignore_ascii_case("pdf")) && policy.ocr_pages>0 {1000+i64::from(policy.ocr_pages)} else {1};
-    if store.mark_unchanged_version(
+    if !policy.force_reload && store.mark_unchanged_version(
         scan,
         &identity,
         path,
@@ -779,7 +781,7 @@ pub(crate) fn excluded(path: &Path, name: &std::ffi::OsStr, policy: &Policy) -> 
             })
 }
 
-fn supported(path: &Path, documents: bool) -> bool {
+pub(crate) fn supported(path: &Path, documents: bool) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| {

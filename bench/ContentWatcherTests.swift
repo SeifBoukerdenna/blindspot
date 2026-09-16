@@ -5,12 +5,14 @@ private final class FixtureCore: ContentMonitoring {
     let root: String
     var refreshes = 0
     var pauses: [Bool] = []
+    var recoveryTicks = 0
     init(root: String) { self.root = root }
     var contentState: ContentRuntime? {
         ContentRuntime(enabled: true, onBattery: true, roots: [root], watchRoots: [root], indexing: false, status: "Fixture")
     }
     func pauseContent(_ paused: Bool, reason: ContentPauseReason) { pauses.append(paused) }
     func refreshContent() { refreshes += 1 }
+    func recoverContentModel() { recoveryTicks += 1 }
     func contentEventRelevant(_ path: String) -> Bool {
         return path.hasPrefix(root + "/") && !path.hasPrefix(root + "/.ignored")
     }
@@ -48,7 +50,7 @@ struct ContentWatcherTests {
         free(resolved)
         defer { try? fm.removeItem(at: root) }
         let core = FixtureCore(root: canonical)
-        var watcher: ContentWatcher? = ContentWatcher(core: core)
+        var watcher: ContentWatcher? = ContentWatcher(core: core, policyInterval: .milliseconds(200))
         weak let lifetime = watcher
         watcher?.configure()
         precondition(watcher?.isMonitoring == true, "The native event stream must start")
@@ -66,12 +68,15 @@ struct ContentWatcherTests {
         }
         precondition(core.refreshes == 1, "Native FSEvents must deliver and coalesce relevant changes")
         watcher?.stop()
+        let ticks = core.recoveryTicks
+        precondition(ticks > 0, "Model recovery must run without Settings polling")
         watcher = nil
         precondition(lifetime == nil, "Watcher callbacks must not retain the owner")
         try Data("after stop".utf8).write(to: root.appendingPathComponent("stopped.txt"))
         try await Task.sleep(for: .seconds(4))
         precondition(core.refreshes == 1, "Stopped watchers must not deliver refreshes")
         precondition(core.pauses.last == true)
-        print("Content monitoring: 6 resource-policy checks; native exclusion, event coalescing, stop, and owner release passed")
+        precondition(core.recoveryTicks == ticks, "Stopping the watcher must stop recovery ticks")
+        print("Content monitoring: resource policy, background model recovery ticks, native exclusion, event coalescing, stop, and owner release passed")
     }
 }

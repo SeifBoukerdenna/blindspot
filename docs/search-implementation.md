@@ -89,8 +89,9 @@ Configuration, overrides, clipboard, history and existing vector-cache files wer
 - This is not completion of every item in the original roadmap. Native iWork extraction,
   typed Word paragraph/XLSX row-range navigation and Office deep links remain unimplemented.
   Word/workbooks open whole-file; worksheet/row/cell labels are searchable text.
-- No Settings model-check button or digest-pinned Ollama model identity yet. Refresh after
-  backend availability changes; automatic timed retry/switching without filesystem work remains.
+- The 0.3.0 follow-up adds model checks, backed-off automatic recovery without filesystem
+  scans, manual pause/resume, root-level rescans, recorded-failure retries and bounded embedding
+  work counts. Ollama model identities are still not pinned by weights digest.
 - Explicit kind/size/date filters use exact scoped semantic scoring for up to 2,048 candidates.
   Larger scopes use bounded ANN candidates, then authoritative filtering; filtered recall is
   not exhaustive. Missing/corrupt shards degrade to text and the bounded delta until Refresh

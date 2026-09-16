@@ -954,6 +954,28 @@ void bs_free_results(BsResults results);
 void bs_shutdown(BsHandle *handle);
 
 /**
+ * Inspects one user-selected file without changing the index. Call on a worker.
+ * Free the returned JSON with `bs_free_blob`.
+ * # Safety
+ * `handle` must be NULL or live; `path` must be NULL or valid NUL-terminated UTF-8.
+ */
+BsBlob bs_content_inspect(const BsHandle *handle, const char *path);
+
+/**
+ * Returns bounded indexing-control and model-health state; free with `bs_free_blob`.
+ * # Safety
+ * `handle` must be NULL or live for this call.
+ */
+BsBlob bs_index_controls(const BsHandle *handle);
+
+/**
+ * Enqueues pause/resume/retry/folder/check or a recovery tick. Empty blob means accepted.
+ * # Safety
+ * `handle` must be NULL or live; strings must be NULL or valid NUL-terminated UTF-8.
+ */
+BsBlob bs_index_action(const BsHandle *handle, const char *action, const char *folder);
+
+/**
  * Reads one immutable indexed passage. Call on a worker; free with `bs_free_blob`.
  * Returns an empty blob when the row is stale, out of scope or unavailable.
  *
