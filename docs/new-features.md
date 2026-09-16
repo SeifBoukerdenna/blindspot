@@ -1,13 +1,25 @@
 # Blindspot — complete feature guide and workflows
 
-**Release: 0.2.9.** This guide describes implemented features, not the full proposed roadmap.
+**Release: 0.3.0.** This guide describes implemented features, not the full proposed roadmap.
 The release notes at the end distinguish new behavior from platform limitations.
 
-**Local search upgrade, September 16 (unreleased):** passage embeddings, blended ranking,
-code folders, PPTX/XLSX extraction, opt-in scanned-PDF OCR, PDF page previews, and Copy/Ask
-Passage. The release version is unchanged; no tag or publication was made.
+**0.3.0 interface:** translucent native surfaces, a search-scope menu, readable passage rows,
+sidebar Settings, and a flatter Index page. Your search syntax and stored index are preserved.
+The preceding local search upgrade includes passage embeddings, blended ranking, code folders,
+PPTX/XLSX extraction, opt-in scanned-PDF OCR, PDF page previews, and Copy/Ask Passage.
 
 ## 1. Open, navigate, and run actions
+
+The menu at the right of search switches between **Apps**, **Files**, **Clipboard**,
+**Assistant**, and **Documents**. Apps is the existing mixed search, not an app-only filter.
+Documents inserts `:content ` and searches all supported indexed text; use
+`documents about TOPIC` to restrict results to document kinds. Prefixes stay visible and editable.
+The quiet footer's **Actions** button opens the same menu as ⌘K.
+
+Settings now uses a resizable sidebar. **AI** was Agent, **Search** was Ranking, and
+**About** was Status; configuration keys and typed `:settings` links have not changed.
+Appearance keeps the existing palettes. macOS **Reduce Transparency** or **Increase Contrast**
+automatically replaces glass with an opaque surface; **Reduce Motion** disables launcher/list motion.
 
 | Shortcut | Behavior |
 |---|---|
@@ -131,7 +143,7 @@ Supported indexed text/code extensions:
 one vector per passage. It is separate from the model answering AI questions. Empty selects
 Apple's installed English contextual model. If Ollama is unavailable at indexing time, Apple is
 tried automatically; if no usable backend/generation is available, word search remains usable.
-No model is downloaded. Use Index → Refresh after starting Ollama or installing a model yourself.
+No model is downloaded. Use Index → Overview → Rescan folders after starting Ollama or installing a model yourself, once the current pass has stopped.
 
 - **What gets embedded:** prose, extracted PDF/Word/PPTX text, and code under explicitly selected
   **Code folders** (empty by default). Code elsewhere remains word-searchable. JSON, CSV, TSV,
@@ -177,24 +189,30 @@ second while open; **Settings → Content → Open index** jumps there.
 
 | Part | What it tells you |
 |---|---|
-| Header | Up to date, Indexing, Paused or Off; while indexing, the stage, elapsed time and folder; otherwise when the last pass finished and how long it took. **Refresh** starts a full reconciliation |
-| Meaning bar | Active-model vectors out of all stored passages; not a completion percentage because some kinds stay word-only |
-| Tiles | Documents stored, extracted documents with text, passages searchable by meaning, disk used (database plus semantic cache) |
-| Busy-folder banner | A folder whose files changed at least 20 times in five minutes. **Exclude folder** asks first, then adds it to Content → Excluded paths |
-| What's indexed | Documents by kind (notes, PDFs, code, data, web) and by top-level folder, with sizes. Click a folder to reveal it in Finder |
-| Needs attention | Documents without text, locked, oversized, unreadable or partly indexed. Click to reveal |
-| Recently changed | The most recently modified indexed files |
-| Activity | This pass's checked, updated, unchanged, skipped and unreadable counts; what was embedded; watched folders; when counts were sampled |
-| Resources | Blindspot and each helper (semantic model, vector search, PDF extraction) with memory and CPU %, and the current pace |
+| Overview → live work | Actual stage, elapsed stage time, current root folder and this pass's checked/updated counts. The moving bar indicates activity, not percent complete. Pauses show their reason and automatic-resume behavior |
+| Overview → Your library | Documents, stored passages and disk used (database plus vector cache); active-model embeddings are separate from pass progress because some kinds stay word-only |
+| Overview → Indexing settings… | Opens the indexing controls in Content |
+| Folders → Search locations | Watched roots; **Manage folders…** opens folder controls, exclusions and code roots in Content |
+| Folders → busy-folder warning | A folder whose files changed at least 20 times in five minutes. **Exclude folder** asks first, then adds it to Content → Excluded paths |
+| Folders → Indexed folders / File types | Documents by top-level folder and kind, with sizes. Click an indexed folder to reveal it in Finder |
+| Folders → Recently changed | The most recently modified indexed files |
+| Diagnostics → Needs attention | Extraction problems, partly indexed documents and embedding failures. File rows reveal the source |
+| Diagnostics → Last reported pass | Checked, updated, unchanged, skipped and unreadable counts; what was embedded; watched folders; when counts were sampled |
+| Diagnostics → Storage / Resources | Disk usage and storage target; Blindspot and each helper (semantic model, vector search, PDF extraction) with memory and sampled CPU %, and the current pace |
 
-**Compact** (next to Refresh on the Index page) asks first, then removes vectors left by the
+**Compact…** (under Index → Diagnostics) asks first, then removes vectors left by the
 retired search model, merges the word index and rewrites the database file so deleted pages go
 back to the disk. Indexing and content search pause until it finishes. It needs free disk space
-roughly equal to the database size, and never removes documents or current vectors. The Disk
-tile shows how much is reclaimable, and Activity shows the last result.
+roughly equal to the database size, and never removes documents or current vectors. The Storage
+section shows how much is reclaimable, and Last reported pass shows the last result.
+
+Overview, Folders and Diagnostics stay visible as navigation while the content scrolls.
+File types, Recently changed, Last reported pass, Storage and Resources are expandable.
+Your selected tab and expanded sections stay put during polling. Missing snapshots clear old figures rather
+than leaving stale counts on screen. Coverage describes stored passages, not a work queue or ETA.
 
 Inventory, stored and disk figures are sampled in the background at most every 15 seconds; pass
-counters update immediately. **Settings → Status → Content index** gives a one-line summary.
+counters update immediately. **Settings → About → Content index** gives a one-line summary.
 Detailed terms:
 
 | Item | Meaning |
@@ -216,16 +234,17 @@ Detailed terms:
 | Paused | A named power/thermal condition is preventing background work |
 
 Storage/count diagnostics are sampled in the background; they are not instantaneous totals.
-**Settings → Status → Content storage** separates database, WAL and SHM sizes from the
+**Settings → About → Content storage** separates database, WAL and SHM sizes from the
 vector files. File sizes are logical sizes, not a total filesystem allocation
 measurement. App resident memory is shown separately under **App resources**.
 
-There is no reliable final percentage until the eligible work is known. Each counter is
-shown once; the Erase row describes erasure and only shows erase progress during an erase.
+There is no reliable total, final percentage or ETA until the eligible work is known.
+The Erase row describes erasure and only shows erase progress during an erase.
 
-**Refresh** requests reconciliation. During active indexing it cancels that pass and
-queues another; committed documents/embeddings remain reusable. Avoid repeatedly pressing
-it while progress is advancing. Filesystem changes normally trigger updates automatically.
+**Rescan folders** (formerly Refresh) requests reconciliation from Overview. It is unavailable
+while work is running or paused; the dashboard updates automatically without it. Paused work
+resumes when the named power/thermal condition clears. Filesystem changes normally trigger
+updates automatically; committed documents and embeddings remain reusable.
 
 **Disable indexing:** stops it and hides content results, retaining stored data.
 **Erase content index:** after confirmation, disables indexing and removes stored excerpts,
@@ -260,7 +279,7 @@ Upgrading the app normally reuses the separate on-disk index and compatible embe
   that a program rewrites constantly shows up as a busy folder on the Index page.
 - These are workload limits, **not hard CPU-percent or total-RAM quotas**.
 - Ollama/Qwen runs separately. Its model memory is not the launcher's own memory usage.
-  **Settings → Status → App resources** and **Settings → Index → Resources** show Blindspot and its
+  **Settings → About → App resources** and **Settings → Index → Resources** show Blindspot and its
   own helpers with resident memory and CPU percentage between two refreshes (the first refresh
   shows memory only). Ollama is a separate process and is not included; use Activity Monitor for it.
   CPU time is converted from Mach time units: builds before 0.2.5 under-reported cumulative CPU
@@ -331,7 +350,7 @@ AI transformations accept text up to about 16 KB. Disabling recording stops new 
 ## 7. Local AI and context
 
 `>your question` explicitly opens general Agent mode. Return submits. Choose installed
-models through **Settings → Agent** or ⌘M in Agent mode. The Settings pickers use the
+models through **Settings → AI** or ⌘M in Agent mode. The Settings pickers use the
 configured local Ollama host and include **Refresh local models**. The current configured
 choice remains represented when unavailable; choosing a model does not download one.
 Set the task model and question model independently where offered.
@@ -570,9 +589,9 @@ Type `:` or `:help` for the first-party command catalog; `:po` then Tab complete
 `:ports`. `:settings WORDS` searches labels, sections and keys, e.g. `:settings hotkey`,
 `:settings clipboard`, `:settings agent.model`.
 
-**Settings → Status** also shows the installed Blindspot version.
+**Settings → About** also shows the installed Blindspot version.
 
-**Updates:** press **Settings → Status → Updates → Check for updates**.
+**Updates:** press **Settings → About → Updates → Check for updates**.
 
 - **Checking:** Blindspot asks GitHub for the latest release of SeifBoukerdenna/blindspot. It never
   checks in the background.
@@ -596,7 +615,8 @@ Settings cover launcher/Agent shortcuts, login startup, result count, app folder
 launch-history ranking decay, indexed roots/exclusions/source size/power policy,
 clipboard retention/images/OCR, local AI models/host/keep-alive/timeout/allowed roots,
 appearance palettes, and diagnostic status. Reset returns a setting to its inherited
-configuration/default; the origin label explains whether it was set in this window.
+configuration/default. **Reset** appears for values changed in Settings; inherited-value badges
+are hidden. Restart-required controls still say so.
 
 ## 13. Practical workflows
 
@@ -646,9 +666,9 @@ configuration/default; the origin label explains whether it was set in this wind
 
 ### Reclaim disk space from the index
 
-1. Open **Settings → Index** and read the Disk tile's reclaimable amount.
+1. Open **Settings → Index → Diagnostics → Storage** and read the reclaimable amount.
 2. Press **Compact**, read the confirmation and choose Compact.
-3. Watch the header stages; Activity shows before and after sizes when it is done.
+3. Watch the stages in Overview; Diagnostics → Last reported pass shows before and after sizes when it is done.
 
 ### Free a development port safely
 
@@ -668,16 +688,16 @@ configuration/default; the origin label explains whether it was set in this wind
 ### Maintain the index without wasting work
 
 1. Keep roots limited to folders you need. Exclude generated/private subfolders.
-2. Open **Settings → Index**. The header shows the stage and elapsed time; the meaning bar shows
-   active-model passage coverage. **Embedded this pass** counts passages, not documents.
-3. If a busy-folder banner names generated data (logs, feeds, caches), choose **Exclude folder**.
-   If **Resources** shows sustained CPU you do not want, turn on **Low-impact indexing**;
+2. Open **Settings → Index → Overview** for the stage, elapsed time and pass counters.
+   Active-model passage counts describe your stored library, not percent complete.
+3. If a warning under **Folders** names generated data (logs, feeds, caches), choose **Exclude folder**.
+   If **Diagnostics → Resources** shows sustained CPU you do not want, turn on **Low-impact indexing**;
    passes take longer. Turning off **Search by meaning** stops embedding work entirely.
 4. If paused, read the specific reason; power checks repeat automatically.
-5. Let a running pass finish. Use Refresh for a reconciliation, not as a progress refresh button.
+5. Let a running pass finish. **Rescan folders** becomes available once it stops; progress updates itself.
 6. Upgrade the app normally. Do not erase the index merely to install a new build.
 
-## 14. Privacy, limitations, and 0.2.9 release notes
+## 14. Privacy, limitations, and release notes
 
 Data and inference remain local by default. No cloud dependency or custom third-party
 extension setup is added. The local model service must be running. This is a locally
@@ -688,9 +708,18 @@ arbitrary process restart, complete browser automation, public extension distrib
 hard CPU/RAM quotas, or validated 10-million-record production operation. macOS limits
 process visibility, selected-text access, last-opened metadata and atomic PID identity checks.
 
+**0.3.0 changes**
+
+- Native translucent launcher and Settings, with opaque accessibility fallbacks.
+- Compact search-scope menu replaces the permanent tab strip; existing keyboard modes remain.
+- Flat results with an inset selection; document paths and excerpts have separate lines.
+- Resizable sidebar Settings with native switches and keyboard-accessible shortcut/palette controls.
+- Index has pinned Overview / Folders / Diagnostics navigation, direct links to controls, explicit live stages and pause reasons, with stored embedding coverage separate from progress.
+- Existing index, embeddings, roots, exclusions, history and configuration are reused; no UI migration or rebuild is required.
+
 **0.2.9 changes**
 
-- **In-app updates:** Settings → Status → Updates checks GitHub for the latest release, then
+- **In-app updates:** Settings → About → Updates checks GitHub for the latest release, then
   downloads, verifies and installs it and relaunches, asking first.
 - **Add calendar events:** `schedule a meeting today about an exam at 6pm` shows a preview; Return
   adds it. Calendar questions such as `do I have anything on my calendar today` show your schedule,
@@ -757,6 +786,6 @@ process visibility, selected-text access, last-opened metadata and atomic PID id
 
 The Settings shortcuts, visible version, source-byte accounting and empty filtered-search
 explanations from 0.2.4 remain available. Still not included: native iWork extraction, Office deep links, hard CPU/RAM
-quotas, copying or deleting files from the agent, system-wide snippet expansion, creating or
-editing calendar events, and changing system settings beyond the commands listed in section 9. The
+quotas, copying or deleting files from the agent, system-wide snippet expansion,
+editing existing calendar events, and changing system settings beyond the commands listed in section 9. The
 related-by-meaning tail and document answers are approximate; check the cited sources.

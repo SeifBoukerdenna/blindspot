@@ -1,5 +1,10 @@
 import AppKit
 
+@MainActor
+private final class IndexPageStack: NSStackView {
+    override var isFlipped: Bool { true }
+}
+
 /// The Index page: what the content index holds, what it is doing and what it costs, drawn
 /// from one structured snapshot per refresh. Numbers, sizes and times are formatted here; what
 /// each count means is decided in the core, so the page cannot drift from the indexer.
@@ -11,12 +16,23 @@ final class IndexDashboardView: NSView {
     var onRefresh: (() -> Void)?
     var onExclude: ((String) -> Void)?
     var onCompact: (() -> Void)?
+    var onOpenSetting: ((String) -> Void)?
 
-    private let column = NSStackView()
+    private let column = IndexPageStack()
+    private let pages = (0..<3).map { _ in IndexPageStack() }
+    private let navigation = NSSegmentedControl()
+    private let scroll = NSScrollView()
+    private(set) var selectedPage = 0
     private let dot = PlateView(fill: Theme.faint, radius: 4)
     private let title = IndexUI.label("Index", IndexUI.font(20, .semibold), Theme.ink)
-    private let subtitle = IndexUI.label("", IndexUI.font(12), Theme.muted, breaking: .byTruncatingMiddle)
-    private let tiles = (0..<4).map { _ in Tile() }
+    private let subtitle = IndexUI.wrapping("", IndexUI.font(12), Theme.muted, width: 560)
+    private let currentWork = IndexUI.wrapping("", IndexUI.font(13), Theme.ink, width: 560)
+    private let passSummary = IndexUI.wrapping("", IndexUI.font(12), Theme.inkSoft, width: 560)
+    private let progressNote = IndexUI.wrapping("", IndexUI.font(12), Theme.muted, width: 560)
+    private let progress = NSProgressIndicator()
+    private let issueSummary = IndexUI.wrapping("", IndexUI.font(12), Theme.muted, width: 560)
+    private let inventory = IndexUI.wrapping("Waiting for index", IndexUI.font(12), Theme.muted, width: 600)
+    private let roots = Card()
     private let semantic = Card()
     private let storage = Card()
     private let busy = NSStackView()
@@ -36,52 +52,117 @@ final class IndexDashboardView: NSView {
         column.orientation = .vertical
         column.alignment = .leading
         column.spacing = 0
+        column.detachesHiddenViews = true
         column.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(column)
+        scroll.documentView = column
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        navigation.segmentCount = 3
+        for (index, name) in ["Overview", "Folders", "Diagnostics"].enumerated() {
+            navigation.setLabel(name, forSegment: index)
+            navigation.setWidth(112, forSegment: index)
+        }
+        navigation.trackingMode = .selectOne
+        navigation.target = self
+        navigation.action = #selector(navigate)
+        navigation.identifier = NSUserInterfaceItemIdentifier("index.navigation")
+        navigation.setAccessibilityLabel("Index sections")
+        navigation.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(navigation)
+        addSubview(scroll)
+        let preferredHeight = heightAnchor.constraint(equalToConstant: 520)
+        preferredHeight.priority = .defaultLow
         NSLayoutConstraint.activate([
-            column.topAnchor.constraint(equalTo: topAnchor, constant: 18),
-            column.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Theme.gutter),
-            column.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Theme.gutter),
-            column.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -24),
+            preferredHeight,
+            navigation.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            navigation.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Theme.gutter),
+            navigation.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -Theme.gutter),
+            scroll.topAnchor.constraint(equalTo: navigation.bottomAnchor, constant: 18),
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+            column.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
         ])
+        for page in pages {
+            page.orientation = .vertical
+            page.alignment = .leading
+            page.spacing = 0
+            page.edgeInsets = NSEdgeInsets(top: 4, left: Theme.gutter, bottom: 24, right: Theme.gutter)
+            column.addArrangedSubview(page)
+            page.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+        }
         busy.orientation = .vertical
         busy.alignment = .leading
         busy.spacing = 8
         busy.isHidden = true
 
-        let pair = NSStackView(views: [types, folders])
-        pair.orientation = .horizontal
-        pair.distribution = .fillEqually
-        pair.alignment = .top
-        pair.spacing = 12
-
         add(header(), after: 0)
-        add(tileRow(), after: 18)
-        add(IndexUI.caption("Search by meaning"), after: 22)
+        add(subtitle, after: 8)
+        progress.style = .bar
+        progress.isIndeterminate = true
+        progress.isDisplayedWhenStopped = false
+        progress.setAccessibilityLabel("Indexing activity; total work is not known")
+        add(progress, after: 16)
+        add(currentWork, after: 12)
+        add(passSummary, after: 8)
+        add(progressNote, after: 8)
+        add(IndexUI.caption("Your library"), after: 24)
+        add(inventory, after: 8)
         add(semantic, after: 8)
-        add(busy, after: 14)
-        add(IndexUI.caption("Needs attention"), after: 22)
-        add(attention, after: 8)
-        add(IndexUI.caption("Indexer activity"), after: 22)
-        add(activity, after: 8)
-        add(IndexUI.caption("Storage"), after: 22)
-        add(storage, after: 8)
-        add(IndexUI.caption("What's indexed"), after: 22)
-        add(pair, after: 8)
-        add(IndexUI.caption("Recently changed"), after: 22)
-        add(recent, after: 8)
-        add(IndexUI.caption("Resources"), after: 22)
-        add(resources, after: 8)
+        add(issueSummary, after: 16)
+        let issues = ActionButton("Review diagnostics →", colour: Theme.accent) { [weak self] in self?.showPage(2) }
+        issues.identifier = NSUserInterfaceItemIdentifier("index.reviewIssues")
+        let settings = ActionButton("Indexing settings…", colour: Theme.muted) { [weak self] in self?.onOpenSetting?("content.enabled") }
+        settings.identifier = NSUserInterfaceItemIdentifier("index.settings")
+        add(NSStackView(views: [issues, IndexUI.spacer(), settings]), after: 12)
+
+        let manage = ActionButton("Manage folders…", colour: Theme.accent) { [weak self] in self?.onOpenSetting?("content.roots") }
+        manage.identifier = NSUserInterfaceItemIdentifier("index.manageFolders")
+        add(NSStackView(views: [IndexUI.caption("Search locations"), IndexUI.spacer(), manage]), page: 1, after: 0)
+        add(IndexUI.note("These are the folders being watched. Manage folders also opens exclusions and code-folder controls."), page: 1, after: 8)
+        add(roots, page: 1, after: 8)
+        add(busy, page: 1, after: 14)
+        add(IndexUI.caption("Indexed folders"), page: 1, after: 20)
+        add(folders, page: 1, after: 8)
+        add(IndexDisclosure("File types", content: types), page: 1, after: 12)
+        add(IndexDisclosure("Recently changed", content: recent), page: 1, after: 12)
+
+        let compact = ActionButton("Compact…", colour: Theme.muted) { [weak self] in self?.onCompact?() }
+        compact.identifier = NSUserInterfaceItemIdentifier("index.compact")
+        compact.toolTip = "Reclaim unused index space. A confirmation explains what will be removed."
+        compactButton = compact
+        add(NSStackView(views: [IndexUI.caption("Needs attention"), IndexUI.spacer(), compact]), page: 2, after: 0)
+        add(attention, page: 2, after: 8)
+        add(IndexDisclosure("Last reported pass", content: activity), page: 2, after: 16)
+        add(IndexDisclosure("Storage", content: storage), page: 2, after: 12)
+        add(IndexDisclosure("Resources", content: resources), page: 2, after: 12)
+        showPage(0)
         update(nil)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
 
-    private func add(_ view: NSView, after spacing: CGFloat) {
-        if let previous = column.arrangedSubviews.last { column.setCustomSpacing(spacing, after: previous) }
-        column.addArrangedSubview(view)
-        view.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
+    private func add(_ view: NSView, page: Int = 0, after spacing: CGFloat) {
+        let stack = pages[page]
+        if let previous = stack.arrangedSubviews.last { stack.setCustomSpacing(spacing, after: previous) }
+        stack.addArrangedSubview(view)
+        view.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -Theme.gutter * 2).isActive = true
+    }
+
+    @objc private func navigate() { showPage(navigation.selectedSegment) }
+
+    private func showPage(_ index: Int) {
+        guard pages.indices.contains(index) else { return }
+        selectedPage = index
+        navigation.selectedSegment = index
+        for (at, page) in pages.enumerated() { page.isHidden = at != index }
+        column.layoutSubtreeIfNeeded()
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
     }
 
     private func header() -> NSView {
@@ -91,32 +172,20 @@ final class IndexDashboardView: NSView {
         heading.orientation = .horizontal
         heading.alignment = .centerY
         heading.spacing = 9
-        let text = NSStackView(views: [heading, subtitle])
+        let text = NSStackView(views: [heading])
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 3
         subtitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let refresh = ActionButton("Refresh", colour: Theme.accent) { [weak self] in self?.onRefresh?() }
-        let compact = ActionButton("Compact", colour: Theme.muted) { [weak self] in self?.onCompact?() }
+        let refresh = ActionButton("Rescan folders", colour: Theme.accent) { [weak self] in self?.onRefresh?() }
         refresh.identifier = NSUserInterfaceItemIdentifier("index.refresh")
-        compact.identifier = NSUserInterfaceItemIdentifier("index.compact")
         refresh.toolTip = "Rescan your selected folders and retry semantic indexing. No model downloads."
-        compact.toolTip = "Reclaim unused index space. A confirmation explains what will be removed."
         refreshButton = refresh
-        compactButton = compact
-        let row = NSStackView(views: [text, IndexUI.spacer(), compact, refresh])
+        let row = NSStackView(views: [text, IndexUI.spacer(), refresh])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 12
-        return row
-    }
-
-    private func tileRow() -> NSView {
-        let row = NSStackView(views: tiles.map(\.view))
-        row.orientation = .horizontal
-        row.distribution = .fillEqually
-        row.spacing = 10
         return row
     }
 
@@ -128,10 +197,17 @@ final class IndexDashboardView: NSView {
             subtitle.stringValue = "Waiting for an index snapshot. Previous counts are not shown."
             refreshButton?.isEnabled = false
             compactButton?.isEnabled = false
-            for (tile, name) in zip(tiles, ["Documents", "Passages", "Embedded", "On disk"]) {
-                tile.set(name, "—", "Waiting for index")
-            }
-            for card in [semantic, storage, types, folders, attention, recent, activity, resources] {
+            inventory.stringValue = "Waiting for index"
+            currentWork.stringValue = ""
+            passSummary.stringValue = ""
+            progressNote.stringValue = ""
+            issueSummary.stringValue = ""
+            currentWork.isHidden = true
+            passSummary.isHidden = true
+            progressNote.isHidden = true
+            progress.stopAnimation(nil)
+            progress.isHidden = true
+            for card in [semantic, storage, types, roots, folders, attention, recent, activity, resources] {
                 card.set([IndexUI.note("Waiting for index status…")])
             }
             rebuildBusy([])
@@ -141,13 +217,17 @@ final class IndexDashboardView: NSView {
         let previous = last
         last = overview
         updateHeader(overview)
-        updateTiles(overview)
-        refreshButton?.isEnabled = !["erasing", "compacting"].contains(overview.state)
+        inventory.stringValue = "\(IndexUI.number(overview.documents)) documents  ·  \(IndexUI.number(overview.semantic.eligible)) passages  ·  \(IndexUI.bytes(overview.disk.database + (overview.disk.cache ?? 0))) on disk"
+        refreshButton?.isEnabled = ["ready", "partial", "failed"].contains(overview.state)
         compactButton?.isEnabled = overview.sampled && !["indexing", "erasing", "compacting", "erased"].contains(overview.state)
-        if previous?.semantic != overview.semantic || previous?.message != overview.message || previous?.sampled != overview.sampled {
+        if previous?.semantic != overview.semantic || previous?.message != overview.message || previous?.sampled != overview.sampled || previous?.state != overview.state {
             semantic.set(semanticRows(overview))
         }
         if previous?.busy != overview.busy { rebuildBusy(overview.busy) }
+        if previous?.roots != overview.roots {
+            roots.set(overview.roots.isEmpty ? [IndexUI.note("No folders selected. Choose Manage folders to get started.")]
+                : overview.roots.map { IndexUI.row(symbol: "folder", tint: Theme.muted, title: $0) })
+        }
         if previous?.kinds != overview.kinds { types.set(typeRows(overview)) }
         if previous?.folders != overview.folders { folders.set(folderRows(overview)) }
         if previous?.attention != overview.attention || previous?.pdfIssues != overview.pdfIssues || previous?.sampled != overview.sampled || previous?.partialDocuments != overview.partialDocuments || previous?.semantic.passFailed != overview.semantic.passFailed || previous?.state != overview.state || previous?.message != overview.message || previous?.compactError != overview.compactError || previous?.pacing != overview.pacing {
@@ -157,11 +237,19 @@ final class IndexDashboardView: NSView {
         activity.set(activityRows(overview))
         storage.set(storageRows(overview))
         resources.set(resourceRows(overview))
+        var issues: [String] = []
+        let extraction = overview.pdfIssues?.reduce(0, +) ?? UInt64(overview.attention.count)
+        if extraction > 0 { issues.append("\(IndexUI.number(extraction)) extraction issues") }
+        if let partial = overview.partialDocuments, partial > 0 { issues.append("\(IndexUI.number(partial)) partly indexed documents") }
+        if let failed = overview.semantic.passFailed, failed > 0 { issues.append("\(IndexUI.number(failed)) embedding failures this pass") }
+        issueSummary.stringValue = !overview.sampled ? "Checking for issues…" : issues.isEmpty
+            ? "No file issues reported. Diagnostics has detailed activity, storage and resource usage."
+            : issues.joined(separator: " · ") + ". Review diagnostics for details."
     }
 
     private func updateHeader(_ overview: IndexOverview) {
         let (text, colour): (String, NSColor) = switch overview.state {
-        case "indexing": ("Indexing", Theme.accent)
+        case "indexing": (overview.stage.isEmpty ? "Preparing index" : overview.stage, Theme.accent)
         case "ready": ("Index pass complete", Theme.ok)
         case "partial": ("Partly indexed", Theme.warn)
         case "paused": ("Paused", Theme.warn)
@@ -170,62 +258,77 @@ final class IndexDashboardView: NSView {
         case "erasing": ("Erasing index", Theme.warn)
         case "compacting": ("Compacting index", Theme.accent)
         case "erased": ("Index erased", Theme.faint)
+        case "eraseFailed": ("Erasure incomplete", Theme.danger)
         default: ("Index unavailable", Theme.danger)
         }
         title.stringValue = text
         dot.fill(colour)
+        let working = ["indexing", "compacting", "erasing"].contains(overview.state)
+        progress.isHidden = !working
+        if working && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { progress.startAnimation(nil) }
+        else { progress.stopAnimation(nil) }
+        currentWork.stringValue = overview.state == "indexing"
+            ? overview.currentFolder.map { "Working in \($0)" } ?? "Preparing the next batch…" : ""
+        currentWork.isHidden = currentWork.stringValue.isEmpty
+        passSummary.stringValue = ""
+        progressNote.stringValue = ""
         var parts: [String] = []
         switch overview.state {
         case "indexing":
-            parts.append(overview.stage.isEmpty ? "Working" : overview.stage)
-            if let seconds = overview.stageSeconds { parts.append(IndexUI.duration(Double(seconds))) }
-            if let folder = overview.currentFolder { parts.append(folder) }
+            parts.append(overview.message)
+            if let seconds = overview.stageSeconds { parts.append("This stage: \(IndexUI.duration(Double(seconds)))") }
+            passSummary.stringValue = "This pass: \(IndexUI.number(overview.pass.checked)) entries checked · \(IndexUI.number(overview.pass.updated)) documents updated"
+            if overview.stage.lowercased().contains("embed"), let written = overview.semantic.passEmbedded {
+                passSummary.stringValue += " · \(IndexUI.number(written)) passages embedded"
+            }
+            progressNote.stringValue = "Work is still being counted. No reliable total or time estimate yet. This view updates automatically."
         case "compacting":
             parts.append(overview.stage.isEmpty ? "Starting" : overview.stage)
+            progressNote.stringValue = "Indexing and content search resume when compaction finishes. Your source files are not changed."
+        case "erasing":
+            parts.append(overview.message)
+            progressNote.stringValue = "Stored search data is being removed. Source files are not deleted."
+        case "paused":
+            parts.append(overview.message)
+            progressNote.stringValue = "Resumes automatically when the power or thermal condition clears. No need to rescan."
+        case "off", "erased", "needsRoots":
+            parts.append(overview.message)
+            progressNote.stringValue = "Use Folders to choose what to search, then Indexing settings to enable indexing."
         case "ready", "partial":
             if let ago = overview.lastPassAgo {
                 parts.append("Last pass \(IndexUI.ago(ago))")
                 if let took = overview.lastPassSeconds { parts.append("took \(IndexUI.duration(took))") }
             }
+            progressNote.stringValue = overview.state == "partial"
+                ? "Some work did not finish. Review diagnostics before retrying."
+                : "The last pass has finished. Folder changes are picked up automatically."
         default:
             parts.append(overview.message)
         }
-        if overview.state != "indexing", !overview.roots.isEmpty { parts.append("Watching \(overview.roots.joined(separator: ", "))") }
+        passSummary.isHidden = passSummary.stringValue.isEmpty
+        progressNote.isHidden = progressNote.stringValue.isEmpty
         subtitle.stringValue = parts.joined(separator: "  ·  ")
 
         subtitle.toolTip = subtitle.stringValue
     }
 
-    private func updateTiles(_ overview: IndexOverview) {
-        tiles[0].set("Documents", IndexUI.number(overview.documents),
-                     "in your local library")
-        tiles[1].set("Passages", IndexUI.number(overview.semantic.eligible), "searchable text chunks")
-        tiles[2].set("Embedded", IndexUI.number(overview.semantic.embedded),
-                     overview.semantic.enabled ? "active-model vectors" : "meaning search is off")
-        tiles[3].set("On disk", IndexUI.bytes(overview.disk.database + (overview.disk.cache ?? 0)),
-                     (overview.reclaimable ?? 0) > 16 << 20
-                         ? "\(IndexUI.bytes(overview.reclaimable ?? 0)) reclaimable"
-                         : "cache \(IndexUI.bytes(overview.disk.cache ?? 0))")
-    }
-
     private func semanticRows(_ overview: IndexOverview) -> [NSView] {
         let state = overview.semantic
-        var rows = [IndexUI.row(symbol: "sparkles", tint: state.enabled ? Theme.accent : Theme.muted,
-                               title: state.enabled ? "Words + meaning" : "Exact-word search", trailing: "ON THIS MAC")]
+        var rows: [NSView] = []
         if !state.enabled {
             rows.append(IndexUI.note("Search by meaning is off. Stored vectors are retained; enable it in Content settings to use them."))
         } else if let total = state.eligible, let embedded = state.embedded, overview.sampled {
-            let coverage = total > 0 ? min(Double(embedded) / Double(total), 1) : 0
             rows.append(IndexUI.row(symbol: "square.stack.3d.up", tint: Theme.muted,
-                title: "\(IndexUI.number(embedded)) of \(IndexUI.number(total)) passages embedded",
-                trailing: total > 0 ? "\(Int(coverage * 100))%" : "—", fraction: coverage))
+                title: "\(IndexUI.number(embedded)) passages have active-model embeddings"))
             rows.append(IndexUI.note(total == 0
-                ? "No stored passages yet. Choose folders in Content settings, then Refresh to start indexing."
-                : "Coverage of stored passages, not a work queue. Data and spreadsheets stay word-only; code needs selected code folders."))
+                ? "No stored passages yet. Choose folders under Folders, then use Rescan folders to start indexing."
+                : "Library coverage, not progress toward completion. Data and spreadsheets stay word-only; code needs selected code folders."))
         } else {
             rows.append(IndexUI.note("Measuring passage coverage… Word search and meaning search have separate readiness."))
         }
-        rows.append(IndexUI.pair("Worker report", overview.message.isEmpty ? "Waiting for worker status" : overview.message))
+        if ["ready", "partial"].contains(overview.state) {
+            rows.append(IndexUI.pair("Search worker", overview.message.isEmpty ? "Waiting for worker status" : overview.message))
+        }
         return rows
     }
 
@@ -250,7 +353,7 @@ final class IndexDashboardView: NSView {
     private func rebuildBusy(_ items: [IndexOverview.Busy]) {
         for view in busy.arrangedSubviews { view.removeFromSuperview() }
         for item in items {
-            let plate = PlateView(fill: Theme.warn.withAlphaComponent(0.10), radius: 10, border: Theme.warn.withAlphaComponent(0.35))
+            let plate = PlateView(fill: .clear)
             let icon = IndexUI.symbol("bolt.fill", Theme.warn)
             let text = IndexUI.wrapping(
                 "\(item.folder) changed \(IndexUI.number(item.changes)) times in the last 5 minutes. Every change starts indexing; exclude it if it holds generated data.",
@@ -277,22 +380,19 @@ final class IndexDashboardView: NSView {
 
     private func typeRows(_ overview: IndexOverview) -> [NSView] {
         guard !overview.kinds.isEmpty else { return [IndexUI.note(overview.sampled ? "Nothing indexed yet" : "Counting…")] }
-        let largest = Double(overview.kinds.map(\.count).max() ?? 1)
         return overview.kinds.map { kind in
             IndexUI.row(symbol: IndexUI.symbolName(forKind: kind.label), tint: Theme.muted, title: kind.label,
-                        detail: IndexUI.bytes(kind.bytes), trailing: IndexUI.number(kind.count),
-                        fraction: Double(kind.count) / largest)
+                        detail: IndexUI.bytes(kind.bytes), trailing: IndexUI.number(kind.count))
         }
     }
 
     private func folderRows(_ overview: IndexOverview) -> [NSView] {
         guard !overview.folders.isEmpty else { return [IndexUI.note(overview.sampled ? "No folders indexed yet" : "Counting…")] }
-        let largest = Double(overview.folders.map(\.count).max() ?? 1)
         return overview.folders.map { folder in
             let path = folder.path
             return IndexUI.row(symbol: "folder", tint: Theme.muted, title: folder.folder,
                                detail: IndexUI.bytes(folder.bytes), trailing: IndexUI.number(folder.count),
-                               fraction: Double(folder.count) / largest, breaking: .byTruncatingHead) {
+                               breaking: .byTruncatingHead) {
                 IndexUI.reveal(path)
             }
         }
@@ -303,7 +403,7 @@ final class IndexDashboardView: NSView {
         var rows: [NSView] = []
         if ["failed", "partial", "eraseFailed"].contains(overview.state) {
             rows.append(IndexUI.row(symbol: "exclamationmark.triangle.fill", tint: Theme.warn,
-                title: "Indexing needs attention", detail: "Review the worker report above. Refresh retries selected folders."))
+                title: "Indexing needs attention", detail: overview.message))
         }
         if let failed = overview.semantic.passFailed, failed > 0 {
             rows.append(IndexUI.row(symbol: "sparkles", tint: Theme.warn,
@@ -376,8 +476,7 @@ final class IndexDashboardView: NSView {
             }
             let cpu = process.cpu.map { String(format: "%.1f%% CPU", $0) } ?? "—"
             return IndexUI.row(symbol: process.name == "Blindspot" ? "app.badge" : "cpu", tint: Theme.muted, title: name,
-                               detail: IndexUI.bytes(process.memory) + " memory", trailing: cpu,
-                               fraction: process.cpu.map { $0 / 100 }, meterColour: (process.cpu ?? 0) > 50 ? Theme.warn : Theme.accent)
+                               detail: IndexUI.bytes(process.memory) + " memory", trailing: cpu)
         }
         if rows.isEmpty { rows.append(IndexUI.note("Process usage unavailable")) }
         let pacing = overview.pacing
@@ -420,7 +519,7 @@ enum IndexUI {
 
     static func caption(_ text: String) -> NSTextField {
         let field = NSTextField(labelWithString: "")
-        field.attributedStringValue = Theme.label(text.uppercased(), size: 10, tracking: 0.10, color: Theme.muted, weight: .medium)
+        field.attributedStringValue = Theme.label(text, size: 13, tracking: 0, color: Theme.ink, weight: .medium)
         field.translatesAutoresizingMaskIntoConstraints = false
         return field
     }
@@ -508,6 +607,12 @@ enum IndexUI {
             meter.trailingAnchor.constraint(equalTo: body.trailingAnchor).isActive = true
         }
         let container: NSView = action.map { LinkRow(action: $0) } ?? NSView()
+        if action != nil {
+            container.setAccessibilityElement(true)
+            container.setAccessibilityRole(.button)
+            container.setAccessibilityLabel([title, detail].compactMap { $0 }.joined(separator: ", "))
+            container.setAccessibilityHelp("Reveal in Finder")
+        }
         container.translatesAutoresizingMaskIntoConstraints = false
         body.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(body)
@@ -581,35 +686,47 @@ enum IndexUI {
 }
 
 @MainActor
-private struct Tile {
-    let view = PlateView(fill: Theme.ground, radius: 10, border: Theme.hairline)
-    private let caption = IndexUI.caption("")
-    private let value = IndexUI.label("—", .monospacedDigitSystemFont(ofSize: 24, weight: .semibold), Theme.ink)
-    private let detail = IndexUI.label("", IndexUI.font(10.5), Theme.muted)
+private final class IndexDisclosure: NSStackView {
+    private let heading: String
+    private let content: NSView
+    private let button = NSButton()
 
-    init() {
-        let stack = NSStackView(views: [caption, value, detail])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 3
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        value.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        view.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 14),
-            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -14),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -10),
-        ])
+    init(_ heading: String, content: NSView) {
+        self.heading = heading
+        self.content = content
+        super.init(frame: .zero)
+        orientation = .vertical
+        alignment = .leading
+        spacing = 6
+        translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.alignment = .left
+        button.font = Theme.text(13, .medium)
+        button.contentTintColor = Theme.ink
+        button.target = self
+        button.action = #selector(toggle)
+        button.identifier = NSUserInterfaceItemIdentifier("index.section.\(heading)")
+        button.setAccessibilityLabel(heading)
+        for view in [button, content] {
+            addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: widthAnchor).isActive = true
+        }
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        content.isHidden = true
+        updateLabel()
     }
 
-    func set(_ title: String, _ figure: String, _ note: String) {
-        caption.attributedStringValue = Theme.label(title.uppercased(), size: 9.5, tracking: 0.10, color: Theme.muted, weight: .medium)
-        value.stringValue = figure
-        detail.stringValue = note
-        value.toolTip = figure
-        detail.toolTip = note
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
+
+    @objc private func toggle() {
+        content.isHidden.toggle()
+        updateLabel()
+    }
+
+    private func updateLabel() {
+        button.title = (content.isHidden ? "▸  " : "▾  ") + heading
+        button.setAccessibilityValue(content.isHidden ? "Collapsed" : "Expanded")
     }
 }
 
@@ -620,7 +737,7 @@ private final class Card: NSView {
     init() {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
-        let plate = PlateView(fill: Theme.ground, radius: 10, border: Theme.hairline)
+        let plate = PlateView(fill: .clear)
         addSubview(plate)
         rows.orientation = .vertical
         rows.alignment = .leading
@@ -707,6 +824,12 @@ private final class LinkRow: NSView {
     override func mouseEntered(with event: NSEvent) { layer?.backgroundColor = Theme.selection.cgColor }
     override func mouseExited(with event: NSEvent) { layer?.backgroundColor = nil }
     override func mouseDown(with event: NSEvent) {}
+    override var acceptsFirstResponder: Bool { true }
+    override func accessibilityPerformPress() -> Bool { action(); return true }
+    override func keyDown(with event: NSEvent) {
+        if event.charactersIgnoringModifiers == " " || event.keyCode == 36 { action() }
+        else { super.keyDown(with: event) }
+    }
     override func mouseUp(with event: NSEvent) {
         if bounds.contains(convert(event.locationInWindow, from: nil)) { action() }
     }
@@ -721,14 +844,12 @@ private final class ActionButton: NSButton {
         self.handler = handler
         super.init(frame: .zero)
         isBordered = false
-        attributedTitle = Theme.label(title.uppercased(), size: 10, tracking: 0.1, color: colour, weight: .medium)
+        attributedTitle = Theme.label(title, size: 12, tracking: 0, color: colour, weight: .medium)
         target = self
         action = #selector(fire)
         wantsLayer = true
         layer?.cornerRadius = 7
         layer?.cornerCurve = .continuous
-        layer?.borderWidth = 1
-        layer?.borderColor = colour.withAlphaComponent(0.45).cgColor
         setAccessibilityLabel(title)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 26).isActive = true

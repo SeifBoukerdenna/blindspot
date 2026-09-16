@@ -5,7 +5,7 @@
 
 APP        := Blindspot
 BUNDLE_ID  := com.seifboukerdenna.blindspot
-VERSION    := 0.2.9
+VERSION    := 0.3.0
 # Where Settings → Status looks for updates (shell/Updater.swift). Forks set their own.
 RELEASE_REPO ?= SeifBoukerdenna/blindspot
 
@@ -35,10 +35,7 @@ BENCH_SRC  := bench/LatencyBench.swift
 # Pinned rather than inherited from the host SDK so swiftc cannot silently adopt an
 # API that only exists on the machine that happened to build it.
 #
-# 26.0 because the panel is built on `NSGlassEffectView`, which is
-# `API_AVAILABLE(macos(26.0))`. Liquid Glass is what "native" looks like on Tahoe, and
-# an availability branch to keep a 14.0 floor would mean two visual paths to keep in
-# sync in a single-user app that only ever runs on this machine.
+# The supported platform remains Tahoe; the shell uses native AppKit materials.
 DEPLOY     := 26.0
 ARCH       := arm64
 
@@ -53,7 +50,7 @@ SWIFTFLAGS := -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) \
               -framework Quartz -framework EventKit \
               -L $(TARGET_DIR)/release -lblindspot_core
 
-.PHONY: all core header app sign package install version media run clean test test-retrieval test-actions test-updater bench-search test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
+.PHONY: all core header app sign package install version media run clean test test-retrieval test-actions test-updater test-ui test-index-dashboard bench-search test-content test-semantic test-vectors smoke-panel bench bench-shell check check-header
 
 all: sign
 
@@ -192,7 +189,14 @@ smoke-panel: $(CORE_LIB) $(HEADER)
 	@mkdir -p $(BUILD)
 	swiftc $(SWIFTFLAGS) -o $(BUILD)/panel-smoke bench/PanelSmoke.swift \
 	    $(filter-out shell/AppDelegate.swift,$(SWIFT_SRC))
-	$(BUILD)/panel-smoke
+	env -u HOME $(BUILD)/panel-smoke
+
+test-ui: test-index-dashboard smoke-panel
+
+test-index-dashboard: $(CORE_LIB) $(HEADER)
+	swiftc $(SWIFTFLAGS) -o $(BUILD)/index-dashboard-tests bench/IndexDashboardTests.swift \
+	    shell/IndexDashboard.swift shell/Bridge.swift shell/Theme.swift
+	$(BUILD)/index-dashboard-tests
 
 test-content: $(BUILD)/content-tests
 	$(BUILD)/content-tests

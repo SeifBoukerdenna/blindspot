@@ -4,10 +4,11 @@ import AppKit
 @MainActor
 enum IndexDashboardTests {
     static func fixture(_ state: String = "ready", enabled: Bool = true, sampled: Bool = true,
-                        empty: Bool = false, failed: UInt64 = 0) throws -> IndexOverview {
+                        empty: Bool = false, failed: UInt64 = 0, stage: String? = nil) throws -> IndexOverview {
         let object: [String: Any] = [
-            "state": state, "stage": state == "indexing" ? "Embedding passages" : "",
+            "state": state, "stage": stage ?? (state == "indexing" ? "Embedding passages" : ""),
             "message": state == "failed" ? "Semantic unavailable; text search ready"
+                : state == "paused" ? "Paused by resource policy · Low Power Mode · Semantic indexing queued"
                 : state == "indexing" ? "Embedding · 420 written · 18,004 current"
                 : "Semantic ready · embeddinggemma:300m",
             "stageSeconds": 38, "lastPassAgo": 42, "lastPassSeconds": 12.4,
@@ -42,6 +43,11 @@ enum IndexDashboardTests {
         descendants(view).compactMap { ($0 as? NSTextField)?.stringValue }.joined(separator: "\n")
     }
 
+    static func visibleText(_ view: NSView) -> String {
+        descendants(view).filter { !$0.isHiddenOrHasHiddenAncestor }
+            .compactMap { ($0 as? NSTextField)?.stringValue }.joined(separator: "\n")
+    }
+
     static func render(_ dashboard: IndexDashboardView, name: String, directory: URL) throws {
         dashboard.layoutSubtreeIfNeeded()
         let height = dashboard.fittingSize.height
@@ -52,20 +58,32 @@ enum IndexDashboardTests {
         plate.translatesAutoresizingMaskIntoConstraints = true
         plate.frame = dashboard.frame
         plate.addSubview(dashboard)
+        let placement = [
+            dashboard.leadingAnchor.constraint(equalTo: plate.leadingAnchor),
+            dashboard.trailingAnchor.constraint(equalTo: plate.trailingAnchor),
+            dashboard.topAnchor.constraint(equalTo: plate.topAnchor),
+            dashboard.bottomAnchor.constraint(equalTo: plate.bottomAnchor),
+        ]
+        NSLayoutConstraint.activate(placement)
         let window = NSWindow(contentRect: plate.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.appearance = NSAppearance(named: Theme.isDark ? .darkAqua : .aqua)
         window.contentView = plate
         plate.layoutSubtreeIfNeeded()
+        let visibleFields = descendants(dashboard).compactMap { $0 as? NSTextField }
+            .filter { !$0.isHiddenOrHasHiddenAncestor }
+        let firstTextTop = visibleFields.map { $0.convert($0.bounds, to: dashboard).maxY }.max() ?? 0
+        precondition(firstTextTop > dashboard.bounds.height - 110, "Selected page must start below navigation, without hidden-page space")
         guard let bitmap = plate.bitmapImageRepForCachingDisplay(in: plate.bounds) else { fatalError("No bitmap") }
         plate.cacheDisplay(in: plate.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else { fatalError("No PNG") }
         try png.write(to: directory.appendingPathComponent(name + ".png"))
         precondition(!dashboard.hasAmbiguousLayout, "Dashboard layout is ambiguous")
-        for field in descendants(dashboard).compactMap({ $0 as? NSTextField }) {
+        for field in descendants(dashboard).compactMap({ $0 as? NSTextField }).filter({ !$0.isHiddenOrHasHiddenAncestor }) {
             let rect = field.convert(field.bounds, to: dashboard)
             precondition(rect.minX >= -1 && rect.maxX <= 641, "Text outside dashboard: \(field.stringValue)")
         }
+        NSLayoutConstraint.deactivate(placement)
         dashboard.removeFromSuperview()
         window.close()
     }
@@ -77,43 +95,117 @@ enum IndexDashboardTests {
         var cases = 0
         for (palette, name) in [(Palette.ember, "dark"), (.parchment, "light")] {
             Theme.current = palette
+            let glass = SurfaceView(radius: 18)
+            glass.applyAccessibility(reduceTransparency: true, increaseContrast: false)
+            precondition(glass.usesOpaqueFallback)
+            glass.applyAccessibility(reduceTransparency: false, increaseContrast: true)
+            precondition(glass.usesOpaqueFallback)
+            glass.applyAccessibility(reduceTransparency: false, increaseContrast: false)
+            precondition(!glass.usesOpaqueFallback)
             let dashboard = IndexDashboardView()
             dashboard.widthAnchor.constraint(equalToConstant: 640).isActive = true
             var refreshes = 0
             var compactions = 0
+            var opened: [String] = []
             dashboard.onRefresh = { refreshes += 1 }
             dashboard.onCompact = { compactions += 1 }
-            let refresh = descendants(dashboard).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "index.refresh" }!
-            let compact = descendants(dashboard).compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "index.compact" }!
+            dashboard.onOpenSetting = { opened.append($0) }
+            let navigation = descendants(dashboard).compactMap { $0 as? NSSegmentedControl }.first!
+            precondition(navigation.superview === dashboard, "Navigation must stay outside the scroller")
+            var allViews: [NSView] = []
+            for page in [1, 2, 0] {
+                navigation.selectedSegment = page
+                _ = navigation.sendAction(navigation.action, to: navigation.target)
+                allViews += descendants(dashboard)
+            }
+            var seen = Set<ObjectIdentifier>()
+            allViews = allViews.filter { seen.insert(ObjectIdentifier($0)).inserted }
+            func allText() -> String {
+                allViews.compactMap { $0 as? NSStackView }.flatMap { descendants($0) }
+                    .compactMap { ($0 as? NSTextField)?.stringValue }.joined(separator: "\n")
+            }
+            let refresh = allViews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "index.refresh" }!
+            let compact = allViews.compactMap { $0 as? NSButton }.first { $0.identifier?.rawValue == "index.compact" }!
             precondition(!refresh.isEnabled && !compact.isEnabled)
-            for state in ["ready", "indexing", "paused", "partial", "failed", "erasing", "compacting", "erased", "needsRoots", "off"] {
+            dashboard.update(try fixture())
+            try render(dashboard, name: name + "-summary", directory: directory)
+            let disclosures = allViews.compactMap { $0 as? NSButton }
+                .filter { $0.identifier?.rawValue.hasPrefix("index.section.") == true }
+            precondition(disclosures.count == 5)
+            for button in disclosures {
+                precondition(button.title.hasPrefix("▸"))
+                button.performClick(nil)
+                precondition(button.title.hasPrefix("▾"))
+            }
+            for state in ["ready", "indexing", "paused", "partial", "failed", "erasing", "compacting", "erased", "needsRoots", "off", "eraseFailed"] {
                 dashboard.update(try fixture(state, failed: state == "partial" ? 7 : 0))
-                let labels = text(dashboard)
-                precondition(labels.contains("Coverage of stored passages, not a work queue"))
+                let labels = allText()
+                precondition(disclosures.allSatisfy { $0.title.hasPrefix("▾") }, "Refresh must preserve disclosure state")
+                precondition(labels.contains("Library coverage, not progress toward completion"))
+                precondition(!visibleText(dashboard).contains("%"), "Overview must not present coverage as progress")
+                precondition(refresh.isEnabled == ["ready", "partial", "failed"].contains(state))
                 precondition(labels.contains("Database") && labels.contains("Vector cache"))
                 if state == "partial" { precondition(labels.contains("7 passages could not") && labels.contains("3 documents are partly indexed")) }
                 if state == "failed" { precondition(labels.contains("Semantic unavailable; text search ready")) }
+                if state == "paused" {
+                    precondition(labels.contains("Low Power Mode") && labels.contains("Resumes automatically"))
+                    precondition(!visibleText(dashboard).contains("Working in"))
+                    try render(dashboard, name: name + "-paused", directory: directory)
+                }
                 if ["indexing", "erasing", "compacting", "erased"].contains(state) { precondition(!compact.isEnabled) }
                 if ["ready", "indexing", "partial"].contains(state) { try render(dashboard, name: name + "-" + state, directory: directory) }
                 cases += 1
             }
+            for stage in ["Scanning folders", "Scanning folders and extracting PDFs", "Embedding passages", "Building vector cache"] {
+                dashboard.update(try fixture("indexing", stage: stage))
+                let labels = visibleText(dashboard)
+                precondition(labels.contains(stage) && labels.contains("This stage: 38s"))
+                precondition(labels.contains("1,250 entries checked") && labels.contains("84 documents updated"))
+                precondition(labels.contains("No reliable total or time estimate"))
+                let indicator = descendants(dashboard).compactMap { $0 as? NSProgressIndicator }.first!
+                precondition(indicator.isIndeterminate && !indicator.isHidden)
+                cases += 1
+            }
+            for page in 1...2 {
+                navigation.selectedSegment = page
+                _ = navigation.sendAction(navigation.action, to: navigation.target)
+                dashboard.update(try fixture("partial", failed: 7))
+                precondition(dashboard.selectedPage == page, "Polling must not reset navigation")
+                if page == 1 {
+                    precondition(visibleText(dashboard).contains("Search locations"))
+                    precondition(!visibleText(dashboard).contains("7 passages could not"))
+                } else {
+                    precondition(visibleText(dashboard).contains("7 passages could not"))
+                }
+                try render(dashboard, name: name + (page == 1 ? "-folders" : "-diagnostics"), directory: directory)
+                cases += 1
+            }
+            let buttons = allViews.compactMap { $0 as? NSButton }
+            for id in ["index.manageFolders", "index.settings"] {
+                buttons.first { $0.identifier?.rawValue == id }!.performClick(nil)
+            }
+            precondition(opened == ["content.roots", "content.enabled"])
+            navigation.selectedSegment = 0
+            _ = navigation.sendAction(navigation.action, to: navigation.target)
+            buttons.first { $0.identifier?.rawValue == "index.reviewIssues" }!.performClick(nil)
+            precondition(dashboard.selectedPage == 2)
             dashboard.update(try fixture())
             refresh.performClick(nil)
             compact.performClick(nil)
             precondition(refreshes == 1 && compactions == 1)
             dashboard.update(try fixture(enabled: false))
-            precondition(text(dashboard).contains("Search by meaning is off"))
+            precondition(allText().contains("Search by meaning is off"))
             dashboard.update(try fixture(empty: true))
-            precondition(text(dashboard).contains("No stored passages yet"))
+            precondition(allText().contains("No stored passages yet"))
             dashboard.update(try fixture(sampled: false))
-            precondition(text(dashboard).contains("Measuring passage coverage"))
+            precondition(allText().contains("Measuring passage coverage"))
             dashboard.update(nil)
-            precondition(!text(dashboard).contains("18,424") && !text(dashboard).contains("embeddinggemma"))
+            precondition(!allText().contains("18,424") && !allText().contains("embeddinggemma"))
             precondition(!refresh.isEnabled && !compact.isEnabled)
             dashboard.update(try fixture())
-            precondition(text(dashboard).contains("embeddinggemma"))
+            precondition(allText().contains("embeddinggemma"))
             cases += 5
         }
-        print("PASS: \(cases) dashboard states across dark/light palettes; action callbacks, stale-state clearing, layout bounds; 6 PNG renders")
+        print("PASS: \(cases) dashboard states across dark/light palettes; pinned navigation, settings links, honest progress, pause handling, stale-state clearing, disclosure persistence, accessibility fallbacks, layout bounds; 14 PNG renders")
     }
 }

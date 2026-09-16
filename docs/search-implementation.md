@@ -1,7 +1,8 @@
 # Search upgrade implementation — September 16, 2026
 
-Unreleased working-tree changes, still version 0.2.8. Existing unrelated edits were preserved.
-No commit, push, tag, release, live-index migration or installation was performed.
+Version **0.2.9** is now signed, installed at `~/Applications/Blindspot.app`, and running.
+The user created the existing `v0.2.9` release tag; the agent did not commit, push or change it.
+The local follow-up changes below remain uncommitted. Existing user configuration was preserved.
 
 ## Implemented
 
@@ -44,8 +45,15 @@ No commit, push, tag, release, live-index migration or installation was performe
   **89%**, **0.66**, p95 **37 ms**. Words and meaning subsets improved; `--check` passed.
   This is file relevance on a small code checkout, not held-out document/location or scale proof.
 - `git diff --check`: passed. Developer ID signing works outside the tool sandbox.
+- Follow-up: 30 dashboard fixture states passed across dark/light palettes, including action
+  callbacks, stale-state clearing and layout bounds; six PNGs rendered. The earlier assertion
+  failure was caused by missing placement constraints in the fixture, now fixed.
+- Rebuilt 0.2.9, explicitly signed its helpers and bundle, and verified the installed app with
+  `codesign --verify --deep --strict`. Verified version 0.2.9 and its running process.
+- Opened the installed Settings → Index page: real passage backfill, worker status, storage and
+  partial-document warnings were visible and updating. Full embedding completion is pending.
 
-## Installation gate: existing FTS mismatch
+## Resolved installation gate: existing FTS mismatch
 
 The live database was opened read-only. A consistent `VACUUM INTO` snapshot was taken at:
 
@@ -57,13 +65,24 @@ preserved both counts, but the external-content FTS integrity check failed:
 `fts5: checksum mismatch for table "content_fts"`
 
 Checking an independent pre-migration copy reproduced the same mismatch **before migration**.
-This is not evidence of lost source documents; it means the derived FTS index and document table
-do not agree. The live index has not been repaired or migrated. The repeated-failure stop in
-`verify-loop` leaves installation paused rather than treating preserved row counts as integrity.
+This was a mismatch between derived FTS postings and the document table; the internal FTS
+structure check passed. A copy-only rebuild fixed it. The historical cause has not been established.
 
-Next: diagnose/rebuild only the derived FTS on a disposable copy, verify document/vector contents
-and FTS integrity, then agree the live repair/installation procedure with the user. Do not erase
-the database or silently treat this as a successful migration. Keep the original snapshot.
+After user authorization, the old app was stopped and a fresh snapshot was repaired and migrated
+to schema 10. SQLite, foreign-key and both FTS integrity checks passed. Exact original-column
+comparisons confirmed all five authoritative tables unchanged, including **14,527 documents and
+14,454 legacy embeddings**. The validated copy replaced the live database before installing 0.2.9.
+No full erasure was needed. The app is now backfilling passages from the existing selected roots.
+
+Rollback material is in `build/rollback-0.2.9-20260916/` (private directory):
+
+- `Blindspot-before.zip`: previous installed app; archive integrity checked.
+- `index/before.sqlite`: consistent pre-repair snapshot.
+- `index/original-live.sqlite`, with its matching WAL/SHM: original live database moved aside.
+- `index/migration-check.sqlite`: validated repaired/migrated copy used for installation.
+
+Never restore a database while Blindspot is running, or mix its WAL files with another database.
+Configuration, overrides, clipboard, history and existing vector-cache files were left untouched.
 
 ## Remaining roadmap work / limitations
 
@@ -83,5 +102,5 @@ the database or silently treat this as a successful migration. Keep the original
 - Large-library, multilingual, held-out PDF/Office relevance and combined helper/Ollama memory
   budgets remain unmeasured. Disk target is cooperative, not a hard quota. No full live panel
   smoke test was run because its current harness initializes the real state directory.
-- Recheck artifacts against final source, signature and header before installing; the old
-  installed app is unchanged. No release packaging/publication was performed.
+- The local installer now explains that invalid signatures require `make install`, which builds
+  and signs first. No release packaging/publication was performed by the agent.

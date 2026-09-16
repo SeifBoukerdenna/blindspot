@@ -1,117 +1,41 @@
 import AppKit
 import Carbon.HIToolbox
 
-/// The mode tabs, flush left along the top of the plate.
-///
-/// In the panel it is a picture of the query's prefix and nothing else: the prefix in the
-/// field is the state, and clicking a tab types it. The settings window reuses it for its
-/// sections, which is the whole reason the two read as one application. Not an `NSSegmentedControl`, which brings a
-/// bezel, the system accent and a selection style — three of the things this design
-/// exists to take out.
 @MainActor
-final class TabBar: NSView {
-    private let titles: [String]
-    private let tabs: [NSTextField]
-    private let status = NSTextField(labelWithString: "")
-    /// What the status slot already says. Re-setting an attributed string repaints it, and
-    /// this is asked on every poll.
-    private var shownStatus: String?
-    /// Positioned by hand in `layout()`: it has to sit under whichever tab is current,
-    /// and constraints that move between four anchors are more machinery than a frame.
-    private let underline = PlateView(fill: Theme.accent)
-    /// Readable from outside so the settings window can re-select the page it was on
-    /// after a reload.
-    private(set) var selected = 0
-
+private final class LauncherScope: NSPopUpButton {
+    let status = NSTextField(labelWithString: "Blindspot · On this Mac")
     var onSelect: ((Int) -> Void)?
 
     init(titles: [String]) {
-        self.titles = titles
-        self.tabs = titles.map { _ in NSTextField(labelWithString: "") }
-        super.init(frame: .zero)
-
-        wantsLayer = true
-        layer?.backgroundColor = Theme.ground.cgColor
+        super.init(frame: .zero, pullsDown: false)
+        addItems(withTitles: titles)
+        isBordered = false
+        font = Theme.text(12, .medium)
+        target = self
+        action = #selector(changed)
+        setAccessibilityLabel("Search scope")
+        toolTip = "Search scope · ⌘1 Apps · ⌘2 Files · ⌘3 Clipboard · ⌘4 Assistant"
         translatesAutoresizingMaskIntoConstraints = false
-
-        let row = NSStackView(views: tabs)
-        row.spacing = 24
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        status.alignment = .right
-        status.lineBreakMode = .byTruncatingHead
-        status.translatesAutoresizingMaskIntoConstraints = false
+        status.font = Theme.text(11)
+        status.textColor = Theme.muted
+        status.lineBreakMode = .byTruncatingTail
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let edge = PlateView(fill: Theme.hairline)
-        underline.translatesAutoresizingMaskIntoConstraints = true
-
-        for view in [row, status, edge, underline] as [NSView] { addSubview(view) }
-
-        NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Theme.gutter),
-            row.centerYAnchor.constraint(equalTo: centerYAnchor),
-            status.leadingAnchor.constraint(
-                greaterThanOrEqualTo: row.trailingAnchor, constant: 16),
-            status.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Theme.gutter),
-            status.centerYAnchor.constraint(equalTo: centerYAnchor),
-            edge.leadingAnchor.constraint(equalTo: leadingAnchor),
-            edge.trailingAnchor.constraint(equalTo: trailingAnchor),
-            edge.bottomAnchor.constraint(equalTo: bottomAnchor),
-            edge.heightAnchor.constraint(equalToConstant: 1),
-            heightAnchor.constraint(equalToConstant: Theme.tabBarHeight),
-        ])
-        select(0)
+        status.translatesAutoresizingMaskIntoConstraints = false
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
 
-    func select(_ index: Int) {
-        selected = index
-        for (at, tab) in tabs.enumerated() {
-            tab.attributedStringValue = Theme.label(
-                titles[at], size: 10, tracking: 0.15,
-                color: at == index ? Theme.ink : Theme.faint,
-                weight: at == index ? .semibold : .regular)
-        }
-        // The underline is placed from the selected label's frame, so the labels have to
-        // have one. On a bar built moments ago they do not, and the underline lands at
-        // zero — which is exactly what a rebuilt settings window showed.
-        layoutSubtreeIfNeeded()
-        needsLayout = true
-    }
-
-    /// What this mode can say about itself, at the right of the bar. Empty is a
-    /// perfectly good answer and most modes give it.
+    func select(_ index: Int) { selectItem(at: index) }
     func show(status text: String) {
-        guard text != shownStatus else { return }
-        shownStatus = text
-        status.attributedStringValue = Theme.label(
-            text, size: 9.5, tracking: 0.14, color: Theme.faint)
+        let line = text == "ACTIONS ⌘K" ? "Blindspot · On this Mac" : text
+        guard status.stringValue != line else { return }
+        status.stringValue = line
+        status.toolTip = line
     }
-
-    override func layout() {
-        super.layout()
-        guard tabs.indices.contains(selected) else { return }
-        let tab = tabs[selected].frame
-        // y = 0 is the bottom in an unflipped view, which is where this belongs — over
-        // the hairline, which was added first and so draws under it.
-        underline.frame = NSRect(x: tab.minX, y: 0, width: tab.width, height: 2)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        // Generous horizontally: the labels are ten points of type in a thirty-point
-        // band, and hitting one exactly is not a thing anyone should have to do.
-        guard
-            let index = tabs.firstIndex(where: {
-                point.x >= $0.frame.minX - 8 && point.x <= $0.frame.maxX + 8
-            })
-        else { return }
-        onSelect?(index)
-    }
+    @objc private func changed() { onSelect?(indexOfSelectedItem) }
 }
+
 
 /// The launcher window.
 ///
@@ -128,12 +52,12 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// Everything above the results: the mode tabs, the query, and the rule under it.
     /// The panel grows and shrinks below this; this height never changes.
     private static let chromeHeight =
-        Theme.tabBarHeight + Theme.fieldHeight + Theme.ruleHeight
+        38 + Theme.fieldHeight + Theme.ruleHeight
 
     /// The query, and the mode's character in front of it. Mono for the prefix because
     /// `?` and `>` are things you type at a shell, and a point smaller because mono
     /// capitals set larger than the grotesk beside them at the same size.
-    private static let queryFont = Theme.text(24, .medium)
+    private static let queryFont = Theme.text(23, .regular)
     private static let prefixFont = Theme.mono(21, .medium)
 
     /// How the panel arrives and leaves. Short: a launcher that takes a quarter of a second to
@@ -147,7 +71,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// The drawing is dead square. Six points instead, so the plate does not fight the
     /// rounded corner of every other window on a Tahoe screen — the one place this
     /// departs from the canvas, and deliberately.
-    private static let cornerRadius: CGFloat = 6
+    private static let cornerRadius: CGFloat = 18
 
     private let core: Core
     private let watcher: ClipboardWatcher
@@ -165,12 +89,13 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     /// The browse modes, each nothing more than the prefix that selects it — so typing `?`
     /// and pressing ⌘2 are the same act, and the tabs keep no state of their own.
     private static let modes: [(prefix: String, tab: String, prompt: String)] = [
-        ("", "APPS", "Search"),
-        ("?", "FILES", "Find a file"),
-        (";", "CLIPS", "Search what you copied"),
-        (">", "AGENT", "Ask, or say what to do and where"),
+        ("", "Apps", "Search Blindspot"),
+        ("?", "Files", "Find a file"),
+        (";", "Clipboard", "Search what you copied"),
+        (">", "Assistant", "Ask, or say what to do"),
+        (":content ", "Documents", "Search document contents"),
     ]
-    private let tabBar = TabBar(titles: modes.map(\.tab))
+    private let tabBar = LauncherScope(titles: modes.map(\.tab))
 
     /// How far the prompt sits from the field's left edge: past the mode's character,
     /// where the caret is.
@@ -284,8 +209,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // is a printed surface, and a material that samples the desktop behind it would
         // put a different colour under every hairline. Autoresizing left on, because a
         // window sizes its content view with `frame`, not with constraints.
-        let container = PlateView(
-            fill: Theme.surface, radius: Self.cornerRadius, border: Theme.border)
+        let container = SurfaceView(radius: Self.cornerRadius)
         container.translatesAutoresizingMaskIntoConstraints = true
 
         field.font = Self.queryFont
@@ -299,6 +223,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         // and a query with a line break in it matches nothing and draws on two lines.
         field.cell?.usesSingleLineMode = true
         field.delegate = self
+        field.setAccessibilityLabel("Search Blindspot")
         field.translatesAutoresizingMaskIntoConstraints = false
 
         ghost.font = Self.queryFont
@@ -306,28 +231,38 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         ghost.lineBreakMode = .byTruncatingTail
         ghost.translatesAutoresizingMaskIntoConstraints = false
 
-        tabBar.onSelect = { [weak self] index in self?.switchMode(to: index) }
+        tabBar.onSelect = { [weak self] index in
+            self?.makeFirstResponder(self?.field)
+            self?.switchMode(to: index)
+        }
 
         // The one heavy line in the design, and the only thing separating the query from
         // its results. Reversing M5's note that a divider here is "the strongest 'not a
         // Mac app' tell" — which it was, next to Liquid Glass. This panel is not trying
         // to look like a system search surface any more, and the rule is what makes the
         // masthead and the list read as two parts of one plate.
-        let rule = PlateView(fill: Theme.rule)
+        let rule = PlateView(fill: Theme.hairline)
+        let footerRule = PlateView(fill: Theme.hairline)
+        let actions = NSButton(title: "Actions  ⌘K", target: self, action: #selector(openActions))
+        actions.isBordered = false
+        actions.font = Theme.text(11)
+        actions.contentTintColor = Theme.muted
+        actions.translatesAutoresizingMaskIntoConstraints = false
+        actions.setAccessibilityLabel("Actions for selected result, Command K")
 
-        for view in [tabBar, field, ghost, rule, results] as [NSView] {
+        for view in [tabBar, field, ghost, rule, results, footerRule, tabBar.status, actions] as [NSView] {
             container.addSubview(view)
         }
 
         NSLayoutConstraint.activate([
-            tabBar.topAnchor.constraint(equalTo: container.topAnchor),
-            tabBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            tabBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            tabBar.centerYAnchor.constraint(equalTo: field.centerYAnchor),
+            tabBar.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Theme.gutter),
+            tabBar.widthAnchor.constraint(equalToConstant: 108),
 
             field.leadingAnchor.constraint(
                 equalTo: container.leadingAnchor, constant: Theme.gutter),
             field.trailingAnchor.constraint(
-                equalTo: container.trailingAnchor, constant: -Theme.gutter),
+                equalTo: tabBar.leadingAnchor, constant: -16),
             // The field takes its intrinsic text height and is centred in a
             // fixed-height band, rather than being stretched to fill it. An
             // `NSTextField` draws its text at the top of an oversized frame, so
@@ -335,7 +270,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             // a band of dead space under it.
             field.centerYAnchor.constraint(
                 equalTo: container.topAnchor,
-                constant: Theme.tabBarHeight + Theme.fieldHeight / 2),
+                constant: Theme.fieldHeight / 2),
 
             ghostOffset,
             ghost.centerYAnchor.constraint(equalTo: field.centerYAnchor),
@@ -343,7 +278,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
 
             rule.topAnchor.constraint(
                 equalTo: container.topAnchor,
-                constant: Theme.tabBarHeight + Theme.fieldHeight),
+                constant: Theme.fieldHeight),
             rule.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             rule.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             rule.heightAnchor.constraint(equalToConstant: Theme.ruleHeight),
@@ -355,10 +290,21 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             results.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             results.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             resultsHeight,
+            footerRule.topAnchor.constraint(equalTo: results.bottomAnchor),
+            footerRule.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
+            footerRule.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+            footerRule.heightAnchor.constraint(equalToConstant: 0.5),
+            tabBar.status.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: Theme.gutter),
+            tabBar.status.centerYAnchor.constraint(equalTo: results.bottomAnchor, constant: 19),
+            tabBar.status.trailingAnchor.constraint(lessThanOrEqualTo: actions.leadingAnchor, constant: -16),
+            actions.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Theme.gutter),
+            actions.centerYAnchor.constraint(equalTo: tabBar.status.centerYAnchor),
         ])
 
         contentView = container
     }
+
+    @objc private func openActions() { showActions() }
 
     /// Colours the mode's character in the field, and keeps the caret on the accent.
     ///
@@ -374,10 +320,11 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         storage.addAttributes(
             [.font: Self.queryFont, .foregroundColor: Theme.ink],
             range: NSRange(location: 0, length: length))
-        if length > 0, !Self.modes[Self.mode(of: field.stringValue)].prefix.isEmpty {
+        let prefix = Self.modes[Self.mode(of: field.stringValue)].prefix
+        if length > 0, !prefix.isEmpty {
             storage.addAttributes(
                 [.font: Self.prefixFont, .foregroundColor: Theme.accent],
-                range: NSRange(location: 0, length: 1))
+                range: NSRange(location: 0, length: min(length, (prefix as NSString).length)))
         }
         storage.endEditing()
     }
@@ -476,7 +423,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         alphaValue = 0
         layer.transform = Self.scaled(layer, by: Self.openScale)
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.openDuration
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : Self.openDuration
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             animator().alphaValue = 1
             layer.transform = CATransform3DIdentity
@@ -583,7 +530,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
     private func fadeOut() {
         let contentLayer = contentView?.layer
         NSAnimationContext.runAnimationGroup { context in
-            context.duration = Self.closeDuration
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : Self.closeDuration
             context.timingFunction = CAMediaTimingFunction(name: .easeIn)
             animator().alphaValue = 0
             if let contentLayer {
@@ -1202,8 +1149,12 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
 
     /// Grows and shrinks downward, keeping the top edge where `placeOnActiveScreen` put it.
     private func layoutForResults() {
-        resultsHeight.constant = results.fittingHeight
-        let height = Self.chromeHeight + results.fittingHeight
+        let screen = NSScreen.screens.first { $0.visibleFrame.contains(NSPoint(x: leftEdge, y: topEdge)) }
+            ?? NSScreen.main
+        let available = screen.map { max(0, topEdge - $0.visibleFrame.minY - Self.chromeHeight - 16) }
+            ?? results.fittingHeight
+        resultsHeight.constant = min(results.fittingHeight, available)
+        let height = Self.chromeHeight + resultsHeight.constant
         let target = NSRect(
             x: leftEdge, y: topEdge - height, width: Theme.panelWidth, height: height)
         // Measured: across a realistic typing burst the height changes on only 4 of 12

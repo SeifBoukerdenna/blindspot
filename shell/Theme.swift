@@ -47,13 +47,13 @@ enum Theme {
 
     static let panelWidth: CGFloat = 640
     static let tabBarHeight: CGFloat = 30
-    static let fieldHeight: CGFloat = 56
+    static let fieldHeight: CGFloat = 72
     /// The rule under the query, as a view of its own rather than a border.
-    static let ruleHeight: CGFloat = 2
+    static let ruleHeight: CGFloat = 1
     /// Horizontal padding, identical in the tab bar, the field and every row — which is
     /// what makes the tabs, the caret and the icons share one left edge.
     static let gutter: CGFloat = 20
-    static let rowHeight: CGFloat = 44
+    static let rowHeight: CGFloat = 56
     static let iconSize: CGFloat = 24
     /// Icon to text, and text to whatever sits at the right of a row.
     static let gap: CGFloat = 14
@@ -101,13 +101,64 @@ enum Theme {
         NSAttributedString(
             string: string,
             attributes: [
-                .font: mono(size, weight),
+                .font: text(size, weight),
                 .foregroundColor: color,
                 // Kerning is per-character and trails the last glyph too, which would
                 // push a right-aligned label off its margin. Trailing space is cheaper
                 // to live with than a paragraph style per label.
-                .kern: size * tracking,
+                .kern: min(size * tracking, 0.2),
             ])
+    }
+}
+
+@MainActor
+final class SurfaceView: NSView {
+    private let effect = NSVisualEffectView()
+    private let tint = PlateView(fill: .clear)
+    private(set) var usesOpaqueFallback = false
+
+    init(radius: CGFloat = 0) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = radius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.borderWidth = radius > 0 ? 0.5 : 0
+        layer?.borderColor = Theme.border.cgColor
+        effect.material = .hudWindow
+        effect.blendingMode = .behindWindow
+        effect.state = .active
+        for view in [effect, tint] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: trailingAnchor),
+                view.topAnchor.constraint(equalTo: topAnchor),
+                view.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(updateAccessibility),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
+        updateAccessibility()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
+
+    isolated deinit { NSWorkspace.shared.notificationCenter.removeObserver(self) }
+
+    @objc private func updateAccessibility() {
+        applyAccessibility(reduceTransparency: NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency,
+                           increaseContrast: NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast)
+    }
+
+    func applyAccessibility(reduceTransparency: Bool, increaseContrast: Bool) {
+        usesOpaqueFallback = reduceTransparency || increaseContrast
+        effect.isHidden = usesOpaqueFallback
+        tint.fill(Theme.surface.withAlphaComponent(usesOpaqueFallback ? 1 : (Theme.isDark ? 0.32 : 0.40)))
+        layer?.borderColor = (increaseContrast ? Theme.ink : Theme.border).cgColor
     }
 }
 
@@ -222,7 +273,7 @@ struct Palette {
     static let ember = Palette(
         name: "Ember", note: "Warm dark, amber.",
         surface: 0x131210, ground: 0x1C1A17, ink: 0xF0ECE5, inkSoft: 0xD4CFC5,
-        muted: 0x938C80, faint: 0x7A7468, accent: 0xE0A533,
+        muted: 0xB3ADA3, faint: 0x99938B, accent: 0xE0A533,
         ok: 0x6EC28B, warn: 0x74A9DB, danger: 0xE8705C, dark: true,
         hairline: 0.13, rule: 0.30, border: 0.18, selection: 0.16)
 

@@ -10,7 +10,12 @@ target="$HOME/Applications/Blindspot.app"
 lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 [[ -d $app ]] || { echo "error: $app is missing; run make sign first" >&2; exit 1; }
-codesign --verify --deep --strict "$app"
+if ! codesign --verify --deep --strict "$app"; then
+    echo "error: the app bundle is unsigned, incomplete, or changed since signing." >&2
+    echo "From the repository root, run: make install" >&2
+    echo "That rebuilds and signs before installing. release.sh does not rebuild the local app." >&2
+    exit 1
+fi
 source_path="$(cd "$(dirname "$app")" && pwd)/$(basename "$app")"
 bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
 version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")

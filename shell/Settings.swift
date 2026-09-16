@@ -11,54 +11,117 @@ private final class TopStack: NSStackView {
     override var isFlipped: Bool { true }
 }
 
-/// A switch, in the plate's own language.
-///
-/// Not `NSSwitch`: its on state is the system accent, and this design spends exactly one
-/// colour on exactly one thing per screen.
 @MainActor
-private final class Toggle: NSView {
-    private static let size = NSSize(width: 38, height: 22)
-    private let knob = PlateView(fill: Theme.surface, radius: 8)
-    private var on: Bool
-    private var placement: NSLayoutConstraint?
+private final class SettingsSidebar: NSView {
+    private var buttons: [NSButton] = []
+    private(set) var selected = 0
+    var onSelect: ((Int) -> Void)?
 
-    var onChange: ((Bool) -> Bool)?
+    static func title(for section: String) -> String {
+        switch section {
+        case "Launcher": "General"
+        case "Ranking": "Search"
+        case "Agent": "AI"
+        case "Status": "About"
+        default: section
+        }
+    }
 
-    init(on: Bool) {
-        self.on = on
+    init(titles: [String]) {
         super.init(frame: .zero)
-        wantsLayer = true
-        layer?.cornerRadius = Self.size.height / 2
-        layer?.borderColor = Theme.hairline.cgColor
-        layer?.borderWidth = 1
         translatesAutoresizingMaskIntoConstraints = false
-        knob.translatesAutoresizingMaskIntoConstraints = true
-        addSubview(knob)
-
+        let brand = NSTextField(labelWithString: "Blindspot")
+        brand.font = Theme.text(20)
+        brand.textColor = Theme.inkSoft
+        let stack = NSStackView(views: [brand])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 5
+        stack.setCustomSpacing(22, after: brand)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        for (index, section) in titles.enumerated() {
+            let button = NSButton(title: Self.title(for: section), target: self, action: #selector(changed(_:)))
+            button.tag = index
+            button.identifier = NSUserInterfaceItemIdentifier("settings.section.\(section)")
+            button.font = Theme.text(13)
+            button.alignment = .left
+            button.isBordered = false
+            let symbol: String = switch section {
+            case "General": "gearshape"
+            case "Ranking": "magnifyingglass"
+            case "Content": "doc.text"
+            case "Index": "externaldrive"
+            case "Clipboard": "doc.on.clipboard"
+            case "Agent": "brain"
+            case "Appearance": "paintbrush"
+            default: "info.circle"
+            }
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+            button.imagePosition = .imageLeading
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 7
+            button.setAccessibilityLabel(Self.title(for: section))
+            button.widthAnchor.constraint(equalToConstant: 148).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            buttons.append(button)
+            stack.addArrangedSubview(button)
+        }
+        let footer = NSTextField(labelWithString: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+        footer.font = Theme.text(11)
+        footer.textColor = Theme.muted
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(footer)
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: Self.size.width),
-            heightAnchor.constraint(equalToConstant: Self.size.height),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: footer.topAnchor, constant: -20),
+            footer.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
+            footer.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
-        paint()
+        select(0)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
 
-    private func paint() {
-        layer?.backgroundColor = (on ? Theme.accent : Theme.ground).cgColor
-        knob.layer?.backgroundColor = (on ? Theme.surface : Theme.faint).cgColor
-        let inset: CGFloat = 3
-        let side: CGFloat = 16
-        knob.frame = NSRect(
-            x: on ? Self.size.width - side - inset : inset,
-            y: (Self.size.height - side) / 2, width: side, height: side)
+    func select(_ index: Int) {
+        selected = index
+        for button in buttons {
+            let current = button.tag == index
+            button.layer?.backgroundColor = current ? Theme.selection.cgColor : NSColor.clear.cgColor
+            button.contentTintColor = current ? Theme.ink : Theme.muted
+            button.setAccessibilityValue(current ? "Selected" : "")
+        }
     }
 
-    override func mouseDown(with event: NSEvent) {
-        on.toggle()
-        paint()
-        if onChange?(on) == false { on.toggle(); paint() }
+    func show(status: String) {}
+    @objc private func changed(_ sender: NSButton) { onSelect?(sender.tag) }
+}
+
+/// A switch, in the plate's own language.
+///
+/// Not `NSSwitch`: its on state is the system accent, and this design spends exactly one
+/// colour on exactly one thing per screen.
+@MainActor
+private final class Toggle: NSSwitch {
+    var onChange: ((Bool) -> Bool)?
+
+    init(on: Bool) {
+        super.init(frame: .zero)
+        state = on ? .on : .off
+        target = self
+        action = #selector(changed)
+        translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not loaded from a nib") }
+
+    @objc private func changed() {
+        if onChange?(state == .on) == false { state = state == .on ? .off : .on }
     }
 }
 
@@ -69,9 +132,9 @@ private final class Toggle: NSView {
 /// modifier bits share no positions — and the core spells it. The window therefore never
 /// knows how a chord is written, and cannot drift from the parser config.toml is read with.
 @MainActor
-private final class ChordWell: NSView {
+private final class ChordWell: NSButton {
     private let label = NSTextField(labelWithString: "")
-    private let plate = PlateView(fill: Theme.ground, radius: 3, border: Theme.hairline)
+    private let plate = PlateView(fill: Theme.ink.withAlphaComponent(0.04), radius: 6, border: Theme.hairline)
     private var monitor: Any?
     private var resting: String
 
@@ -83,6 +146,12 @@ private final class ChordWell: NSView {
     init(_ value: String) {
         resting = value
         super.init(frame: .zero)
+        title = ""
+        isBordered = false
+        target = self
+        action = #selector(arm)
+        setAccessibilityLabel("Record keyboard shortcut")
+        setAccessibilityValue(value.isEmpty ? "None" : value)
         translatesAutoresizingMaskIntoConstraints = false
         label.alignment = .right
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -116,15 +185,24 @@ private final class ChordWell: NSView {
     private func rest() {
         let empty = resting.trimmingCharacters(in: .whitespaces).isEmpty
         label.attributedStringValue = NSAttributedString(
-            string: empty ? "none" : resting,
+            string: empty ? "Not set" : resting.split(separator: "+").map {
+                switch $0.lowercased() {
+                case "cmd", "command": "⌘"
+                case "shift": "⇧"
+                case "alt", "option": "⌥"
+                case "ctrl", "control": "⌃"
+                case "space": "Space"
+                default: String($0).uppercased()
+                }
+            }.joined(separator: " "),
             attributes: [
-                .font: Theme.mono(12),
+                .font: Theme.text(13),
                 .foregroundColor: empty ? Theme.faint : Theme.ink,
             ])
-        plate.fill(Theme.ground)
+        plate.fill(Theme.ink.withAlphaComponent(0.04))
     }
 
-    override func mouseDown(with event: NSEvent) {
+    @objc private func arm() {
         guard monitor == nil else { return disarm() }
         label.attributedStringValue = Theme.label(
             "PRESS A CHORD · ⎋ CANCEL", size: 9.5, tracking: 0.1, color: Theme.accent)
@@ -548,12 +626,19 @@ private final class SettingRow: NSView, NSTextFieldDelegate, NSTextViewDelegate 
         separator.isHidden = !separated
 
         label.attributedStringValue = NSAttributedString(
-            string: setting.label,
+            string: setting.key == "hotkey" ? "Open Blindspot" : setting.key == "agent_hotkey" ? "Open AI" : setting.label,
             attributes: [.font: Theme.text(13, .medium), .foregroundColor: Theme.ink])
         help.lineBreakMode = .byWordWrapping
-        help.maximumNumberOfLines = 2
+        help.maximumNumberOfLines = 0
         help.preferredMaxLayoutWidth = 320
-        say(setting.help, wrong: false)
+        let shortHelp: String = switch setting.key {
+        case "hotkey", "agent_hotkey", "max_results": ""
+        case "launch_at_login": "Ready whenever you need it."
+        case "fallback_search": "Offered when local results are limited."
+        default: setting.help
+        }
+        say(shortHelp, wrong: false)
+        help.isHidden = shortHelp.isEmpty
 
         // A button, not a label: on a row this window set, it is how you put it back.
         origin.isBordered = false
@@ -563,7 +648,8 @@ private final class SettingRow: NSView, NSTextFieldDelegate, NSTextViewDelegate 
         origin.isEnabled = setting.source == .window
         origin.toolTip = setting.source == .window ? "Back to config.toml" : nil
         // Nothing set a diagnostic, so "where did this come from" has no answer to give.
-        origin.isHidden = setting.kind == .readonly
+        origin.isHidden = setting.kind == .readonly || (setting.source != .window && setting.live)
+        label.toolTip = setting.help + "\n" + (setting.source == .configFile ? "From config.toml" : "Local changes override config.toml")
 
         let text = NSStackView(views: [label, help])
         text.orientation = .vertical
@@ -603,11 +689,12 @@ private final class SettingRow: NSView, NSTextFieldDelegate, NSTextViewDelegate 
 
     /// The second line: what this knob is for, or why the last write was refused.
     private func say(_ message: String, wrong: Bool) {
+        help.isHidden = message.isEmpty
         help.attributedStringValue = NSAttributedString(
             string: message,
             attributes: [
-                .font: Theme.text(11),
-                .foregroundColor: wrong ? Theme.danger : Theme.faint,
+                .font: Theme.text(12),
+                .foregroundColor: wrong ? Theme.danger : Theme.muted,
             ])
     }
 
@@ -629,12 +716,12 @@ private final class SettingRow: NSView, NSTextFieldDelegate, NSTextViewDelegate 
     private static func provenance(of setting: Setting) -> NSAttributedString {
         let (word, colour): (String, NSColor) =
             switch setting.source {
-            case .builtIn: ("DEFAULT", Theme.faint)
-            case .configFile: ("CONFIG.TOML", Theme.muted)
-            case .window: ("SET HERE · RESET", Theme.accent)
+            case .builtIn: ("Default", Theme.muted)
+            case .configFile: ("config.toml", Theme.muted)
+            case .window: ("Reset", Theme.muted)
             }
-        let line = setting.live ? word : "\(word) · RESTART"
-        return Theme.label(line, size: 9, tracking: 0.12, color: colour)
+        let line = setting.live ? word : "\(word) · Restart required"
+        return Theme.label(line, size: 10, tracking: 0, color: colour)
     }
 
     // MARK: - Controls
@@ -643,6 +730,8 @@ private final class SettingRow: NSView, NSTextFieldDelegate, NSTextViewDelegate 
         switch setting.kind {
         case .flag:
             let toggle = Toggle(on: setting.value == "true")
+            toggle.setAccessibilityLabel(setting.label)
+            toggle.setAccessibilityHelp(setting.help)
             toggle.onChange = { [weak self] on in self?.commit(on ? "true" : "false") ?? false }
             return trailing(toggle)
 
@@ -697,6 +786,7 @@ private final class SettingRow: NSView, NSTextFieldDelegate, NSTextViewDelegate 
     /// the system bezel is the loudest thing on a dark ground and this design is hairlines.
     private func well(width: CGFloat, mono: Bool) -> NSView {
         let field = NSTextField(string: setting.value)
+        field.setAccessibilityLabel(setting.label)
         field.font = mono ? Theme.mono(12) : Theme.text(12)
         field.textColor = Theme.ink
         field.alignment = .right
@@ -707,7 +797,7 @@ private final class SettingRow: NSView, NSTextFieldDelegate, NSTextViewDelegate 
         field.delegate = self
         field.translatesAutoresizingMaskIntoConstraints = false
 
-        let plate = PlateView(fill: Theme.ground, radius: 3, border: Theme.hairline)
+        let plate = PlateView(fill: Theme.ink.withAlphaComponent(0.04), radius: 6, border: Theme.hairline)
         plate.addSubview(field)
         NSLayoutConstraint.activate([
             plate.widthAnchor.constraint(equalToConstant: width),
@@ -819,7 +909,8 @@ private final class ActionRow: NSView {
 
     func showButton(_ title: String) {
         press?.attributedTitle = Theme.label(
-            title.uppercased(), size: 10, tracking: 0.1, color: Theme.danger)
+            title, size: 12, tracking: 0,
+            color: title.hasPrefix("Erase") || title.hasPrefix("Forget") ? Theme.danger : Theme.accent)
     }
 
     @objc private func fire() { act() }
@@ -831,12 +922,18 @@ private final class ActionRow: NSView {
 /// because which ones exist is a fact about `Theme.swift`. Asking Rust to describe an enum
 /// it cannot see would be backwards.
 @MainActor
-private final class PaletteRow: NSView {
+private final class PaletteRow: NSButton {
     private let choose: () -> Void
 
     init(_ palette: Palette, current: Bool, separated: Bool, choose: @escaping () -> Void) {
         self.choose = choose
         super.init(frame: .zero)
+        title = ""
+        isBordered = false
+        target = self
+        action = #selector(selectPalette)
+        setAccessibilityLabel(palette.name)
+        setAccessibilityValue(current ? "Selected" : "")
         translatesAutoresizingMaskIntoConstraints = false
 
         let separator = PlateView(fill: Theme.hairline)
@@ -859,7 +956,7 @@ private final class PaletteRow: NSView {
 
         let mark = NSTextField(labelWithString: "")
         mark.attributedStringValue = Theme.label(
-            current ? "CURRENT" : "", size: 9, tracking: 0.12, color: Theme.accent)
+            current ? "✓" : "", size: 13, tracking: 0, color: Theme.accent)
 
         let text = NSStackView(views: [title, note])
         text.orientation = .vertical
@@ -899,7 +996,7 @@ private final class PaletteRow: NSView {
         return chip
     }
 
-    override func mouseDown(with event: NSEvent) { choose() }
+    @objc private func selectPalette() { choose() }
 }
 
 /// The preferences window.
@@ -914,15 +1011,16 @@ private final class PaletteRow: NSView {
 /// this window from drifting from config.toml.
 @MainActor
 final class SettingsWindow: NSObject, NSWindowDelegate {
-    private static let width: CGFloat = 640
-    private static let height: CGFloat = 460
+    private static let width: CGFloat = 860
+    private static let height: CGFloat = 650
 
     private let core: Core
     private let window: NSWindow
     /// All three are rebuilt when the colourway changes: a `CALayer` bakes its colour in
     /// when it is built, so repainting in place would leave every hairline and the tab
     /// bar's band in the old palette.
-    private var tabs: TabBar
+    private var tabs: SettingsSidebar
+    private var pageTitle = NSTextField(labelWithString: "")
     private var rows = TopStack()
     private var scroll = NSScrollView()
     private var sections: [String] = []
@@ -949,17 +1047,20 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         self.core = core
         settings = core.settings()
         sections = Self.sections(of: settings)
-        tabs = TabBar(titles: sections.map { $0.uppercased() })
+        tabs = SettingsSidebar(titles: sections)
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: Self.width, height: Self.height),
-            styleMask: [.titled, .closable],
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false)
         super.init()
 
         window.title = "blindspot"
         window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        window.minSize = NSSize(width: 820, height: 540)
+        window.setFrameAutosaveName("BlindspotSettings03")
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.center()
@@ -989,9 +1090,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         // the scroller and every other system-drawn part resolve against the window's
         // appearance, and a light title bar over a dark plate reads as two applications.
         window.appearance = NSAppearance(named: Theme.isDark ? .darkAqua : .aqua)
-        window.backgroundColor = Theme.ground
+        window.backgroundColor = .clear
+        window.isOpaque = false
 
-        tabs = TabBar(titles: sections.map { $0.uppercased() })
+        tabs = SettingsSidebar(titles: sections)
         tabs.onSelect = { [weak self] index in self?.choose(index) }
 
         rows = TopStack()
@@ -1008,16 +1110,28 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         scroll.scrollerStyle = .overlay
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
-        let plate = PlateView(fill: Theme.surface)
+        let plate = SurfaceView()
         plate.translatesAutoresizingMaskIntoConstraints = true
-        for view in [tabs, scroll] as [NSView] { plate.addSubview(view) }
+        pageTitle = NSTextField(labelWithString: "")
+        pageTitle.font = Theme.text(24, .semibold)
+        pageTitle.textColor = Theme.ink
+        pageTitle.translatesAutoresizingMaskIntoConstraints = false
+        let contentTint = PlateView(fill: Theme.surface.withAlphaComponent(0.18))
+        for view in [contentTint, tabs, pageTitle, scroll] as [NSView] { plate.addSubview(view) }
 
         NSLayoutConstraint.activate([
-            tabs.topAnchor.constraint(equalTo: plate.topAnchor),
+            tabs.topAnchor.constraint(equalTo: plate.topAnchor, constant: 48),
             tabs.leadingAnchor.constraint(equalTo: plate.leadingAnchor),
-            tabs.trailingAnchor.constraint(equalTo: plate.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: tabs.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: plate.leadingAnchor),
+            tabs.widthAnchor.constraint(equalToConstant: 180),
+            tabs.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -20),
+            contentTint.leadingAnchor.constraint(equalTo: tabs.trailingAnchor),
+            contentTint.trailingAnchor.constraint(equalTo: plate.trailingAnchor),
+            contentTint.topAnchor.constraint(equalTo: plate.topAnchor),
+            contentTint.bottomAnchor.constraint(equalTo: plate.bottomAnchor),
+            pageTitle.topAnchor.constraint(equalTo: plate.topAnchor, constant: 48),
+            pageTitle.leadingAnchor.constraint(equalTo: tabs.trailingAnchor, constant: Theme.gutter),
+            scroll.topAnchor.constraint(equalTo: pageTitle.bottomAnchor, constant: 18),
+            scroll.leadingAnchor.constraint(equalTo: tabs.trailingAnchor),
             scroll.trailingAnchor.constraint(equalTo: plate.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: plate.bottomAnchor),
             // The document view is as wide as the clip, so a row's trailing gutter lands
@@ -1230,6 +1344,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         statusTask = nil
         tabs.select(index)
         let section = sections[index]
+        pageTitle.stringValue = SettingsSidebar.title(for: section)
         eraseRow = nil
         dashboard = nil
         for view in rows.arrangedSubviews {
@@ -1244,8 +1359,10 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             }
             view.onExclude = { [weak self] path in self?.exclude(path) }
             view.onCompact = { [weak self] in self?.confirmCompact() }
+            view.onOpenSetting = { [weak self] key in self?.show(settingKey: key) }
             rows.addArrangedSubview(view)
             view.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
+            view.heightAnchor.constraint(equalTo: scroll.contentView.heightAnchor).isActive = true
             dashboard = view
             core.refreshDiagnostics()
             view.update(core.contentState?.overview)
@@ -1273,9 +1390,23 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
 
         for (at, setting) in settings.filter({ $0.section == section }).enumerated() {
             let key = setting.key
+            let group: String? = switch key {
+            case "hotkey": "Shortcuts"
+            case "launch_at_login": "Startup"
+            case "fallback_search": "Search"
+            case "app_paths": "Application folders"
+            default: nil
+            }
+            if let group {
+                let heading = IndexUI.caption(group)
+                let inset = NSStackView(views: [heading])
+                inset.edgeInsets = NSEdgeInsets(top: at == 0 ? 0 : 20, left: Theme.gutter, bottom: 6, right: Theme.gutter)
+                rows.addArrangedSubview(inset)
+                inset.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
+            }
             let row = SettingRow(
                 setting,
-                separated: at > 0,
+                separated: section != "General" && at > 0,
                 apply: { [weak self] value in self?.write(key, value) },
                 forget: { [weak self] in self?.forget(key) },
                 spell: { [weak self] code, mask in

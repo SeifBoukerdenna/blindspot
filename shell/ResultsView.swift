@@ -354,6 +354,7 @@ private final class ResultRow: NSView {
     private let rail = NSTextField(labelWithString: "")
     private let title = NSTextField(labelWithString: "")
     private let subtitle = NSTextField(labelWithString: "")
+    private let excerpt = NSTextField(labelWithString: "")
     /// The keys that act on this row, or the outcome it ended in.
     private let note = NSTextField(labelWithString: "")
     /// A refusal, and only a refusal: the one place in the design where a label becomes a
@@ -379,7 +380,7 @@ private final class ResultRow: NSView {
 
     /// Names of things are prose; commands and computed values are not. A monospaced title
     /// is the cheapest way to say "this is something you would type", and it lines digits up.
-    private static let nameFont = Theme.text(14.5, .medium)
+    private static let nameFont = Theme.text(15, .medium)
     private static let commandFont = Theme.mono(12.5)
     /// Converted values are the row's whole point, so they are set at reading size.
     private static let figureFont = Theme.mono(17)
@@ -400,10 +401,15 @@ private final class ResultRow: NSView {
         // A command may carry newlines — a heredoc writing a file — and a row is one line.
         title.maximumNumberOfLines = 1
         title.usesSingleLineMode = true
-        subtitle.font = Theme.text(11)
+        subtitle.font = Theme.text(12)
         subtitle.maximumNumberOfLines = 1
         subtitle.usesSingleLineMode = true
         subtitle.lineBreakMode = .byTruncatingMiddle
+        excerpt.font = Theme.text(12)
+        excerpt.textColor = Theme.inkSoft
+        excerpt.maximumNumberOfLines = 1
+        excerpt.lineBreakMode = .byTruncatingTail
+        excerpt.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         // Low horizontal compression resistance on both labels, so long text truncates
         // instead of widening the window. A label's intrinsic width is its whole string,
         // at the default priority of 750 — and the panel's width is not a required
@@ -421,10 +427,10 @@ private final class ResultRow: NSView {
         badgeLabel.translatesAutoresizingMaskIntoConstraints = false
         badge.addSubview(badgeLabel)
 
-        text.setViews([title, subtitle], in: .leading)
+        text.setViews([title, subtitle, excerpt], in: .leading)
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 1
+        text.spacing = 4
 
         for view in [separator, iconView, rail, text, note, badge] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
@@ -475,12 +481,16 @@ private final class ResultRow: NSView {
 
     func show(_ match: Match, selected: Bool, separated: Bool) {
         shown = match
-        separator.isHidden = !separated
+        separator.isHidden = true
 
         let (name, detail) = Self.contents(of: match)
         shownTitle = name
+        setAccessibilityLabel([name, detail].filter { !$0.isEmpty }.joined(separator: ", "))
+        toolTip = detail
         subtitle.stringValue = detail
         subtitle.isHidden = detail.isEmpty
+        excerpt.stringValue = match.kind == .file ? match.detail : ""
+        excerpt.isHidden = excerpt.stringValue.isEmpty
 
         apply(Self.lead(of: match))
         select(selected)
@@ -502,7 +512,7 @@ private final class ResultRow: NSView {
                 color: on ? Theme.muted : Theme.faint)
         }
 
-        subtitle.textColor = on ? Theme.muted : Theme.faint
+        subtitle.textColor = Theme.muted
 
         switch Self.rightHand(of: match, selected: on) {
         case let .filled(text, colour):
@@ -543,9 +553,9 @@ private final class ResultRow: NSView {
     private static func rightHand(of match: Match, selected: Bool) -> RightHand {
         switch match.kind {
         case .agentBlocked:
-            return .filled("REFUSED", Theme.danger)
+            return .word("Refused", Theme.danger)
         case .agentModel where match.subtitle.hasPrefix(currentPrefix):
-            return .filled("CURRENT", Theme.accent)
+            return .word("Current", Theme.accent)
         case .agentPast:
             let word = match.subtitle.components(separatedBy: " · ").first ?? ""
             if !word.isEmpty { return .word(word.uppercased(), outcomeColour(word)) }
@@ -553,7 +563,7 @@ private final class ResultRow: NSView {
             break
         }
         guard selected, let keys = ActionHint.text(for: match) else { return .nothing }
-        return .keys(keys)
+        return .keys(match.kind == .agentRunning ? keys : "↩")
     }
 
     /// Ran, answered, left running, failed — each its own colour, so a list of past
@@ -711,10 +721,11 @@ private final class ResultRow: NSView {
         case .agentModel:
             // "current · 2.4 GB" marks the model in use; the badge says so instead.
             return (match.name, match.subtitle.replacingOccurrences(of: currentPrefix, with: ""))
-        case .file where match.page > 0 || match.line > 0:
+        case .file where !match.detail.isEmpty || match.page > 0 || match.line > 0:
             let paged = URL(fileURLWithPath: match.path).pathExtension.lowercased() == "pptx" ? "slide" : "p."
-            let place = match.page > 0 ? "\(paged) \(match.page)" : "line \(match.line)"
-            return (match.name, match.subtitle.isEmpty ? place : "\(place) · \(match.subtitle)")
+            let place = match.page > 0 ? "\(paged) \(match.page)" : match.line > 0 ? "line \(match.line)" : ""
+            let folder = ((match.path as NSString).deletingLastPathComponent as NSString).abbreviatingWithTildeInPath
+            return (match.name, [folder, place].filter { !$0.isEmpty }.joined(separator: " · "))
         case .app, .file, .port, .command, .setting, .shortcut, .quickLink, .snippet, .system, .prompt, .event, .header, .agentPrompt, .agentStep, .agentBlocked,
             .agentOk, .agentFailed, .agentAnswer:
             return (match.name, match.subtitle)
@@ -852,6 +863,7 @@ private final class HeaderRow: NSView {
         text.translatesAutoresizingMaskIntoConstraints = false
         addSubview(text)
         addSubview(line)
+        line.isHidden = true
 
         NSLayoutConstraint.activate([
             // Level with the gutter every row's icon starts at.
@@ -870,7 +882,7 @@ private final class HeaderRow: NSView {
     /// `detail` is the agent's working folder; the welcome screen's headers have none.
     func show(_ title: String, detail path: String) {
         label.attributedStringValue = Theme.label(
-            title.uppercased(), size: 9.5, tracking: 0.17, color: Theme.faint)
+            title.localizedCapitalized, size: 11, tracking: 0, color: Theme.muted)
         detail.isHidden = path.isEmpty
         detail.attributedStringValue = Theme.label(
             (path as NSString).abbreviatingWithTildeInPath, size: 9.5, tracking: 0.10,
@@ -888,7 +900,10 @@ private final class Selection: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = Theme.selection.cgColor
+        layer?.cornerRadius = 8
+        layer?.cornerCurve = .continuous
         bar.translatesAutoresizingMaskIntoConstraints = true
+        bar.isHidden = true
         addSubview(bar)
     }
 
@@ -928,7 +943,7 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
     /// Nothing at the top: the first section title sits directly under the heavy rule,
     /// the way it does in the drawing. Six at the bottom so the last row is not flush
     /// against the plate's edge.
-    private static let padding = NSEdgeInsets(top: 0, left: 0, bottom: 6, right: 0)
+    private static let padding = NSEdgeInsets(top: 6, left: 0, bottom: 6, right: 0)
     private static let rowID = NSUserInterfaceItemIdentifier("result")
 
     private let table = NSTableView()
@@ -1095,6 +1110,7 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
     /// One animation on the table's layer rather than one per row: fifty row animations cost
     /// fifty times as much and look no different at this speed.
     private func playEntrance() {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
         guard let layer = table.layer else { return }
         layer.removeAnimation(forKey: "entrance")
         let fade = CABasicAnimation(keyPath: "opacity")
@@ -1112,7 +1128,7 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
     }
 
     private func highlightFrame(for row: Int) -> NSRect {
-        table.rect(ofRow: row)
+        table.rect(ofRow: row).insetBy(dx: 8, dy: 2)
     }
 
     /// Puts the wash on the selected row. `animated` only when the move came from the arrow
@@ -1127,7 +1143,7 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
         // Nothing to glide from when it was hidden, or when the list just changed.
         let appearing = highlight.isHidden
         highlight.isHidden = false
-        guard animated, !appearing else {
+        guard animated, !appearing, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
             highlight.frame = frame
             return
         }
@@ -1140,7 +1156,8 @@ final class ResultsView: NSScrollView, NSTableViewDataSource, NSTableViewDelegat
     }
 
     private static func height(of match: Match) -> CGFloat {
-        match.kind == .header ? headerHeight : rowHeight
+        if match.kind == .file, !match.detail.isEmpty { return rowHeight + 20 }
+        return match.kind == .header ? headerHeight : rowHeight
     }
 
     /// The live row view, if it is on screen. Off-screen rows get their selection state
