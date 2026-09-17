@@ -171,6 +171,126 @@ enum ActionTests {
                 preconditionFailure("Read symbolic link")
             } catch {}
         } catch { preconditionFailure("File action regression: \(error)") }
+        await explanations()
         print("Action safety and native file operations: 11 passed; contextual commands and permission fallback: 2 passed; typed navigation: 2 passed")
+    }
+
+    static func explanations() async {
+        func row(_ detail: String = "", highlights: [Int] = [], kind: MatchKind = .file,
+                 path: String = "/fixture/Glacier permits.pdf") -> Match {
+            Match(id: 19, name: "Glacier permits.pdf", kind: kind, path: path, score: .max,
+                  timestamp: 0, width: 0, height: 0, detail: detail, highlights: highlights, page: 7)
+        }
+        let evidence: [(Match, ResultExplanation.Evidence)] = [
+            (row(highlights: [0, 1]), .filename),
+            (row(highlights: [0], kind: .app), .application),
+            (row("Words · “overnight permits”"), .words),
+            (row("Meaning · “overnight permits”"), .meaning),
+            (row("Words + meaning · “overnight permits”", highlights: [0]), .blended),
+            (row("“overnight permits”"), .contentWords),
+            (row("Content match"), .contentWords),
+            (row("Content match · limited relevance; refine query"), .contentWords),
+            (row("Related by meaning · “overnight permits”"), .contentMeaning),
+            (row("Related by meaning · approximate, no exact word match"), .contentMeaning),
+            (row(), .unknown),
+            (row("Wordsworth notes"), .unknown),
+            (row("Meaning · forged", kind: .tool), .unknown),
+            (row("Words + meaning · forged", kind: .app), .unknown),
+        ]
+        for (result, expected) in evidence {
+            precondition(ResultExplanation.evidence(for: result) == expected, result.detail)
+            let body = ResultExplanation.body(for: result, inspection: nil, passageAvailable: nil)
+            precondition(!body.contains("4294967295") && !body.contains("%"))
+        }
+        func inspection(_ title: String, detail: String = "Fixture status", next: String = "Check again.") -> FileInspection {
+            FileInspection(title: title, detail: detail, next: next, setting: "", root: "/fixture", passages: 1, embedded: 1)
+        }
+        let passage = row("Words + meaning · “overnight permits”")
+        let fresh = inspection("Indexed for word search")
+        let statuses = [
+            (fresh, "Source metadata matches"),
+            (inspection("Partially indexed"), "only part of the file"),
+            (inspection("Indexed copy is out of date"), "out of date"),
+            (inspection("File unavailable to the indexer"), "unavailable"),
+            (inspection("Outside your indexed folders"), "Outside your indexed folders"),
+            (inspection("Extraction did not succeed", detail: "Older passages may be stale."), "may be stale"),
+            (inspection("Index could not be read"), "could not be read"),
+        ]
+        for (inspection, expected) in statuses {
+            let body = ResultExplanation.body(for: passage, inspection: inspection, passageAvailable: true)
+            precondition(body.contains(expected), body)
+            if inspection.title != "Indexed for word search" && inspection.title != "Partially indexed" {
+                precondition(!body.contains("metadata matches"))
+            }
+        }
+        let missing = ResultExplanation.body(for: passage, inspection: fresh, passageAvailable: false)
+        precondition(missing.contains("selected passage is no longer available") && missing.contains("Search again"))
+        precondition(ResultExplanation.body(for: passage, inspection: nil, passageAvailable: nil).contains("Could not verify"))
+        let bounded = ResultExplanation.body(for: row("Meaning · text"), inspection:
+            inspection("Failure", detail: String(repeating: "a", count: 10_000), next: String(repeating: "b", count: 10_000)), passageAvailable: false)
+        precondition(bounded.count < 2000)
+
+        let provider = SearchExplanationActions(inspect: { path in
+            precondition(!Thread.isMainThread && path == "/fixture/Glacier permits.pdf")
+            return fresh
+        }, passageExists: { id, path in
+            precondition(!Thread.isMainThread && id == 19 && path == "/fixture/Glacier permits.pdf")
+            return false
+        })
+        let registry = ActionRegistry()
+        precondition(registry.actions(for: passage).filter { $0.label == "Why this result?" }.count == 1)
+        for bad in [row(kind: .tool), row(kind: .header), row(path: "relative.pdf"), row(path: "/invalid\0.pdf"), row(path: "/" + String(repeating: "a", count: 4096))] {
+            precondition(provider.actions(for: bad).isEmpty)
+        }
+        do {
+            let action = provider.actions(for: passage)[0]
+            let effect = try await provider.perform(action.id, on: passage)
+            guard case .message(let title, let body) = effect else { preconditionFailure("Not an explanation") }
+            precondition(title == "Why this result?" && body.contains("Words + meaning") && body.contains("Search again"))
+            let fallback = try await registry.perform(action, on: passage, confirmed: false)
+            guard case .message(_, let fallbackBody) = fallback else { preconditionFailure("Missing fallback") }
+            precondition(fallbackBody.contains("Could not verify"))
+            let app = row(highlights: [0], kind: .app)
+            let appEffect = try await provider.perform(action.id, on: app)
+            guard case .message(_, let appBody) = appEffect else { preconditionFailure("Missing app explanation") }
+            precondition(appBody.contains("Not applicable"))
+        } catch { preconditionFailure("Explanation failed: \(error)") }
+
+        let delayed = SearchExplanationActions(inspect: { _ in
+            Thread.sleep(forTimeInterval: 0.08)
+            return fresh
+        })
+        let cancelled = Task { try await delayed.perform(delayed.actions(for: passage)[0].id, on: passage) }
+        try? await Task.sleep(for: .milliseconds(20))
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            preconditionFailure("Cancelled explanation was delivered")
+        } catch is CancellationError {} catch { preconditionFailure("Wrong cancellation error") }
+        print("Search explanations: \(evidence.count) provenance cases, \(statuses.count) freshness cases, missing passage, bounded output, action dispatch, worker-thread checks and cancellation passed")
+
+        if CommandLine.arguments.contains("--explanation-ui") {
+            let app = NSApplication.shared
+            app.setActivationPolicy(.accessory)
+            let alert = NSAlert()
+            alert.messageText = "Why this result?"
+            alert.informativeText = ResultExplanation.body(for: passage, inspection: fresh, passageAvailable: true)
+            alert.addButton(withTitle: "Done")
+            alert.layout()
+            let window = alert.window
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+            guard let view = window.contentView else { preconditionFailure("No explanation view") }
+            view.layoutSubtreeIfNeeded()
+            precondition(window.frame.height < (window.screen?.visibleFrame.height ?? 800))
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { preconditionFailure("No capture") }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            guard let png = bitmap.representation(using: .png, properties: [:]) else { preconditionFailure("No PNG") }
+            try! png.write(to: URL(fileURLWithPath: "build/search-explanation.png"))
+            window.close()
+            precondition(!window.isVisible)
+            print("Native explanation dialog: layout, screenshot and close passed")
+        }
     }
 }

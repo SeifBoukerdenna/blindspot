@@ -954,6 +954,18 @@ void bs_free_results(BsResults results);
 void bs_shutdown(BsHandle *handle);
 
 /**
+ * Searches document contents within one already indexed folder. Work runs on workers.
+ * The query is content text plus existing kind/size/modified filters, without :content.
+ * # Safety
+ * `handle` must be NULL or live; strings must be NULL or valid NUL-terminated UTF-8.
+ * Free the returned result with `bs_free_results` exactly once.
+ */
+BsResults bs_content_query_in_folder(const BsHandle *handle,
+                                     const char *query,
+                                     const char *folder,
+                                     size_t limit);
+
+/**
  * Inspects one user-selected file without changing the index. Call on a worker.
  * Free the returned JSON with `bs_free_blob`.
  * # Safety

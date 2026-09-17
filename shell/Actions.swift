@@ -58,6 +58,7 @@ final class ActionRegistry {
 
     init(clipSink: ClipSink? = nil, core: Core? = nil, schedule: ScheduleProvider? = nil) {
         register(FileActions(reader: core?.passageReader))
+        register(SearchExplanationActions(reader: core?.passageReader))
         register(ApplicationActions())
         register(ProcessActions())
         register(NavigationActions())
@@ -90,6 +91,129 @@ final class ActionRegistry {
             throw ActionFailure.unavailable
         }
         return try await provider.perform(action.id, on: result)
+    }
+}
+
+enum ResultExplanation {
+    enum Evidence: Equatable {
+        case filename, application, words, meaning, blended, contentWords, contentMeaning, unknown
+
+        var isPassage: Bool { self == .words || self == .meaning || self == .blended }
+
+        var description: String {
+            switch self {
+            case .filename:
+                "Filename match\nThe search matched the highlighted characters in this filename. Matching can ignore case and match separated characters; it need not be an exact phrase. This row came from filename search, not content search."
+            case .application:
+                "Application name match\nThe search matched the highlighted characters in the app name. Name relevance and local usage can affect ordering; this is not a match inside the app’s documents."
+            case .words:
+                "Word match\nWord search retrieved this passage from indexed text, titles or headings. It can match a subset of query terms, not necessarily an exact phrase. This is the evidence recorded when this row appeared."
+            case .meaning:
+                "Meaning match\nEmbedding search retrieved this passage as related to your query. Word search did not retrieve it in this result snapshot; that does not prove the words are absent. Related meaning is approximate, not proof of relevance."
+            case .blended:
+                "Words + meaning\nBoth word search and embedding search retrieved this passage. Its ranking combines their result lists. Word matches can cover only some query terms; related meaning is approximate."
+            case .contentWords:
+                "Word match\nWord search retrieved indexed content from this file. This whole-file row does not retain whether meaning search also contributed. Use Documents search for per-passage explanations."
+            case .contentMeaning:
+                "Meaning match\nEmbedding search retrieved indexed content from this file as related to your query. Word search did not retrieve that content in this snapshot. Related meaning is approximate, not proof of relevance."
+            case .unknown:
+                "Match reason unavailable\nThis row has no recorded name, word or meaning match evidence. Browsing, filter-only results and answer sources may have no specific text-match reason."
+            }
+        }
+    }
+
+    static func evidence(for result: Match) -> Evidence {
+        if result.kind == .file {
+            if result.detail.hasPrefix("Words + meaning · ") { return .blended }
+            if result.detail.hasPrefix("Words · ") { return .words }
+            if result.detail.hasPrefix("Meaning · ") { return .meaning }
+            if result.detail.hasPrefix("Related by meaning · ") { return .contentMeaning }
+            if result.detail == "Content match" || result.detail == "Content match · limited relevance; refine query"
+                || (result.detail.hasPrefix("“") && result.detail.hasSuffix("”")) { return .contentWords }
+        }
+        if !result.highlights.isEmpty {
+            if result.kind == .file { return .filename }
+            if result.kind == .app { return .application }
+        }
+        return .unknown
+    }
+
+    static func body(for result: Match, inspection: FileInspection?, passageAvailable: Bool?) -> String {
+        var sections = [String(result.name.prefix(160)), evidence(for: result).description]
+        if result.kind == .app {
+            sections.append("Index freshness\nNot applicable: application lookup does not use the document-content index.")
+        } else {
+            var freshness: String
+            switch inspection?.title {
+            case "Indexed for word search":
+                freshness = "Source metadata matches the indexed version at this check (size and modification/change times). This is not a byte-for-byte content comparison."
+            case "Partially indexed":
+                freshness = "Source metadata matches the indexed version, but only part of the file was extracted. Text beyond indexing limits may be absent."
+            case .some:
+                freshness = "\(inspection!.title). \(inspection!.detail.prefix(600))\n\(inspection!.next.prefix(240))"
+            case nil:
+                freshness = "Could not verify the indexed copy. Try Check a file in Settings → Index → Diagnostics."
+            }
+            if passageAvailable == false {
+                freshness = "The selected passage is no longer available in the current search scope. Search again.\n\nCurrent file check: " + freshness
+            }
+            sections.append("Index freshness\n" + freshness)
+        }
+        sections.append("Read-only explanation of this result snapshot. No AI answer or confidence percentage.")
+        return sections.joined(separator: "\n\n")
+    }
+}
+
+@MainActor
+struct SearchExplanationActions: ResultActionProvider {
+    let id = "native.searchExplanation"
+    let inspect: (@Sendable (String) -> FileInspection?)?
+    let passageExists: (@Sendable (UInt64, String) -> Bool)?
+
+    init(reader: PassageReader?) {
+        if let reader {
+            inspect = { reader.inspect(path: $0) }
+            passageExists = { reader.text(rowID: $0, path: $1) != nil }
+        } else {
+            inspect = nil
+            passageExists = nil
+        }
+    }
+
+    init(inspect: @escaping @Sendable (String) -> FileInspection?,
+         passageExists: (@Sendable (UInt64, String) -> Bool)? = nil) {
+        self.inspect = inspect
+        self.passageExists = passageExists
+    }
+
+    func actions(for result: Match) -> [ResultAction] {
+        guard result.kind == .file || result.kind == .app, result.path.hasPrefix("/"),
+              result.path.utf8.count <= 4096, !result.path.contains("\0") else { return [] }
+        return [ResultAction(id: ResultActionID(provider: id, operation: "explain"),
+                             label: "Why this result?", rank: 110, confirmation: nil,
+                             permission: nil, shortcut: "")]
+    }
+
+    func perform(_ action: ResultActionID, on result: Match) async throws -> ActionEffect {
+        try Task.checkCancellation()
+        guard actions(for: result).contains(where: { $0.id == action }) else { throw ActionFailure.unavailable }
+        let path = result.path, rowID = result.id
+        let inspect = self.inspect, passageExists = self.passageExists
+        let isFile = result.kind == .file, isPassage = ResultExplanation.evidence(for: result).isPassage
+        let worker = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            let inspection = isFile ? inspect?(path) : nil
+            try Task.checkCancellation()
+            let available = isPassage ? passageExists?(rowID, path) : nil
+            try Task.checkCancellation()
+            return (inspection, available)
+        }
+        let (inspection, available) = try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: { worker.cancel() }
+        try Task.checkCancellation()
+        return .message(title: "Why this result?", body: ResultExplanation.body(
+            for: result, inspection: inspection, passageAvailable: available))
     }
 }
 

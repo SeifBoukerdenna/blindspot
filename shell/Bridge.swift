@@ -226,6 +226,15 @@ final class Core {
         return (Self.decode(results), results.pending)
     }
 
+    func queryDocuments(_ text: String, folder: String, limit: Int) -> (matches: [Match], pending: Bool) {
+        guard !text.contains("\0"), !folder.contains("\0") else { return ([], false) }
+        let results = text.withCString { query in
+            folder.withCString { bs_content_query_in_folder(handle, query, $0, max(0, limit)) }
+        }
+        defer { bs_free_results(results) }
+        return (Self.decode(results), results.pending)
+    }
+
     /// The M3 frecency seam. A no-op in the core today; called anyway so that landing
     /// frecency needs no change on this side.
     func cancelSearch() { bs_search_cancel(handle) }

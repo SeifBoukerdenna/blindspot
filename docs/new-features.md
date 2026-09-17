@@ -1,6 +1,6 @@
 # Blindspot — complete feature guide and workflows
 
-**Release: 0.3.1.** This guide describes implemented features, not the full proposed roadmap.
+**Release: 0.3.2.** This guide describes implemented features, not the full proposed roadmap.
 The release notes at the end distinguish new behavior from platform limitations.
 
 **0.3.0 interface:** translucent native surfaces, a search-scope menu, readable passage rows,
@@ -34,6 +34,7 @@ automatically replaces glass with an opaque surface; **Reduce Motion** disables 
 | ⌃Return | Quit an app or request process termination where offered |
 | ⌘1 / ⌘2 / ⌘3 / ⌘4 | Apps/mixed search, Files, Clipboard, Agent |
 | ⌘M | Local model chooser in explicit Agent mode |
+| ⌘L | Choose a folder scope in Documents mode |
 | ⌘, | Opens Settings while interacting with Blindspot |
 | ⌘W | Closes Settings or the passage reader without quitting Blindspot |
 | ⌘[ / ⌘] | Previous/next result inside the passage reader |
@@ -121,6 +122,29 @@ Only the selected stored passage is read (up to 8 KiB), not the entire document 
 chunks. If reindexing replaces it, the reader asks you to search again instead of displaying a
 different passage. Stored excerpts may lag source-file edits until indexing catches up.
 
+**Why this result?** Select a file, passage or app and press **⌘K → Why this result?**.
+A compact native dialog explains the evidence recorded on that result: highlighted filename/app
+characters, indexed words, related meaning, or both words and meaning. It does not ask a model,
+show a confidence percentage, or change ranking. Choose **Done** to return to your search.
+
+- A **word match** can come from indexed text, titles or headings and can match only some query
+  terms; it does not guarantee an exact phrase. A **meaning match** is approximate. Absence from
+  word-search candidates does not prove those words are absent from the source.
+- The **Index freshness** section checks the file's current size and modification/change times
+  against its indexed record. Matching metadata is not a byte-for-byte content verification.
+  Partial extraction, outdated content and unavailable checks are distinguished. If reindexing
+  replaced the selected passage, the dialog asks you to search again.
+- Filename search does not require a content-index record. Files outside indexed folders may
+  still appear by name; app lookup does not use the document-content index at all.
+- Ordinary whole-file content rows retain less evidence than Documents results: word matches
+  do not retain whether semantic search also contributed. Use **Documents** for per-passage
+  explanations. Browsing, filter-only rows and answer sources may report **Match reason
+  unavailable** rather than inventing one.
+- This is a read-only snapshot, not a live monitor or an explanation of every ranking factor.
+  It reads local metadata/status and, for passage results, checks the bounded stored passage.
+  It never reindexes, downloads a cloud file, calls Ollama, or uploads content. If something
+  needs attention, use **Settings → Index → Diagnostics → Check a file…** for the full report.
+
 If a query's words never all appear together, search retries with any of them rather than returning
 nothing. On a disposable 134-document checkout index and 47 golden queries, blended retrieval
 scored **89% hit@5 / 0.66 MRR@10**, versus **66% / 0.49** for passage words alone and **36% / 0.34**
@@ -142,6 +166,26 @@ uses the shipping pipeline and fails a ranking-regression gate; output contains 
 `used:` is refused for content search, because the index does not store last-opened dates.
 `documents about TOPIC` now means `:content kind:documents TOPIC`, and `find code mentioning`
 means `:content kind:code`.
+
+**Search within a folder or project:** switch to **Documents** (`:content `), then open
+**All indexed folders** in the footer, or press **⌘L**. Choose an indexed root or
+**Choose subfolder…** to narrow results to a project inside it. The selected path stays
+visible in the footer; its tooltip shows the full path. Choose **All indexed folders**
+again to clear the scope. Your query and `kind:`, `size:` and `modified:` filters stay intact.
+
+The selection lasts for this app session, including query edits, previews and reopening
+Documents. It applies only to explicit Documents mode, not Apps/Files, natural-language
+aliases typed in Apps, or **Ask your documents**. Selecting a folder does not add an
+indexing root, rescan files or rebuild embeddings. Both word and meaning searches rank
+within the selected folder and its descendants. Exclusions still apply; similarly named
+sibling folders do not match. Unindexed, excluded, missing or inaccessible folders show an
+unavailable message instead of silently broadening the search. Symlinks beneath indexed
+roots are refused.
+
+Folder meaning search uses a bounded local vector scan (up to 32,768 matching vectors,
+with a 250 ms ranking/read budget after query embedding). If the model is unavailable or
+this work cannot finish within its limits, the results explicitly say **Word results only**.
+Narrow the folder or add filters to reduce the work. Word search remains available independently.
 
 **Settings → Content:** Desktop and Downloads are the default folders. Explicitly saved
 off settings are respected. **Add folder…** opens the macOS multi-folder chooser;
@@ -347,9 +391,9 @@ Upgrading the app normally reuses the separate on-disk index and compatible embe
 
 | Object | Available actions |
 |---|---|
-| File | Open, Quick Look, Reveal in Finder, Copy Path, Copy Filename, Rename, Move, Duplicate, Compress to ZIP, Move to Trash |
+| File | Open, Quick Look, Why this result?, Reveal in Finder, Copy Path, Copy Filename, Rename, Move, Duplicate, Compress to ZIP, Move to Trash |
 | Supported text/code/PDF file | Also Summarize with Local AI and Extract Text to Clipboard |
-| Application | Open, Reveal, Copy Path, Quit, Force Quit, Restart Application, Show Process; inherited file actions may also be offered |
+| Application | Open, Why this result?, Reveal, Copy Path, Quit, Force Quit, Restart Application, Show Process; inherited file actions may also be offered |
 | Text clipboard item | Copy, Paste into Previous App, Pin/Unpin, Delete, Rewrite Professionally, Summarize, Translate, Ask Local AI, Save as Snippet… |
 | Quick link | Open Link (or Type Search Text), Copy URL, Delete Quick Link |
 | Snippet | Paste Snippet into Previous App, Copy Snippet, Delete Snippet |
@@ -705,6 +749,18 @@ are hidden. Restart-required controls still say so.
 4. If the answer says the documents do not cover it, try distinctive words from the document
    or check the file with `:content kind:documents signaling`.
 
+### Understand a surprising search result
+
+1. Search a topic covered by your indexed files, for example `:content overnight hiking permits`.
+2. Select a passage and choose **⌘K → Why this result?**. Read whether word search, meaning
+   search or both retrieved it, then check **Index freshness**.
+3. Choose **Done**, then **⌘Y** to read the passage in context. A meaning-only result may have
+   no literal highlights; that is not an error.
+4. If the dialog reports an outdated index, rescan its watched folder under **Settings → Index
+   → Folders**, then search again. The explanation itself changes nothing.
+5. Compare with `?permit`: a highlighted filename result explains the name match independently
+   of whether that file's contents are indexed.
+
 ### Save a quick link and a snippet
 
 1. Type `:link gh https://github.com/search?q={query}` and press Return.
@@ -763,6 +819,14 @@ Not implemented: universal document-format indexing, arbitrary shell automation,
 arbitrary process restart, complete browser automation, public extension distribution,
 hard CPU/RAM quotas, or validated 10-million-record production operation. macOS limits
 process visibility, selected-text access, last-opened metadata and atomic PID identity checks.
+
+**0.3.2 changes**
+
+- **Why this result?** in the ⌘K menu for files, passages and apps: recorded name, word,
+  meaning or blended evidence, with explicit fallbacks when provenance is unavailable.
+- Read-only, off-main-thread index freshness checks and a warning for replaced/unavailable
+  passages. No model requests, confidence percentages, ranking changes or index migration.
+- Preserves existing preferences, embeddings, history and search workflows.
 
 **0.3.1 changes**
 

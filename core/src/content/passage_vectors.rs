@@ -1,5 +1,5 @@
 use super::{*, vectors::{Page, Vector, Shard, SHARD_CAPACITY, MAX_SHARDS}};
-use super::passage_search::{Match, read_match, scope_sql};
+use super::passage_search::{Match, Scope, read_match, scope_sql};
 use std::path::PathBuf;
 
 impl ContentStore {
@@ -115,6 +115,48 @@ impl ContentStore {
         })
     }
 
+    pub fn rank_folder_passages(&self, model: &str, query: &[f32], filter: &SearchFilter,
+        scope: Scope<'_>, cancel: Arc<AtomicBool>, eligible: impl Fn(&Path) -> bool) -> Result<Vec<Match>> {
+        let Scope { roots, exclusions } = scope;
+        validate(model, query.len())?;
+        if query.iter().any(|value| !value.is_finite()) { return Err(Error::Invalid("Invalid query vector")); }
+        let scope = scope_sql(roots, exclusions)?;
+        let candidates = self.passage_read(Arc::clone(&cancel), || {
+            let started = Instant::now();
+            let mut statement = self.connection.prepare(&format!("SELECT e.id,substr(e.vector,1,8193),e.scale,d.path
+                FROM chunk_embeddings e JOIN chunks c ON c.id=e.chunk_id JOIN documents d ON d.id=c.document_id
+                WHERE e.model=?1 AND e.dimensions=?2 {} {scope} ORDER BY e.id LIMIT 32769", filter.sql()))?;
+            let mut rows = statement.query(params![model, query.len() as i64])?;
+            let mut candidates: Vec<(i64, f32)> = Vec::new();
+            let mut scanned = 0;
+            while let Some(row) = rows.next()? {
+                if cancel.load(Ordering::Acquire) || started.elapsed() > Duration::from_millis(250) { return Err(Error::Cancelled); }
+                scanned += 1;
+                if scanned > 32768 { return Err(Error::Invalid("Folder semantic search limit reached")); }
+                let path: String = row.get(3)?;
+                if validated_path(Path::new(&path)).is_err() || !eligible(Path::new(&path)) { continue; }
+                let key: i64 = row.get(0)?;
+                let bytes: Vec<u8> = row.get(1)?;
+                let scale: f32 = row.get(2)?;
+                let values = if bytes.len() == query.len() && scale > 0.0 {
+                    retrieval::dequantize(&bytes, scale).ok_or(Error::Invalid("Invalid compressed passage vector"))?
+                } else if bytes.len() == query.len() * 4 && scale == 0.0 {
+                    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+                } else { return Err(Error::Invalid("Invalid passage vector")); };
+                if values.iter().any(|value| !value.is_finite()) { return Err(Error::Invalid("Invalid passage vector")); }
+                let similarity: f32 = values.iter().zip(query).map(|(a, b)| a * b).sum();
+                let distance = (1.0 - similarity).clamp(0.0, 2.0);
+                let at = candidates.binary_search_by(|(old_key, old_distance)| old_distance.total_cmp(&distance).then(old_key.cmp(&key))).unwrap_or_else(|at| at);
+                if at < 100 {
+                    candidates.insert(at, (key, distance));
+                    candidates.truncate(100);
+                }
+            }
+            Ok(candidates)
+        })?;
+        self.resolve_passage_vectors(model, &candidates, filter, roots, exclusions, cancel)
+    }
+
     pub fn remove_empty_passage_shards(&self,model:&str)->Result<()> {
         self.connection.execute("DELETE FROM passage_shards WHERE model=?1 AND NOT EXISTS(
             SELECT 1 FROM chunk_embeddings e WHERE e.model=passage_shards.model AND e.id>after_key AND e.id<=after_key+65536)",[model])?;
@@ -166,6 +208,46 @@ fn validate(model: &str, dimensions: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn folder_vectors_rank_inside_scope_before_limits_even_above_small_filter_threshold() {
+        let mut store = ContentStore { connection: Connection::open_in_memory().unwrap() };
+        store.migrate().unwrap();
+        store.connection.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        let scan = store.begin_scan(Path::new("/fixture")).unwrap();
+        let folder = PathBuf::from("/fixture/Café's project");
+        let mut paths: Vec<_> = (0..2100).map(|n| format!("{}/{n}.md", folder.display())).collect();
+        paths.extend((0..120).map(|n| format!("/fixture/Café's project extra/{n}.md")));
+        paths.extend((0..120).map(|n| format!("{}/private/{n}.md", folder.display())));
+        paths.push(format!("{}/best.md", folder.display()));
+        paths.push(format!("{}/other.txt", folder.display()));
+        for batch in paths.chunks(32) {
+            let docs: Vec<_> = batch.iter().map(|path| Document { identity: path, path: Path::new(path), title: path,
+                body: "renewal schedule", modified_ns: 10, changed_ns: 10, bytes: 16, extraction: Extraction::Text }).collect();
+            store.put_batch(&scan, &docs).unwrap();
+        }
+        let chunks: Vec<(i64, String)> = store.connection.prepare("SELECT c.id,d.path FROM chunks c JOIN documents d ON d.id=c.document_id").unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap().collect::<std::result::Result<_, _>>().unwrap();
+        store.begin_passage_model("fixture", 2).unwrap();
+        for (chunk, path) in chunks {
+            let vector = if path.ends_with("best.md") || path.ends_with("other.txt") || path.contains("private/") || path.contains(" extra/") { [1.0, 0.0] } else { [0.0, 1.0] };
+            store.put_chunk_embedding(chunk, "fixture", &vector).unwrap();
+        }
+        let roots = [folder.clone()];
+        let exclusions = [folder.join("private")];
+        let cancel = || Arc::new(AtomicBool::new(false));
+        let filter = SearchFilter { extensions: vec!["md".into()], min_bytes: Some(10), modified_after_ns: Some(1), ..Default::default() };
+        assert!(store.scoped_passage_vectors("fixture", 2, &filter, &roots, &exclusions, cancel()).unwrap().is_none());
+        let scope = || Scope { roots: &roots, exclusions: &exclusions };
+        let hits = store.rank_folder_passages("fixture", &[1.0, 0.0], &filter, scope(), cancel(), |_| true).unwrap();
+        assert_eq!(hits.len(), 100);
+        assert!(hits[0].passage.path.ends_with("best.md"));
+        assert!(hits.iter().all(|hit| Path::new(&hit.passage.path).starts_with(&folder) && !hit.passage.path.contains("private/") && hit.passage.path.ends_with(".md")));
+        assert!(store.rank_folder_passages("fixture", &[1.0, 0.0], &filter, scope(), Arc::new(AtomicBool::new(true)), |_| true).is_err());
+        assert!(store.rank_folder_passages("fixture", &[1.0, 0.0], &filter, Scope { roots: &["/fixture/missing".into()], exclusions: &[] }, cancel(), |_| true).unwrap().is_empty());
+        store.connection.execute("DELETE FROM chunks WHERE id=?1", [hits[0].chunk_id]).unwrap();
+        assert!(!store.rank_folder_passages("fixture", &[1.0, 0.0], &filter, scope(), cancel(), |_| true).unwrap().iter().any(|hit| hit.passage.path.ends_with("best.md")));
+    }
+
     #[test]
     fn model_switch_preserves_old_vectors_until_publication_and_rewrite_retires_both() {
         let mut store = ContentStore { connection: Connection::open_in_memory().unwrap() };

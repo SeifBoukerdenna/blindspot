@@ -1,5 +1,56 @@
 use super::*;
 
+/// Searches document contents within one already indexed folder. Work runs on workers.
+/// The query is content text plus existing kind/size/modified filters, without :content.
+/// # Safety
+/// `handle` must be NULL or live; strings must be NULL or valid NUL-terminated UTF-8.
+/// Free the returned result with `bs_free_results` exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bs_content_query_in_folder(handle: *const BsHandle, query: *const c_char, folder: *const c_char, limit: usize) -> BsResults {
+    if handle.is_null() || query.is_null() || folder.is_null() || limit == 0 { return BsResults::empty(); }
+    // SAFETY: all three pointers are retained by the caller for this call.
+    let (handle, query, folder) = unsafe { (&*handle, CStr::from_ptr(query), CStr::from_ptr(folder)) };
+    catch_unwind(AssertUnwindSafe(|| {
+        let limit = limit.min(100);
+        let message = |text| leak_results(vec![BsResult::header(text)], false);
+        let (Ok(query), Ok(folder)) = (query.to_str(), folder.to_str()) else { return message("Invalid folder search"); };
+        handle.files.cancel();
+        handle.ports.cancel();
+        if folder.is_empty() || folder.len() > 4096 {
+            handle.content.cancel_search();
+            return message("Choose an indexed folder or one of its subfolders");
+        }
+        let parsed = match crate::query::FileQuery::parse(query) {
+            Ok(parsed) => parsed,
+            Err(why) => { handle.content.cancel_search(); return message(why); }
+        };
+        let filter = match content_filter(&parsed) {
+            Ok(filter) => filter,
+            Err(why) => { handle.content.cancel_search(); return message(why); }
+        };
+        if parsed.name.trim().chars().count() < 2 {
+            handle.content.cancel_search();
+            return message("Add words to search within the selected folder");
+        }
+        let (page, pending, meaning_unavailable) = handle.content.search_matches_in_folder(&parsed.name, filter, Some(folder.into()));
+        let mut items = match page {
+            Some(Ok(page)) => {
+                let mut items: Vec<_> = page.iter().take(limit).map(BsResult::passage).collect();
+                if meaning_unavailable {
+                    items.insert(0, BsResult::header("Word results only — meaning search unavailable or folder too large"));
+                }
+                if page.is_empty() && !pending { items.push(BsResult::header("No indexed matches in this folder — change words, filters or folder")); }
+                items
+            }
+            Some(Err(_)) => vec![BsResult::header("Folder search unavailable — check indexed folders, exclusions and access")],
+            None if pending => Vec::new(),
+            None => vec![BsResult::navigation("Content search settings", "content.enabled", &handle.content.status(), BS_KIND_SETTING)],
+        };
+        items.truncate(limit);
+        leak_results(items, pending)
+    })).unwrap_or_else(|_| BsResults::empty())
+}
+
 /// Inspects one user-selected file without changing the index. Call on a worker.
 /// Free the returned JSON with `bs_free_blob`.
 /// # Safety

@@ -4,13 +4,16 @@ import AppKit
 @MainActor
 enum PanelSmoke {
     private static let appDelegate = SmokeAppDelegate()
+    private static let manualFolder = ProcessInfo.processInfo.environment["BLINDSPOT_TEST_FOLDER"]
 
     static func main() {
         Task { @MainActor in
             await run()
             exit(0)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { fatalError("Panel smoke timed out") }
+        if manualFolder == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 45) { fatalError("Panel smoke timed out") }
+        }
         NSApplication.shared.run()
         fatalError("Application loop ended before the fixture completed")
     }
@@ -35,12 +38,58 @@ enum PanelSmoke {
         guard let scope = panel.contentView?.subviews.compactMap({ $0 as? NSPopUpButton }).first else {
             fatalError("Search scope missing")
         }
+        if let start = manualFolder {
+            precondition(start.hasPrefix("/") && !start.contains("\0"), "BLINDSPOT_TEST_FOLDER must be an absolute folder path")
+            guard let folder = findRow(in: panel.contentView!, key: "documents.folder") as? DocumentScope else {
+                fatalError("Document folder control missing")
+            }
+            field.stringValue = ":content "
+            panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+            folder.roots = { [start] }
+            folder.selectFolder(start)
+            print("Manual folder chooser ready. Choose a folder or Cancel; no live index is loaded.")
+            folder.onChoose?()
+            print("Manual chooser closed. Inspect the folder in the launcher footer; Escape ends this fixture.")
+            while panel.isVisible { try? await Task.sleep(for: .milliseconds(100)) }
+            print("Manual folder fixture ended; automated assertions were not run.")
+            return
+        }
         for (index, prefix) in [(0, ""), (1, "?"), (2, ";"), (3, ">"), (4, ":content ")] {
             scope.selectItem(at: index)
             _ = scope.sendAction(scope.action, to: scope.target)
             precondition(panel.query == prefix, "Scope must retain the original query prefixes")
             precondition(field.currentEditor() != nil, "Scope must return focus to search")
         }
+        guard let folder = findRow(in: panel.contentView!, key: "documents.folder") as? DocumentScope else {
+            fatalError("Document folder control missing")
+        }
+        field.stringValue = ":content kind:md modified:week bicycle"
+        panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+        folder.roots = { ["/fixture/Café's project", "/fixture/Second project"] }
+        folder.selectFolder("/fixture/Café's project/Notes")
+        precondition(!folder.isHidden && folder.folder == "/fixture/Café's project/Notes")
+        precondition(panel.query == ":content kind:md modified:week bicycle" && field.currentEditor() != nil)
+        field.stringValue += " maintenance"
+        panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+        precondition(folder.folder == "/fixture/Café's project/Notes")
+        scope.selectItem(at: 1)
+        _ = scope.sendAction(scope.action, to: scope.target)
+        precondition(folder.isHidden)
+        scope.selectItem(at: 4)
+        _ = scope.sendAction(scope.action, to: scope.target)
+        precondition(!folder.isHidden && folder.folder == "/fixture/Café's project/Notes")
+        cancelFolderChooser(attempts: 50)
+        folder.selectItem(at: folder.numberOfItems - 1)
+        precondition(folder.selectedItem?.tag == -1, "Choose subfolder command must be selected")
+        _ = folder.sendAction(folder.action, to: folder.target)
+        precondition(panel.isVisible && folder.folder == "/fixture/Café's project/Notes", "Cancelling the chooser must retain the scope and launcher")
+        folder.selectItem(at: 0)
+        _ = folder.sendAction(folder.action, to: folder.target)
+        precondition(folder.folder == nil && folder.title == "All indexed folders")
+        precondition(panel.query == ":content kind:md modified:week bicycle maintenance")
+        let invalid = core.queryDocuments("used:week bicycle", folder: "/fixture", limit: 50)
+        precondition(!invalid.pending && invalid.matches.first?.name.contains("used:") == true)
+        precondition(core.queryDocuments("bicycle", folder: "/fixture", limit: 0).matches.isEmpty)
         for query in ["sa", "documents", "?documents", "?kind:pdf size:>5MB", "?\"quarterly report\" modified:week", "?size:invalid", ";", ":3000", ":ports", ":processes", ":node", ":localhost", ">explain", ""] {
             field.stringValue = query
             panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
@@ -174,6 +223,18 @@ enum PanelSmoke {
         panel.setContentSize(NSSize(width: Theme.panelWidth, height: results.fittingHeight + Theme.fieldHeight + 39))
         panel.contentView?.layoutSubtreeIfNeeded()
         snapshot(panel.contentView!, name: "launcher-passages")
+        folder.selectFolder("/fixture/Café's project/Research and planning notes")
+        results.update(documents.enumerated().map { index, item in
+            Match(id: UInt64(index), name: item.0, kind: .file,
+                  path: "/fixture/Café's project/Research and planning notes/" + item.0,
+                  score: 1, timestamp: 0, width: 0, height: 0, detail: item.1, highlights: [])
+        })
+        resultHeight.constant = results.fittingHeight
+        panel.setContentSize(NSSize(width: Theme.panelWidth, height: results.fittingHeight + Theme.fieldHeight + 39))
+        panel.contentView?.layoutSubtreeIfNeeded()
+        precondition(!panel.contentView!.hasAmbiguousLayout)
+        snapshot(panel.contentView!, name: "launcher-folder-scope")
+        folder.selectFolder(nil)
         results.update([Match(id: 1, name: "7", kind: .calc, path: "", score: 1,
                               timestamp: 0, width: 0, height: 0, detail: "", highlights: [])])
         panel.contentView?.layoutSubtreeIfNeeded()
@@ -185,6 +246,7 @@ enum PanelSmoke {
         print("Settings Command-W close, reopen and close with text-field focus: passed")
         print("File diagnostic bridge and Settings presentation: passed")
         print("Passage preview navigation, Unicode highlighting, stale-result rejection and close: passed")
+        print("Document folder selection, chooser cancellation, query/filter retention, mode isolation, clearing, focus, FFI validation and layout: passed")
     }
 
     private static func checkPassagePreview() async {
@@ -226,6 +288,24 @@ enum PanelSmoke {
         precondition(body.string.contains("no longer available"))
         preview.close()
         precondition(closed == 2)
+    }
+
+    private static func cancelFolderChooser(attempts: Int) {
+        let deadline = Date().addingTimeInterval(Double(attempts) * 0.1)
+        let timer = Timer(timeInterval: 0.1, repeats: true) { timer in
+            let finished = MainActor.assumeIsolated {
+                if let picker = NSApp.windows.compactMap({ $0 as? NSOpenPanel }).first(where: \.isVisible) {
+                    picker.cancel(nil)
+                    return true
+                } else if Date() >= deadline {
+                    fatalError("Folder chooser did not open")
+                }
+                return false
+            }
+            if finished { timer.invalidate() }
+        }
+        RunLoop.main.add(timer, forMode: .modalPanel)
+        RunLoop.main.add(timer, forMode: .default)
     }
 
     private static func snapshot(_ view: NSView, name: String) {

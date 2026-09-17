@@ -1,4 +1,4 @@
-use crate::{content::{ContentStore, SearchFilter, passage_search::Match, vectors::{Shard,MAX_DELTA}},
+use crate::{content::{ContentStore, SearchFilter, passage_search::{Match,Scope}, vectors::{Shard,MAX_DELTA}},
     semantic::{self, Embedder, Model, Failure, cache, indexing::{self,model_key}, vectors, search::Helpers}};
 use std::{path::{Path,PathBuf},sync::{Arc,atomic::{AtomicBool,Ordering}}};
 
@@ -19,6 +19,11 @@ impl Engine {
         self.vectors=None;
     }
     pub fn search(&mut self, database: &Path, query: &str, filter: &SearchFilter, roots: &[PathBuf], exclusions: &[PathBuf], cancel: Arc<AtomicBool>) -> Result<Vec<Match>,Failure> {
+        self.search_with_scope(database, query, filter, Scope { roots, exclusions }, cancel, false)
+    }
+
+    pub fn search_with_scope(&mut self, database: &Path, query: &str, filter: &SearchFilter, scope: Scope<'_>, cancel: Arc<AtomicBool>, folder_scoped: bool) -> Result<Vec<Match>,Failure> {
+        let Scope { roots, exclusions } = scope;
         let reader=ContentStore::open_reader(database).map_err(storage)?;
         for (key,dimensions) in reader.passage_models().map_err(storage)? {
             if cancel.load(Ordering::Acquire) { return Err(Failure::Cancelled); }
@@ -39,6 +44,10 @@ impl Engine {
             let norm=query_vector.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>().sqrt();
             if !norm.is_finite() || norm<=0.0 { return Err(Failure::InvalidResponse); }
             for value in &mut query_vector { *value=(f64::from(*value)/norm) as f32; }
+            if folder_scoped {
+                return reader.rank_folder_passages(&key, &query_vector, filter, scope, cancel,
+                    |path| eligible_path(path, &self.code_roots)).map_err(storage);
+            }
             if !filter.is_empty() && let Some(vectors)=reader.scoped_passage_vectors(&key,dimensions,filter,roots,exclusions,Arc::clone(&cancel)).map_err(storage)? {
                 let mut candidates:Vec<_>=vectors.into_iter().map(|vector| {
                     let similarity:f32=vector.values.iter().zip(&query_vector).map(|(a,b)|a*b).sum();
@@ -86,7 +95,7 @@ impl Engine {
             found.retain(|item| eligible_path(Path::new(&item.passage.path),&self.code_roots));
             return Ok(found);
         }
-        Ok(Vec::new())
+        if folder_scoped { Err(Failure::Unavailable) } else { Ok(Vec::new()) }
     }
 }
 

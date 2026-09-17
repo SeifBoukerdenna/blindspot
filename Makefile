@@ -5,7 +5,7 @@
 
 APP        := Blindspot
 BUNDLE_ID  := com.seifboukerdenna.blindspot
-VERSION    := 0.3.1
+VERSION    := 0.3.2
 # Where Settings → Status looks for updates (shell/Updater.swift). Forks set their own.
 RELEASE_REPO ?= SeifBoukerdenna/blindspot
 
@@ -144,6 +144,26 @@ install: sign
 
 version:
 	@echo $(VERSION)
+
+# Codex CLI/IDE entry points. No implicit publication or hook trust changes.
+# SCOPE=tooling/docs/... narrows checks; BASE=<revision> includes committed changes;
+# PLAN=1 prints the command plan without running it. Delivery always checks release scope.
+export SCOPE BASE PLAN
+.PHONY: agent-context agent-doctor agent-check agent-deliver test-agent-tools
+agent-context:
+	@python3 scripts/agent.py context
+
+agent-doctor:
+	@python3 scripts/agent.py doctor
+
+agent-check:
+	@python3 scripts/agent.py check
+
+agent-deliver:
+	@python3 scripts/agent.py deliver
+
+test-agent-tools:
+	@python3 bench/AgentWorkflowTests.py
 
 # README screenshots and GIFs (scripts/capture-media.sh). The harness and helpers live in a plain
 # directory, not an .app, so LaunchServices never registers a second Blindspot. The helpers sit

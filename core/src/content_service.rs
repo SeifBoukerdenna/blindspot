@@ -142,6 +142,7 @@ struct SearchRequest {
     filter: crate::content::SearchFilter,
     roots: Vec<PathBuf>,
     exclusions: Vec<PathBuf>,
+    folder: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -546,14 +547,19 @@ impl ContentService {
     }
 
     pub fn search_matches(&self, query: &str, filter: crate::content::SearchFilter) -> (Option<Result<Vec<PassageMatch>, Failure>>, bool) {
+        let (page, pending, _) = self.search_matches_in_folder(query, filter, None);
+        (page, pending)
+    }
+
+    pub fn search_matches_in_folder(&self, query: &str, filter: crate::content::SearchFilter, folder: Option<PathBuf>) -> (Option<Result<Vec<PassageMatch>, Failure>>, bool, bool) {
         let snapshot = self.snapshot();
         let Some(path) = &self.path else {
-            return (None, false);
+            return (None, false, false);
         };
         if !snapshot.ready || query.trim().chars().count() < 2 || query.len() > 4096 {
             self.searching.cancel();
             self.semantic_searching.cancel();
-            return (None, false);
+            return (None, false, false);
         }
         let request = SearchRequest {
             epoch: snapshot.epoch,
@@ -563,6 +569,7 @@ impl ContentService {
             filter,
             roots: snapshot.roots,
             exclusions: snapshot.exclusions,
+            folder,
         };
         self.searching.search_shared(request.clone(), run_search);
         let (lexical,lexical_pending)=self.searching.results(&request);
@@ -571,6 +578,7 @@ impl ContentService {
             self.semantic_searching.search_shared(request.clone(),run_semantic_search);
             self.semantic_searching.results(&request)
         } else {self.semantic_searching.cancel();(None,false)};
+        let meaning_unavailable = snapshot.semantic_enabled && matches!(semantic, Some(Err(_)));
         let page=match (lexical,semantic) {
             (Some(Ok(page)),Some(Ok(hits)))=>Some(Ok(fuse_passages(page,hits,2))),
             (Some(Ok(page)),_)=>Some(Ok(fuse_passages(page,Vec::new(),2))),
@@ -578,7 +586,7 @@ impl ContentService {
             (Some(Err(error)),_)=>Some(Err(error)),
             _=>None,
         };
-        (page,lexical_pending || semantic_pending)
+        (page,lexical_pending || semantic_pending,meaning_unavailable)
     }
 
     pub fn cancel_search(&self) {
@@ -945,9 +953,11 @@ fn close_query_engine(engine:&SharedEngine) {
 }
 
 fn run_semantic_search(request:&SemanticRequest,cancel:Arc<AtomicBool>)->Result<Vec<PassageMatch>,Failure> {
+    let roots = search_roots(&request.search)?;
     let mut owner=request.engine.lock().unwrap_or_else(PoisonError::into_inner);
     let engine=owner.as_mut().ok_or(Failure::Unavailable)?;
-    let mut hits=engine.search(&request.search.path,&request.search.query,&request.search.filter,&request.search.roots,&request.search.exclusions,Arc::clone(&cancel)).map_err(|error|match error {
+    let scope = crate::content::passage_search::Scope { roots: &roots, exclusions: &request.search.exclusions };
+    let mut hits=engine.search_with_scope(&request.search.path,&request.search.query,&request.search.filter,scope,Arc::clone(&cancel),request.search.folder.is_some()).map_err(|error|match error {
         semantic::Failure::Cancelled=>Failure::Cancelled,semantic::Failure::TimedOut=>Failure::TimedOut,_=>Failure::Unavailable,
     })?;
     let policy=Policy {excluded_paths:request.search.exclusions.clone(),..Policy::default()};
@@ -969,9 +979,10 @@ fn add(total: &mut Progress, next: &Progress) {
 }
 
 fn run_search(request: &SearchRequest, cancel: Arc<AtomicBool>) -> Result<Vec<PassageMatch>, Failure> {
+    let roots = search_roots(request)?;
     let reader = ContentStore::open_reader(&request.path).map_err(|_| Failure::Unavailable)?;
     let mut page = reader
-        .search_passages(&request.query, &request.filter, &request.roots,&request.exclusions,Arc::clone(&cancel))
+        .search_passages(&request.query, &request.filter, &roots,&request.exclusions,Arc::clone(&cancel))
         .map_err(|error| match error {
             crate::content::Error::Cancelled => Failure::Cancelled,
             _ => Failure::Unavailable,
@@ -979,6 +990,29 @@ fn run_search(request: &SearchRequest, cancel: Arc<AtomicBool>) -> Result<Vec<Pa
     let policy=Policy {excluded_paths:request.exclusions.clone(),..Policy::default()};
     page.retain(|hit|within_scope(std::path::Path::new(&hit.passage.path),&request.roots,&policy));
     Ok(page)
+}
+
+fn search_roots(request: &SearchRequest) -> Result<Vec<PathBuf>, Failure> {
+    let Some(folder) = &request.folder else { return Ok(request.roots.clone()); };
+    let policy = Policy { excluded_paths: request.exclusions.clone(), ..Policy::default() };
+    if !folder.is_absolute() || folder.as_os_str().len() > 4096 || folder.components().count() > 64
+        || folder.components().any(|part| matches!(part, std::path::Component::ParentDir))
+        || !within_scope(folder, &request.roots, &policy)
+        || request.exclusions.iter().any(|excluded| folder.starts_with(excluded)) {
+        return Err(Failure::Unavailable);
+    }
+    let root = request.roots.iter().find(|root| folder.starts_with(root)).ok_or(Failure::Unavailable)?;
+    let mut current = root.clone();
+    let mut paths = vec![current.clone()];
+    for part in folder.strip_prefix(root).map_err(|_| Failure::Unavailable)?.components() {
+        current.push(part);
+        paths.push(current.clone());
+    }
+    for path in paths {
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| Failure::Unavailable)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() { return Err(Failure::Unavailable); }
+    }
+    Ok(vec![folder.clone()])
 }
 
 fn within_scope(path:&std::path::Path,roots:&[PathBuf],policy:&Policy)->bool {
@@ -998,6 +1032,75 @@ fn within_scope(path:&std::path::Path,roots:&[PathBuf],policy:&Policy)->bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn folder_search_preserves_filters_boundaries_and_rejects_stale_or_unavailable_scopes() {
+        let fixture = std::env::temp_dir().join(format!("blindspot-folder-search-{}", std::process::id()));
+        std::fs::create_dir(&fixture).unwrap();
+        let fixture = fixture.canonicalize().unwrap();
+        let root = fixture.join("source");
+        let first = root.join("Project A");
+        let second = root.join("Project A extra");
+        let nested = first.join("notes");
+        let excluded = first.join("private");
+        for folder in [&nested, &excluded, &second] { std::fs::create_dir_all(folder).unwrap(); }
+        std::fs::write(nested.join("plan.md"), "bicycle maintenance schedule").unwrap();
+        std::fs::write(first.join("plan.txt"), "bicycle maintenance schedule").unwrap();
+        std::fs::write(excluded.join("secret.md"), "bicycle maintenance schedule").unwrap();
+        for n in 0..120 { std::fs::write(second.join(format!("{n}.md")), "bicycle maintenance schedule").unwrap(); }
+        std::os::unix::fs::symlink(&second, first.join("link")).unwrap();
+        let service = ContentService::new(Some(fixture.join("content.sqlite")));
+        let mut config = Content { enabled: true, semantic: false, roots: vec![root.to_string_lossy().into()],
+            excluded_paths: vec![excluded.to_string_lossy().into()], ..Content::default() };
+        service.configure(&config);
+        service.set_paused(false, 0);
+        wait(&service);
+        let search = |folder: Option<PathBuf>, filter: crate::content::SearchFilter| {
+            let started = std::time::Instant::now();
+            loop {
+                let (page, pending, _) = service.search_matches_in_folder("bicycle", filter.clone(), folder.clone());
+                if !pending { break page.unwrap(); }
+                assert!(started.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let hits = search(Some(first.clone()), Default::default()).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| std::path::Path::new(&hit.passage.path).starts_with(&first)));
+        let filtered = crate::content::SearchFilter { extensions: vec!["md".into()], min_bytes: Some(10), modified_after_ns: Some(1), ..Default::default() };
+        assert_eq!(search(Some(first.clone()), filtered).unwrap().len(), 1);
+        assert!(search(Some(first.clone()), crate::content::SearchFilter { max_bytes: Some(1), ..Default::default() }).unwrap().is_empty());
+        assert_eq!(search(Some(nested), Default::default()).unwrap().len(), 1);
+        service.search_matches_in_folder("schedule", Default::default(), Some(first.clone()));
+        let hits = search(Some(second.clone()), Default::default()).unwrap();
+        assert_eq!(hits.len(), 100);
+        assert!(hits.iter().all(|hit| std::path::Path::new(&hit.passage.path).starts_with(&second)));
+        service.cancel_search();
+        assert_eq!(search(Some(first.clone()), Default::default()).unwrap().len(), 2);
+        for folder in [excluded, first.join("link"), first.join("missing"), first.join(".."), fixture.clone(), PathBuf::from("relative")] {
+            assert!(search(Some(folder), Default::default()).is_err());
+        }
+        assert!(search(None, Default::default()).unwrap().len() > 2);
+        service.snapshot.lock().unwrap().semantic_enabled = true;
+        let started = std::time::Instant::now();
+        loop {
+            let (page, pending, unavailable) = service.search_matches_in_folder("maintenance", Default::default(), Some(first.clone()));
+            if !pending {
+                assert_eq!(page.unwrap().unwrap().len(), 2);
+                assert!(unavailable, "Missing semantics must be reported while preserving word results");
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::rename(&first, root.join("moved")).unwrap();
+        assert!(search(Some(first), Default::default()).is_err());
+        config.enabled = false;
+        service.configure(&config);
+        assert_eq!(service.search_matches_in_folder("bicycle", Default::default(), Some(second)), (None, false, false));
+        drop(service);
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
 
     #[test]
     fn scope_filter_rejects_hidden_generated_excluded_and_traversal_paths() {
@@ -1151,6 +1254,19 @@ for line in sys.stdin:
             if !pending {
                 let hits=result.unwrap().unwrap().hits;
                 assert!(hits.first().unwrap().path.ends_with("fruit.txt"));
+                break;
+            }
+            assert!(started.elapsed()<Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let started=std::time::Instant::now();
+        loop {
+            let (result,pending,unavailable)=service.search_matches_in_folder("apples",Default::default(),Some(source.canonicalize().unwrap()));
+            if !pending {
+                let hits=result.unwrap().unwrap();
+                assert!(!unavailable);
+                assert!(hits.first().unwrap().passage.path.ends_with("fruit.txt"));
+                assert!(hits.first().unwrap().meaning && !hits.first().unwrap().words);
                 break;
             }
             assert!(started.elapsed()<Duration::from_secs(2));

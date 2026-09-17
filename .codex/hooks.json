@@ -1,42 +1,35 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/agent_hook.py\" SessionStart",
+            "timeout": 10,
+            "additionalContextLimit": 600
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
-            "command": "bash '/Users/malikboukerdenna/blindspot/.codex/hooks/guard-bash.sh'",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/agent_hook.py\" PreToolUse",
             "timeout": 10
           }
         ]
       },
       {
-        "matcher": "Edit|Write|MultiEdit",
+        "matcher": "apply_patch|Edit|Write|MultiEdit",
         "hooks": [
           {
             "type": "command",
-            "command": "bash '/Users/malikboukerdenna/blindspot/.codex/hooks/guard-paths.sh'",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/agent_hook.py\" PreToolUse",
             "timeout": 10
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash '/Users/malikboukerdenna/blindspot/.codex/hooks/rust-check.sh'",
-            "timeout": 120,
-            "statusMessage": "Checking Rust..."
-          },
-          {
-            "type": "command",
-            "command": "bash '/Users/malikboukerdenna/blindspot/.codex/hooks/swift-check.sh'",
-            "timeout": 60,
-            "statusMessage": "Checking Swift..."
           }
         ]
       }

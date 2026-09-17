@@ -97,6 +97,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         (":content ", "Documents", "Search document contents"),
     ]
     private let tabBar = LauncherScope(titles: modes.map(\.tab))
+    private let documentScope = DocumentScope()
 
     /// How far the prompt sits from the field's left edge: past the mode's character,
     /// where the caret is.
@@ -242,6 +243,15 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             self?.makeFirstResponder(self?.field)
             self?.switchMode(to: index)
         }
+        documentScope.roots = { [weak self] in self?.core.contentState?.watchRoots ?? [] }
+        documentScope.onChange = { [weak self] in
+            guard let self else { return }
+            self.core.cancelSearch()
+            self.passagePreview.close()
+            self.makeFirstResponder(self.field)
+            self.refresh()
+        }
+        documentScope.onChoose = { [weak self] in self?.chooseDocumentFolder() }
 
         // The one heavy line in the design, and the only thing separating the query from
         // its results. Reversing M5's note that a divider here is "the strongest 'not a
@@ -257,7 +267,7 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         actions.translatesAutoresizingMaskIntoConstraints = false
         actions.setAccessibilityLabel("Actions for selected result, Command K")
 
-        for view in [tabBar, field, ghost, rule, results, footerRule, tabBar.status, actions] as [NSView] {
+        for view in [tabBar, field, ghost, rule, results, footerRule, tabBar.status, actions, documentScope] as [NSView] {
             container.addSubview(view)
         }
 
@@ -306,12 +316,35 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             tabBar.status.trailingAnchor.constraint(lessThanOrEqualTo: actions.leadingAnchor, constant: -16),
             actions.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -Theme.gutter),
             actions.centerYAnchor.constraint(equalTo: tabBar.status.centerYAnchor),
+            documentScope.leadingAnchor.constraint(equalTo: tabBar.status.leadingAnchor),
+            documentScope.centerYAnchor.constraint(equalTo: tabBar.status.centerYAnchor),
+            documentScope.trailingAnchor.constraint(equalTo: actions.leadingAnchor, constant: -16),
         ])
 
         contentView = container
     }
 
     @objc private func openActions() { showActions() }
+
+    private func chooseDocumentFolder() {
+        let picker = NSOpenPanel()
+        picker.canChooseDirectories = true
+        picker.canChooseFiles = false
+        picker.allowsMultipleSelection = false
+        picker.canCreateDirectories = false
+        picker.resolvesAliases = false
+        picker.prompt = "Search Here"
+        picker.message = "Choose an indexed folder or a subfolder. This does not add folders to the index."
+        if let path = documentScope.folder ?? core.contentState?.watchRoots.first {
+            picker.directoryURL = URL(fileURLWithPath: path)
+        }
+        previewing = true
+        let response = picker.runModal()
+        previewing = false
+        if response == .OK, let url = picker.url { documentScope.selectFolder(url.path) }
+        makeKeyAndOrderFront(nil)
+        makeFirstResponder(field)
+    }
 
     /// Colours the mode's character in the field, and keeps the caret on the accent.
     ///
@@ -647,6 +680,8 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         pollTask = nil
         let text = field.stringValue
         let mode = Self.mode(of: text)
+        documentScope.isHidden = mode != 4
+        tabBar.status.isHidden = mode == 4
 
         // None of the chrome can have moved on a poll: the poll path is guarded on the
         // text being unchanged, and the mode, the prompt and the query's styling are all
@@ -665,7 +700,11 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         let contextual = LauncherContext.isTextCommand(text) || core.promptInstruction(for: text) != nil
         let plan = LocalRequest.parse(text)
         let effectiveQuery = plan?.query ?? (contextual ? ">" + text : text)
-        var (matches, pending) = core.query(effectiveQuery, limit: Self.resultLimit)
+        var (matches, pending) = if mode == 4, let folder = documentScope.folder {
+            core.queryDocuments(String(text.dropFirst(Self.modes[4].prefix.count)), folder: folder, limit: Self.resultLimit)
+        } else {
+            core.query(effectiveQuery, limit: Self.resultLimit)
+        }
         if plan == .currentProject {
             if let url = context?.projectDirectory {
                 matches = [Match(id: 0, name: url.lastPathComponent, kind: .file, path: url.path,
@@ -972,6 +1011,9 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
             previewSelected()
         case kVK_ANSI_K:
             showActions()
+        case kVK_ANSI_L:
+            guard Self.mode(of: field.stringValue) == 4 else { return super.performKeyEquivalent(with: event) }
+            documentScope.performClick(nil)
         case kVK_ANSI_Comma:
             // Handled here rather than left to fall through to the main menu.
             //

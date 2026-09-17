@@ -1,6 +1,11 @@
 use super::*;
 use std::path::PathBuf;
 
+pub struct Scope<'a> {
+    pub roots: &'a [PathBuf],
+    pub exclusions: &'a [PathBuf],
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Match {
     pub chunk_id: i64,
