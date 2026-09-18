@@ -1,5 +1,9 @@
 # Searching inside files: plan
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 A plan for making content search work on code, PDFs, slides and notes, replacing the current
 one-vector-per-file design. Written 2026-09-15 against the installed 0.2.8 index.
 

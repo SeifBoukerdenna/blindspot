@@ -1,5 +1,9 @@
 # Blindspot 0.2.0 delivery
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 Installed and launched on September 14, 2026:
 `~/Applications/Blindspot.app`, verified process PID 18820 and bundle version 0.2.0.
 

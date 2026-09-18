@@ -1,5 +1,9 @@
 # Local semantic search: implementation and measurements
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 Semantic retrieval is not yet exposed in launcher results. This document records the
 implemented embedding boundary and the evidence informing the remaining integration.
 Conventional filename and opt-in FTS content search continue independently.

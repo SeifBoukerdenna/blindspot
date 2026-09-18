@@ -120,6 +120,7 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$VERSION"
           codesign --verify --deep --strict "$app"
           test -f "$check/Blindspot-$VERSION/START-HERE.md"
+          test -f "$check/Blindspot-$VERSION/FEATURE-GUIDE.md"
           rm -rf "$check"
 
       - name: Keep the release files with the run

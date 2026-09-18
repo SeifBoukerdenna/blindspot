@@ -1,12 +1,60 @@
 # Blindspot — complete feature guide and workflows
 
-**Release: 0.3.2.** This guide describes implemented features, not the full proposed roadmap.
+**Release: 0.3.2.** Build version; the release script updates this header. This guide follows
+repository code, which can be ahead of the published release. It describes implemented features,
+not the full proposed roadmap.
 The release notes at the end distinguish new behavior from platform limitations.
 
-**0.3.0 interface:** translucent native surfaces, a search-scope menu, readable passage rows,
+**Native interface:** translucent native surfaces, a search-scope menu, readable passage rows,
 sidebar Settings, and a flatter Index page. Your search syntax and stored index are preserved.
 The preceding local search upgrade includes passage embeddings, blended ranking, code folders,
 PPTX/XLSX extraction, opt-in scanned-PDF OCR, PDF page previews, and Copy/Ask Passage.
+
+## Guided setup
+
+A genuinely new installation opens a native, resizable welcome window. **Make it yours** walks
+through the shortcut, folders, clipboard, Accessibility and local AI; **Open Blindspot** starts
+using the launcher immediately. Resume from the menu bar → **Set up Blindspot…** or
+**Settings → General → Set up Blindspot…**. Visiting or skipping a page does not enable its feature.
+
+Before the core starts, new installations receive settings overrides with content indexing,
+clipboard capture/images/OCR and launch at login off, no content roots, and no assumed answer
+model. Existing configuration/data is treated as an existing installation and remains unchanged.
+Use **Restart onboarding…** in the menu bar to return to Welcome without resetting preferences,
+indexes, installed models or an ongoing setup download. The guide saves its page separately from normal settings. It does not repeat automatically once
+presented, including after an update. All feature changes still use the normal settings overrides.
+
+- **Shortcut:** test the actual key, change it in General, and choose login startup. The guide
+  reports macOS registration/approval status. The menu now also offers **Open Blindspot**.
+- **Documents:** choose folders and explicitly start indexing. See status/counters, pause/resume,
+  and routes to Content settings and the Index dashboard. Cloud-only files must first be downloaded
+  in Finder; word search and embeddings become available separately.
+- **Clipboard:** enable capture and optionally images/OCR, with a copy-and-find example.
+- **Accessibility:** follow the System Settings instructions, return to refresh trust, and test
+  selection reading/insertion in a controlled sample field without changing the clipboard.
+- **Local AI:** install/open Ollama, check its loopback connection, reuse an installed model or
+  explicitly download a curated one, then verify metadata and generate a fixed sample response.
+  Recommendations use local chip/memory information: 2B below 12 GB, 4B below 24 GB, otherwise 9B;
+  these are conservative starting suggestions, not measured speed or memory guarantees.
+  A smaller 0.8B choice is available. Download sizes are estimates; working memory needs are larger.
+  Tested answer models are saved for both writing and questions. Enabling previously disabled AI
+  still requires reopening the app, as Settings does.
+- **Downloads:** a confirmation names the model and estimated size. Progress reports the current
+  layer, followed by verification/test. Retry is explicit. Stop disconnects this request; another
+  Ollama client may retain a shared download. Closing offers background continuation or stopping.
+  No existing model is deleted. Unknown-size stages are indeterminate, not fake percentages.
+- **Meaning search:** after a successful answer-model test, separately download/test the embedding
+  model and enable semantic indexing. Local Apple fallback and detailed progress remain in Index.
+
+Setup requests have bounded sizes/timeouts, reject redirects/non-loopback hosts, and check local
+model metadata/capabilities before testing; missing locality evidence and remote/cloud aliases are
+refused. Tests use fixed sample text. Runtime inference still uses installed models; only the
+explicit setup download action pulls a model. No global Ollama settings or macOS permissions are
+changed automatically. Hardware/model recommendations need workload-specific judgment; high memory
+pressure can require choosing a smaller model.
+
+The download now includes a short **START-HERE.md** and the full **FEATURE-GUIDE.md**. Read
+[the quick start](https://github.com/SeifBoukerdenna/blindspot/blob/main/docs/quick-start.md).
 
 ## 1. Open, navigate, and run actions
 
@@ -20,6 +68,8 @@ Settings now uses a resizable sidebar. **AI** was Agent, **Search** was Ranking,
 **About** was Status; configuration keys and typed `:settings` links have not changed.
 Appearance keeps the existing palettes. macOS **Reduce Transparency** or **Increase Contrast**
 automatically replaces glass with an opaque surface; **Reduce Motion** disables launcher/list motion.
+The surface retains its transparent, blurred glass with a light palette tint. Secondary text and
+hints use stronger colors; glass still responds to the desktop behind it.
 
 | Shortcut | Behavior |
 |---|---|
@@ -36,7 +86,7 @@ automatically replaces glass with an opaque surface; **Reduce Motion** disables 
 | ⌘M | Local model chooser in explicit Agent mode |
 | ⌘L | Choose a folder scope in Documents mode |
 | ⌘, | Opens Settings while interacting with Blindspot |
-| ⌘W | Closes Settings or the passage reader without quitting Blindspot |
+| ⌘W | Closes Settings, Containers or the passage reader without quitting Blindspot |
 | ⌘[ / ⌘] | Previous/next result inside the passage reader |
 | ⌘⇧, | Opens Blindspot Settings globally, subject to macOS shortcut registration |
 | Escape | Cancels current work or closes the launcher/preview |
@@ -187,7 +237,8 @@ with a 250 ms ranking/read budget after query embedding). If the model is unavai
 this work cannot finish within its limits, the results explicitly say **Word results only**.
 Narrow the folder or add filters to reduce the work. Word search remains available independently.
 
-**Settings → Content:** Desktop and Downloads are the default folders. Explicitly saved
+**Settings → Content:** new app installations start with no folders until setup confirms them.
+Existing installations retain their folders; the core configuration defaults remain Desktop and Downloads. Explicitly saved
 off settings are respected. **Add folder…** opens the macOS multi-folder chooser;
 select a list row and choose **Remove selected** to stop including that folder.
 Long paths are shortened to `~`, remain on one line, and have full-path tooltips.
@@ -200,7 +251,8 @@ Supported indexed text/code extensions:
 one vector per passage. It is separate from the model answering AI questions. Empty selects
 Apple's installed English contextual model. If Ollama is unavailable at indexing time, Apple is
 tried automatically; if no usable backend/generation is available, word search remains usable.
-No model is downloaded. **Index → Overview → Check model** tests the configured local backend
+No model is downloaded by indexing itself; guided setup offers a separate confirmed download.
+**Index → Overview → Check model** tests the configured local backend
 with a fixed phrase, showing availability, dimensions and duration. Its compatibility report
 compares model name, revision and dimensions with an active generation; it does not pin model
 weights by digest or detect replaced weights with the same identity and dimensions.
@@ -419,7 +471,9 @@ extracted excerpt, not necessarily the entire document.
 | `:ports`, `:listening` | Visible TCP listeners and UDP sockets |
 | `:localhost` | Sockets bound to loopback interfaces |
 | `:processes` | Visible running processes, including those without sockets |
-| `:node`, `:python`, `:docker` | Filter processes by name/executable |
+| `:node`, `:python`, `:com.docker` | Filter processes by name/executable |
+| `:containers` | Open the local Docker/Podman container browser |
+| `:docker`, `:podman` | Open the browser with that runtime preferred |
 | `:pid 123` | A process by PID |
 | `:children 123` | Its immediate children |
 | `:ports 123` | Its related sockets |
@@ -429,6 +483,96 @@ Inspect exposes PID, parent, executable, command line, resident memory, cumulati
 uptime and working directory where available. Cumulative CPU time is not CPU percentage.
 Visibility depends on permissions. The app does not elevate privileges or reconstruct an
 arbitrary server's restart command/environment.
+
+### Local containers
+
+Type **:containers**, **docker containers** or **podman containers**, then press Return;
+the menu-bar icon also offers **Containers…**. The native window shows running and stopped
+containers, image, status, full ID and published/exposed ports. Filter by name, image, state
+or port; select a container for its details. **Refresh** (⌘R) reads current state. Monitoring and
+log connections stop when the window closes or you change the selected container or engine. **Find engines** rediscovers local installations.
+Opening Containers or a Settings result brings its window to the current Space and restores it
+if minimized, including when the launcher was opened over another app.
+Containers uses Blindspot’s selected palette and transparent glass, including the same macOS
+accessibility fallback as the launcher. Reopen the window to apply a changed palette.
+**Keep on top** is on by default and remembered. The window stays open when focus changes;
+use **⌘W** or its close button to close it, or uncheck Keep on top for normal window stacking.
+
+**Images** lists installed images, including untagged images, with tags, full IDs, size and creation
+time. Multiple tags for one image are grouped. Images are templates; **Containers** lists running
+and stopped instances, so these counts can differ. **Create container…** opens a native form:
+- Name and optional Mac/container port pair, published only to localhost.
+- **Choose .env file…** plus masked inline variables; inline values override matching file keys.
+  Files use UTF-8 `NAME=value` lines, blank lines and `#` comments. Quotes and `$` expressions
+  are literal; shell syntax, multiline values and implicit host-environment inheritance are unsupported.
+  Maximum 256 variables / 256 KiB. The file is read when selected; choose it again to reload edits.
+- Bind folders or existing named volumes, with a container destination and read-only toggle.
+  The runtime must share bind folders with its VM. Existing volume names are checked before creation.
+- Optional CPU cores and memory in MiB, plus no/on-failure/always/unless-stopped restart policy.
+
+**Review configuration** shows mounts, limits, ports and masked environment names before
+**Create and Start**. This uses the installed image’s default command and refuses downloads.
+Creation rechecks the immutable image ID. Environment configuration applies to new containers only.
+Values are not saved as Blindspot preferences or command history and never enter CLI arguments.
+A private temporary environment file is removed on completion, failure or cancellation; an abrupt
+process/system crash can prevent cleanup. The engine stores the created container's environment.
+
+The detail pane has **Overview**, **Resources**, **Logs** and **Events** tabs.
+**Inspect details** loads health, lifecycle timestamps, exit/OOM state, restart policy/count,
+startup command, resource configuration, networks and mounts when reported by the runtime.
+Local published TCP ports offer HTTP browser links; non-HTTP services require their own client.
+**Copy ID** and **Copy image ID** copy the selected identity.
+
+**Start monitoring** refreshes the selected container's overview and samples resources, targeting
+one sample every two seconds without overlapping requests. Resources shows CPU/memory charts
+for the latest 120 samples and cumulative network/disk I/O. Runtime delays can lengthen the interval;
+unavailable metrics produce a disconnected state rather than invented values. Rootless Podman may
+not report network usage. **Pause monitoring** retains samples with an explicit stale-data label.
+**Events** retains the latest 200 lifecycle events since connecting. Reconnect starts a new session;
+events while disconnected are not backfilled. No monitoring continues after closing the window.
+
+Typing **:** lists recently invoked registered commands first, followed by the other commands.
+Only command names are saved locally; arguments, queries and container data are not command history.
+**:help** retains the complete registry order.
+
+Uses already-installed Docker/Podman CLIs from standard Homebrew, /usr/local/bin, /opt/podman/bin
+or Docker.app locations. Docker discovery lists Unix-socket contexts; Podman discovery lists
+machines and uses their local forwarded API sockets. The engine picker always names the target.
+Open Docker or start your Podman machine in its own tools if unavailable. No runtime installation,
+image download or machine startup happens automatically. Custom CLI/config locations may need
+your runtime's own tools. **:docker** now opens containers; **:com.docker** still finds Docker
+backend processes in the developer console.
+
+**Start…**, **Stop…** and **Restart…** confirm the engine, container name and short ID. Before
+execution, the app rechecks the full 64-character container ID and allowed state. A stopped or
+removed selection cannot silently act on a replacement with the same name. Stop/restart can
+interrupt work; an engine's existing auto-remove policy may remove a container when it stops.
+**Stop waiting** cancels the CLI request, not necessarily an operation already accepted by the
+engine. Refresh before retrying when the outcome is uncertain.
+
+In **Logs**, **Read logs** loads a snapshot using the remembered **Lines** choice: 50, 100,
+200, 500, 1,000 or 5,000 per stream, bounded to 1 MiB. **Follow / Reconnect** loads recent history
+and follows new output with runtime timestamps. **Pause** stops the connection and retains output.
+Reconnect reloads recent history; it does not promise gap-free archival logs. Live history retains
+up to twice the selected line count across stdout/stderr, capped at 1 MiB; earlier discarded output
+is labelled. Snapshot stdout precedes stderr; live streams are interleaved as received, not globally
+sorted. Oversized lines or stream overflow disconnect with an incomplete-history label.
+
+Search filters loaded output. **Copy / Export** offers all loaded output or the filtered view;
+exports use the native Save dialog and include snapshot time and live/paused/incomplete status.
+Logs stay in memory unless explicitly copied/exported, are never sent to AI or diagnostic logs,
+and clear on selection change, refresh or close. Changing Lines pauses the connection and clears
+old output; Read or Follow applies the new limit.
+
+Commands run off the main thread with fixed argv, time/output bounds, cancellation and stale
+result rejection. Engine addresses are pinned per operation and remote-context environment
+overrides are excluded. This release supports local Unix sockets only: no remote engines,
+registry accounts, Compose orchestration, image pulls, pruning, deletion or container shells.
+CLI interfaces follow [Docker's formatting documentation](https://docs.docker.com/engine/cli/formatting/)
+and [Podman's machine inspection](https://docs.podman.io/en/stable/markdown/podman-machine-inspect.1.html).
+Creation and monitoring also follow the official [Docker run](https://docs.docker.com/reference/cli/docker/container/run/),
+[Podman stats](https://docs.podman.io/en/latest/markdown/podman-stats.1.html), and
+[Podman events](https://docs.podman.io/en/latest/markdown/podman-events.1.html) interfaces.
 
 ## 6. Clipboard history
 
@@ -685,7 +829,7 @@ so inspect the result label. Compound supported units can be combined.
 
 ## 12. Settings and discovery
 
-Type `:` or `:help` for the first-party command catalog; `:po` then Tab completes
+Type `:` for recent commands first, or `:help` for the complete first-party catalog; `:po` then Tab completes
 `:ports`. `:settings WORDS` searches labels, sections and keys, e.g. `:settings hotkey`,
 `:settings clipboard`, `:settings agent.model`.
 
@@ -813,12 +957,28 @@ are hidden. Restart-required controls still say so.
 
 Data and inference remain local by default. No cloud dependency or custom third-party
 extension setup is added. The local model service must be running. This is a locally
-signed macOS 26+ Apple Silicon build, not a notarized public release.
+signed macOS 26+ Apple silicon build. GitHub downloads are not notarized.
 
 Not implemented: universal document-format indexing, arbitrary shell automation,
 arbitrary process restart, complete browser automation, public extension distribution,
-hard CPU/RAM quotas, or validated 10-million-record production operation. macOS limits
+hard indexing CPU/RAM quotas, or validated 10-million-record production operation. macOS limits
 process visibility, selected-text access, last-opened metadata and atomic PID identity checks.
+
+**0.3.3 changes**
+
+- Native first-run guide and menu-bar onboarding replay: shortcut, opt-in documents/clipboard,
+  Accessibility, Ollama installation, memory-based model suggestions, confirmed downloads and tests.
+- Local Docker/Podman workspace with separate Containers and Images views, full-ID lifecycle
+  controls, inspection, localhost ports and a persistent, optionally floating glass window.
+- Reviewed creation from installed images: .env files with masked inline overrides, bind folders,
+  existing named volumes, CPU/memory limits and restart policies. No automatic image pulls.
+- Live CPU/memory charts, network/disk counters and lifecycle events; bounded searchable logs
+  with pause/reconnect, copy and local export of loaded or filtered output.
+- Recent registered commands appear first for `:`; `:help` keeps the full catalog. Return reliably
+  presents auxiliary windows, including across activation and minimized-window handoffs.
+- Transparent native surfaces retain stronger text colors and opaque accessibility fallbacks.
+- Updated installation, contributor and release documentation, plus current isolated demo media.
+  Existing settings, clipboard history, indexes and embeddings are preserved.
 
 **0.3.2 changes**
 
@@ -913,7 +1073,7 @@ process visibility, selected-text access, last-opened metadata and atomic PID id
   module-cache files on this Mac. The old semantic cache is replaced. Source files are never modified.
 
 The Settings shortcuts, visible version, source-byte accounting and empty filtered-search
-explanations from 0.2.4 remain available. Still not included: native iWork extraction, Office deep links, hard CPU/RAM
+explanations from 0.2.4 remain available. Still not included: native iWork extraction, Office deep links, hard indexing CPU/RAM
 quotas, copying or deleting files from the agent, system-wide snippet expansion,
 editing existing calendar events, and changing system settings beyond the commands listed in section 9. The
 related-by-meaning tail and document answers are approximate; check the cited sources.

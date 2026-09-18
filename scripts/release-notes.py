@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prints the GitHub release body for one version: `release-notes.py docs/new-features.md 0.2.8`.
+"""Prints the GitHub release body for one version: `release-notes.py docs/new-features.md X.Y.Z`.
 
 The body is the guide's "**X.Y.Z changes**" list, so the notes are written once, reviewed in
 the commit that bumps the version, and cannot drift from the guide shipped inside the zip.
@@ -21,11 +21,16 @@ Requires macOS 26 or later on Apple silicon.
 2. Move `Blindspot.app` to your Applications folder and open it.
 3. Blindspot is not notarized by Apple, so macOS blocks the first launch. Open **System Settings →
    Privacy & Security**, find the message about Blindspot and click **Open Anyway**. You only do
-   this once per download. In Terminal, `xattr -dr com.apple.quarantine /Applications/Blindspot.app`
-   does the same.
+   this once per download.
+4. Follow the welcome guide, or press **⌘⇧Space**, type an app name and press Return.
+   Optional setup guides document indexing, Accessibility, Ollama and a confirmed first-model download.
 
-`START-HERE.md` in the zip, also attached as the cheatsheet, is the complete guide. To check the
-download: `shasum -a 256 -c Blindspot-{version}-SHA256SUMS.txt`
+Choose the app ZIP, not GitHub's Source code archives. `~/Applications` is a writable installation
+location for built-in updates. `START-HERE.md` is the short quick start; `FEATURE-GUIDE.md` and the
+attached cheatsheet are the full reference. No account or AI model is needed to begin.
+
+To verify all checksums, download the ZIP, standalone cheatsheet and checksum file into the same
+folder, then run `shasum -a 256 -c Blindspot-{version}-SHA256SUMS.txt`.
 """
 
 

@@ -56,6 +56,9 @@ pub fn builtins() -> &'static Registry {
     REGISTRY.get_or_init(|| {
         let mut registry = Registry::default();
         for (owner, invocation, help) in [
+            ("containers", ":containers", "Local Docker and Podman containers: status, ports, logs and controls"),
+            ("containers", ":docker", "Open local Docker containers"),
+            ("containers", ":podman", "Open local Podman containers"),
             ("process", ":ports", "Show TCP listeners and UDP sockets; :ports PID filters by owner"),
             ("process", ":pid ", "Inspect a visible process by PID"),
             ("process", ":children ", "Show immediate child processes of a PID"),
@@ -173,9 +176,9 @@ mod tests {
     }
     #[test]
     fn builtins_are_discoverable_and_process_filters_remain_available() {
-        assert_eq!(builtins().complete(":help").expect("help").len(), 20);
+        assert_eq!(builtins().complete(":help").expect("help").len(), 23);
         assert_eq!(
-            builtins().complete(":po").expect("prefix")[0].invocation,
+            builtins().complete(":por").expect("prefix")[0].invocation,
             ":ports"
         );
         assert!(builtins().complete(":node").is_none());

@@ -1056,6 +1056,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     var onChange: (() -> Void)?
     /// Called when the colourway changes, so the panel can be rebuilt in it.
     var onPalette: (() -> Void)?
+    var onSetup: (() -> Void)?
 
     init(core: Core) {
         self.core = core
@@ -1190,9 +1191,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         if sections.indices.contains(tabs.selected), sections[tabs.selected] == Self.status {
             probe()
         }
-        // An accessory app's window will not take key focus unless the app activates.
-        NSApp.activate()
-        window.makeKeyAndOrderFront(nil)
+        WindowPresentation.show(window)
         if let target, let control = Self.firstControl(in: target) {
             window.makeFirstResponder(control)
         }
@@ -1412,6 +1411,14 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
             return
         }
 
+        if section == "General" {
+            let setup = ActionRow(label: "Make Blindspot yours", help: "Guided shortcuts, document search, clipboard, Accessibility and local AI.", button: "Set up Blindspot…") { [weak self] in
+                self?.onSetup?()
+            }
+            setup.identifier = NSUserInterfaceItemIdentifier("settings.setup")
+            rows.addArrangedSubview(setup)
+            setup.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
+        }
         for (at, setting) in settings.filter({ $0.section == section }).enumerated() {
             let key = setting.key
             let group: String? = switch key {

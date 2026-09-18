@@ -98,7 +98,63 @@ enum PanelSmoke {
             precondition(panel.control(field, textView: editor, doCommandBy: #selector(NSResponder.moveUp(_:))))
             precondition(results.matches.count <= 50)
         }
-        field.stringValue = ":po"
+        for command in [":containers", ":docker", ":podman", "docker containers"] {
+            field.stringValue = command
+            panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+            precondition(results.selectedMatch?.kind == .command && results.selectedMatch?.path == ContainerRequest.command(command))
+        }
+        let browser = ContainerWindow.shared
+        browser.show(discover: false)
+        let browserWindow = browser.window!
+        browserWindow.miniaturize(nil)
+        for command in [":containers", ":docker", ":podman", "docker containers"] {
+            browser.busy = true
+            NSApp.deactivate()
+            for _ in 0..<20 {
+                if !NSApp.isActive { break }
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+            if NSApp.isActive { print("Inactive-app setup was not granted by macOS; continuing Return/visibility checks with the app active") }
+            panel.show()
+            field.stringValue = command
+            panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+            sendReturn(to: panel)
+            try? await Task.sleep(for: .milliseconds(150))
+            precondition(!panel.isVisible && browserWindow.isVisible && !browserWindow.isMiniaturized,
+                         "Return must present the container window, including after minimization")
+            precondition(browserWindow.occlusionState.contains(.visible) && browserWindow.isOnActiveSpace,
+                         "The container window must actually be displayed on the active Space")
+            precondition(browserWindow.collectionBehavior.contains(.moveToActiveSpace))
+            browserWindow.performClose(nil)
+        }
+        let commands = core.query(":help", limit: 50).matches.filter { $0.kind == .command }
+        precondition(commands.count == 23)
+        let historyRoot = FileManager.default.temporaryDirectory.appendingPathComponent("blindspot-history-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: historyRoot) }
+        let history = CommandHistory(home: historyRoot.path)
+        let invocations = commands.map(\.path)
+        history.record(":docker", registered: invocations)
+        history.record(":ports", registered: invocations)
+        history.record(":docker", registered: invocations)
+        history.record(":snippet secret private text", registered: invocations)
+        let reloaded = CommandHistory(home: historyRoot.path)
+        precondition(reloaded.recent == [":docker", ":ports"], "Persist only unique registered commands, never arguments")
+        precondition(reloaded.ordered(commands).prefix(2).map(\.path) == [":docker", ":ports"])
+        CommandHistory.shared.record(":docker", registered: invocations)
+        panel.show()
+        field.stringValue = ":"
+        panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+        precondition(results.selectedMatch?.path == ":docker", "Colon selects the most recently used command")
+        for command in commands where ContainerRequest.command(command.path) == nil {
+            panel.show()
+            results.update([command])
+            sendReturn(to: panel)
+            for _ in 0..<20 { await Task.yield() }
+            precondition(panel.isVisible && panel.query == command.path,
+                         "Return must navigate the registered command: \(command.path)")
+        }
+        panel.show()
+        field.stringValue = ":por"
         panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
         precondition(results.selectedMatch?.kind == .command)
         precondition(panel.control(field, textView: editor, doCommandBy: #selector(NSResponder.insertTab(_:))))
@@ -110,13 +166,14 @@ enum PanelSmoke {
         field.stringValue = ":settings agent.model"
         panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
         precondition(results.selectedMatch?.kind == .setting)
-        precondition(panel.control(field, textView: editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        sendReturn(to: panel)
         for _ in 0..<20 { await Task.yield() }
         precondition(opened == "agent.model", "Return opens the selected schema key")
         guard let window = NSApplication.shared.windows.first(where: { $0.title == "blindspot" }),
               let content = window.contentView,
               let row = findRow(in: content, key: "agent.model") else { fatalError("Setting row not presented") }
         precondition(window.isVisible && !row.visibleRect.isEmpty)
+        precondition(window.collectionBehavior.contains(.moveToActiveSpace))
         precondition(window.styleMask.contains(.resizable) && content is SurfaceView)
         for section in ["General", "Ranking", "Content", "Index", "Clipboard", "Agent", "Appearance", "Status"] {
             guard let button = findRow(in: content, key: "settings.section.\(section)") as? NSButton else {
@@ -241,12 +298,63 @@ enum PanelSmoke {
         precondition(!visibleText(results).contains("Higashiyama"), "Pooled rows must clear old excerpts")
         panel.standDown()
         await checkPassagePreview()
+        await captureContrasts(core: core, watcher: watcher)
         print("Panel show/reopen, 14 queries, command Tab completion, setting Return navigation, content erasure confirmation cancellation, Status updates row, bounded rows and arrow routing: passed")
+        print("Return key events: four container aliases, all 23 registered command routes and Settings; visible active-Space container window and minimized-window recovery: passed")
         print("Five search scopes with keyboard focus, eight sidebar sections, Index folder/settings navigation, resizable native glass surfaces: passed; persistent stores disabled")
         print("Settings Command-W close, reopen and close with text-field focus: passed")
         print("File diagnostic bridge and Settings presentation: passed")
         print("Passage preview navigation, Unicode highlighting, stale-result rejection and close: passed")
         print("Document folder selection, chooser cancellation, query/filter retention, mode isolation, clearing, focus, FFI validation and layout: passed")
+    }
+
+    private static func sendReturn(to window: NSWindow) {
+        let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+            context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36)!
+        NSApp.sendEvent(event)
+    }
+
+    private static func captureContrasts(core: Core, watcher: ClipboardWatcher) async {
+        guard ProcessInfo.processInfo.environment["BLINDSPOT_CAPTURE_CONTAINERS"] == "1" else { return }
+        let original = Theme.current
+        defer { Theme.current = original }
+        let directory = URL(fileURLWithPath: "build/container-screens")
+        try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        for palette in Palette.all {
+            Theme.current = palette
+            for (name, color) in [("bright", NSColor.white), ("dark", NSColor.black)] {
+                let backdrop = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 1000, height: 800),
+                                        styleMask: [.borderless], backing: .buffered, defer: false)
+                backdrop.isReleasedWhenClosed = false
+                backdrop.backgroundColor = color
+                let panel = Panel(core: core, watcher: watcher)
+                panel.show()
+                let field = panel.contentView!.subviews.compactMap { $0 as? NSTextField }.first { $0.isEditable }!
+                field.stringValue = "harbor"
+                panel.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+                let results = panel.contentView!.subviews.compactMap { $0 as? ResultsView }.first!
+                results.update([
+                    Match(id: 1, name: "Harbor project notes.md", kind: .file, path: "/Fixture/Projects/Harbor project notes.md", score: 1, timestamp: 0, width: 0, height: 0, detail: "", highlights: []),
+                    Match(id: 2, name: "Harbor architecture.pdf", kind: .file, path: "/Fixture/Projects/Harbor architecture.pdf", score: 1, timestamp: 0, width: 0, height: 0, detail: "", highlights: []),
+                    Match(id: 3, name: "Open local containers", kind: .command, path: ":containers", score: 1, timestamp: 0, width: 0, height: 0, detail: "Status, ports, recent logs and controls", highlights: []),
+                ])
+                results.constraints.first { $0.firstAttribute == .height && $0.secondItem == nil }!.constant = results.fittingHeight
+                panel.setContentSize(NSSize(width: Theme.panelWidth, height: results.fittingHeight + Theme.fieldHeight + 39))
+                backdrop.setFrame(panel.frame.insetBy(dx: -80, dy: -80), display: true)
+                backdrop.orderFrontRegardless()
+                panel.orderFrontRegardless()
+                panel.contentView!.layoutSubtreeIfNeeded()
+                try? await Task.sleep(for: .milliseconds(250))
+                let capture = Process()
+                capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+                capture.arguments = ["-x", "-o", "-l", String(panel.windowNumber), directory.appendingPathComponent("launcher-\(palette.name)-\(name).png").path]
+                try! capture.run(); capture.waitUntilExit()
+                precondition(capture.terminationStatus == 0)
+                panel.standDown()
+                backdrop.close()
+            }
+        }
     }
 
     private static func checkPassagePreview() async {

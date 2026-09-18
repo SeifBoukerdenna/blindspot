@@ -53,12 +53,23 @@ an ETA, hard resource quota or proof of large-library readiness.
 
 | Responsibility | Entry points | Relevant checks |
 |---|---|---|
+| First-run lifecycle, guided setup, explicit model downloads | shell/OnboardingState.swift, shell/Onboarding.swift, shell/OnboardingOllama.swift | make test-onboarding; BLINDSPOT_CAPTURE_SETUP=1 make test-onboarding for window-only captures |
+| Local Docker/Podman discovery, container controls/logs | shell/Containers.swift, shell/ContainerCreation.swift, shell/ContainerMonitoring.swift, shell/ContainerWindow.swift, core/src/commands.rs | make test-containers smoke-panel; BLINDSPOT_CAPTURE_CONTAINERS=1 adds synthetic window/background captures |
 | Launch/focus, keys, result polling | shell/AppDelegate.swift, shell/Panel.swift, shell/HotKey.swift, shell/MainMenu.swift | make app smoke-panel |
+| Recent colon commands, registered names only | shell/CommandHistory.swift, shell/Panel.swift | make smoke-panel; disposable history reload and argument exclusion |
 | Rendering and native surfaces | shell/ResultsView.swift, shell/Theme.swift | make smoke-panel test-index-dashboard; inspect fixture screenshots |
 | Result actions, explanations and context | shell/Actions.swift, shell/Context.swift, shell/LocalRequest.swift | make test-actions smoke-panel |
 | Settings, indexing dashboard and watcher | shell/Settings.swift, shell/IndexDashboard.swift, shell/ContentWatcher.swift | make test-index-dashboard test-content smoke-panel |
 | Document/passage preview | shell/Preview.swift, shell/PassagePreview.swift | make test-passages smoke-panel |
 | Clipboard, calendar, updater | shell/ClipboardWatcher.swift, shell/Schedule.swift, shell/Updater.swift | Relevant action/watcher tests; make test-updater |
+
+Fresh-install setup runs before Core initialization; existing config/data must never be treated
+as a new install. Model pulls are confined to explicit setup confirmation; normal inference stays
+installed-model-only. Onboarding fixtures unset HOME and use disposable state and a synthetic
+loopback Ollama server. Native captures require Screen Recording access for the runner.
+Container fixtures use a disposable fake CLI, never live engines. Preserve endpoint pinning,
+full-ID/state revalidation, bounded subprocess output and explicit lifecycle confirmation.
+Container logs are transient private content, not diagnostic output or model context.
 
 Keep AppKit work on the main actor and slow I/O off it. Preserve pooled rows, icon caches,
 preview/focus guards and stale-task rejection. UI direction: minimal Spotlight-like native

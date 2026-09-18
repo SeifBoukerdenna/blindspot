@@ -149,7 +149,7 @@ private final class Director: NSObject, NSApplicationDelegate {
         await scene("launcher") {
             try await self.setQuery("")
             try await Task.sleep(for: .milliseconds(400))
-            try await self.record("launcher", seconds: 17, height: 470) {
+            try await self.record("launcher", seconds: 17, height: 640) {
                 try await self.type("cal")
                 try await self.hold(1.4)
                 try await self.erase()
@@ -187,6 +187,61 @@ private final class Director: NSObject, NSApplicationDelegate {
             try await self.dashboard()
         }
         panel.standDown()
+        await scene("onboarding-ai") { try await self.onboardingScene() }
+        await scene("containers") { try await self.containerScenes() }
+    }
+
+    private func onboardingScene() async throws {
+        backdrop.level = .normal; backdrop.orderFrontRegardless()
+        let setup = Onboarding(core: nil, store: SetupStore(directory: nil), record: SetupRecord(),
+            hardware: SetupHardware(chip: "Apple M3", memory: 16 * 1_073_741_824))
+        setup.values = ["hotkey": "cmd+shift+space", "content.enabled": "false"]
+        setup.show(); setup.navigate(.ai)
+        setup.connected = true; setup.installed = ["qwen3.5:4b"]
+        setup.aiStatus = "Ollama is ready · 1 installed model"
+        guard let window = setup.window else { throw Failure("onboarding window did not open") }
+        window.center(); window.level = .floating
+        window.makeKeyAndOrderFront(nil); window.orderFrontRegardless()
+        try await Task.sleep(for: .milliseconds(500))
+        guard window.isVisible else { throw Failure("onboarding window is not visible") }
+        try await still("onboarding-ai", window: window)
+        window.performClose(nil)
+    }
+
+    private func containerScenes() async throws {
+        backdrop.level = .normal; backdrop.orderFrontRegardless()
+        let model = ContainerWindow()
+        let endpoint = ContainerEndpoint(engine: .docker, name: "Demo engine", socket: "unix:///tmp/blindspot-media-demo.sock", executable: URL(fileURLWithPath: "/nonexistent/demo-docker"))
+        let row = LocalContainer(id: String(repeating: "a", count: 64), name: "harbor-api", image: "harbor/api:dev", state: "running", status: "Up 12 minutes", ports: "127.0.0.1:8080 → 80/tcp")
+        let image = LocalContainerImage(id: String(repeating: "b", count: 64), references: ["harbor/api:dev"], size: "42 MB", created: "2026-09-18")
+        model.endpoints = [endpoint]; model.endpointID = endpoint.id
+        model.rows = [row]; model.selectedID = row.id
+        model.inspection = ContainerDetails(fields: ["Health: healthy", "Restart policy: unless-stopped", "Networks: bridge", "Mount: demo_data → /data"], localPorts: [8080])
+        model.status = "Demo fixture · 1 container · 1 running"
+        model.show(discover: false)
+        guard let window = model.window else { throw Failure("container window did not open") }
+        window.center()
+        try await Task.sleep(for: .milliseconds(500))
+        try await still("containers", window: window)
+        model.detailTab = "Logs"
+        model.logs = "2026-09-18T10:00:00Z Server listening on port 80\n2026-09-18T10:00:01Z Health check passed\n2026-09-18T10:00:04Z GET /api/projects 200 (12 ms)\n2026-09-18T10:00:07Z GET /api/projects/harbor 200 (8 ms)"
+        model.logStatus = "Paused · demo log fixture"
+        try await Task.sleep(for: .milliseconds(300))
+        try await still("container-logs", window: window)
+        model.section = .images; model.images = [image]; model.selectedImageID = image.id
+        model.createContainer()
+        guard let creation = model.creation, let sheet = creation.sheet else { throw Failure("creation sheet did not open") }
+        creation.name = "harbor-api-dev"; creation.hostPort = "8081"; creation.containerPort = "80"
+        creation.cpu = "2"; creation.memory = "512"; creation.restart = "unless-stopped"
+        creation.fileValues = ["MODE":"development", "API_TOKEN":"demo-only"]
+        creation.variables = [ContainerVariable(name: "MODE", value: "local")]
+        creation.mounts = [ContainerMount(source: "demo_data", destination: "/data", volume: true)]
+        creation.reviewConfiguration()
+        guard creation.review else { throw Failure("demo creation did not validate") }
+        try await Task.sleep(for: .milliseconds(500))
+        try await still("container-create", window: sheet)
+        creation.finish(false)
+        window.performClose(nil)
     }
 
     // MARK: - Privacy
@@ -479,25 +534,11 @@ private final class Director: NSObject, NSApplicationDelegate {
         window.close()
     }
 
-    /// Settings pages are chosen through the tab bar's callback, the same path a click takes.
     private func open(page title: String, in window: NSWindow) -> Bool {
         guard let content = window.contentView,
-              let bar = find(in: content, where: { $0 is TabBar }) as? TabBar else { return false }
-        var labels: [String] = []
-        collectTabLabels(in: bar, into: &labels)
-        guard let index = labels.firstIndex(of: title.uppercased()) else { return false }
-        bar.onSelect?(index)
+              let button = find(in: content, where: { ($0 as? NSButton)?.identifier?.rawValue == "settings.section." + title }) as? NSButton else { return false }
+        button.performClick(nil)
         return true
-    }
-
-    private func collectTabLabels(in view: NSView, into labels: inout [String]) {
-        for subview in view.subviews {
-            if let label = subview as? NSTextField, subview.superview is NSStackView {
-                labels.append(label.stringValue)
-            } else {
-                collectTabLabels(in: subview, into: &labels)
-            }
-        }
     }
 
     private func find(in view: NSView, where matches: (NSView) -> Bool) -> NSView? {

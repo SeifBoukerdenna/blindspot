@@ -1,5 +1,9 @@
 # P2 handoff — Ollama embeddings and passage vectors
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 **Superseded implementation status, September 16:** see `docs/search-implementation.md`.
 The passage pipeline is now wired and measured, but installation is paused on a pre-existing
 FTS checksum mismatch reproduced in the pre-upgrade snapshot. The remainder below is historical.

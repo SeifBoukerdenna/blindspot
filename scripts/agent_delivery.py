@@ -97,8 +97,9 @@ def verify_archive(path, current):
         info = plistlib.loads(archive.read(prefix + "Blindspot.app/Contents/Info.plist"))
         if info.get("CFBundleIdentifier") != BUNDLE_ID or info.get("CFBundleShortVersionString") != current:
             raise RuntimeError("Archive version/identity mismatch")
-        if prefix + "START-HERE.md" not in archive.namelist():
-            raise RuntimeError("Archive is missing its feature guide")
+        for guide in ("START-HERE.md", "FEATURE-GUIDE.md"):
+            if prefix + guide not in archive.namelist():
+                raise RuntimeError("Archive is missing " + guide)
 
 
 def verify_rollback(path, previous):

@@ -700,10 +700,17 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
         let contextual = LauncherContext.isTextCommand(text) || core.promptInstruction(for: text) != nil
         let plan = LocalRequest.parse(text)
         let effectiveQuery = plan?.query ?? (contextual ? ">" + text : text)
-        var (matches, pending) = if mode == 4, let folder = documentScope.folder {
+        var (matches, pending) = if let command = ContainerRequest.command(text) {
+            ([Match(id: 0, name: "Open \(ContainerRequest.engine(command)?.title ?? "local") containers", kind: .command,
+                    path: command, score: 0, timestamp: 0, width: 0, height: 0,
+                    detail: "Status, ports, recent logs and container controls · Return to open", highlights: [])], false)
+        } else if mode == 4, let folder = documentScope.folder {
             core.queryDocuments(String(text.dropFirst(Self.modes[4].prefix.count)), folder: folder, limit: Self.resultLimit)
         } else {
             core.query(effectiveQuery, limit: Self.resultLimit)
+        }
+        if text.trimmingCharacters(in: .whitespaces) == ":" {
+            matches = CommandHistory.shared.ordered(matches)
         }
         if plan == .currentProject {
             if let url = context?.projectDirectory {
@@ -1080,6 +1087,21 @@ final class Panel: NSPanel, NSTextFieldDelegate, NSWindowDelegate {
 
     private func launchSelected() {
         guard let match = results.selectedMatch else { return }
+        let registered = core.query(":help", limit: Self.resultLimit).matches
+            .filter { $0.kind == .command }.map(\.path)
+        if match.kind == .command {
+            CommandHistory.shared.record(match.path, registered: registered)
+        } else if let invocation = registered.filter({
+            let prefix = $0.trimmingCharacters(in: .whitespaces)
+            return field.stringValue == prefix || field.stringValue.hasPrefix(prefix + " ")
+        }).max(by: { $0.count < $1.count }) {
+            CommandHistory.shared.record(invocation, registered: registered)
+        }
+        if match.kind == .command, let command = ContainerRequest.command(match.path) {
+            dismiss(restoringFocus: false)
+            ContainerWindow.shared.show(engine: ContainerRequest.engine(command))
+            return
+        }
 
         let plan = LocalRequest.parse(field.stringValue)
         if plan == .currentProject, match.kind == .command {

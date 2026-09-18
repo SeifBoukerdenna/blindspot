@@ -91,10 +91,11 @@ $(BINARY): $(SWIFT_SRC) $(CORE_LIB) $(HEADER) shell/Info.plist Makefile
 
 RESOURCE_FILES := $(shell find docs/licenses -type f -print 2>/dev/null)
 $(RESOURCE_STAMP): scripts/package-resources.py Cargo.lock helpers/vector-worker/Cargo.lock \
-		docs/new-features.md shell/AppIcon.icns $(RESOURCE_FILES)
+		docs/new-features.md docs/quick-start.md shell/AppIcon.icns $(RESOURCE_FILES)
 	python3 scripts/package-resources.py --root . --output $(BUILD)/release-licenses
 	@mkdir -p $(CONTENTS)/Resources/ThirdPartyLicenses
 	cp docs/new-features.md $(CONTENTS)/Resources/README.md
+	cp docs/quick-start.md $(CONTENTS)/Resources/START-HERE.md
 	cp shell/AppIcon.icns $(CONTENTS)/Resources/AppIcon.icns
 	cp -R $(BUILD)/release-licenses/. $(CONTENTS)/Resources/ThirdPartyLicenses/
 	@touch $@
@@ -121,7 +122,7 @@ sign: app
 	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID).vectors $(VECTORS)
 	codesign --force --sign "$(SIGN_ID)" --timestamp=none --identifier $(BUNDLE_ID) $(BUNDLE)
 
-# The download: the signed app with the feature guide as START-HERE.md, plus the guide as a
+# The download: the signed app with a short START-HERE.md and FEATURE-GUIDE.md, plus the guide as a
 # standalone cheatsheet. Not dependent on `sign`, so the Release workflow packages exactly the
 # bundle it verified. The staging copy is removed so no second Blindspot.app lingers for
 # LaunchServices to register.
@@ -133,7 +134,8 @@ package:
 	rm -rf $(DIST) $(DIST).zip
 	mkdir -p $(DIST)
 	ditto $(BUNDLE) $(DIST)/$(APP).app
-	cp docs/new-features.md $(DIST)/START-HERE.md
+	cp docs/quick-start.md $(DIST)/START-HERE.md
+	cp docs/new-features.md $(DIST)/FEATURE-GUIDE.md
 	cd $(BUILD) && ditto -c -k --sequesterRsrc --keepParent $(APP)-$(VERSION) $(APP)-$(VERSION).zip
 	rm -rf $(DIST)
 	cp docs/new-features.md $(DIST)-Cheatsheet.md
@@ -205,7 +207,21 @@ test-updater:
 	    -o $(BUILD)/updater-tests bench/UpdaterTests.swift shell/Updater.swift
 	$(BUILD)/updater-tests
 
-smoke-panel: $(CORE_LIB) $(HEADER)
+.PHONY: test-onboarding
+test-onboarding: $(CORE_LIB) $(HEADER)
+	@mkdir -p $(BUILD)
+	swiftc $(SWIFTFLAGS) -o $(BUILD)/onboarding-tests bench/OnboardingTests.swift \
+	    $(filter-out shell/AppDelegate.swift,$(SWIFT_SRC))
+	env -u HOME $(BUILD)/onboarding-tests
+
+.PHONY: test-containers
+test-containers:
+	@mkdir -p $(BUILD)
+	swiftc -O -swift-version 6 -target $(ARCH)-apple-macos$(DEPLOY) -framework AppKit \
+	    -o $(BUILD)/container-tests bench/ContainerTests.swift shell/Containers.swift shell/ContainerCreation.swift shell/ContainerMonitoring.swift shell/ContainerWindow.swift shell/Theme.swift
+	env -u HOME $(BUILD)/container-tests
+
+smoke-panel: test-onboarding test-containers $(CORE_LIB) $(HEADER)
 	@mkdir -p $(BUILD)
 	swiftc $(SWIFTFLAGS) -o $(BUILD)/panel-smoke bench/PanelSmoke.swift \
 	    $(filter-out shell/AppDelegate.swift,$(SWIFT_SRC))

@@ -1,5 +1,9 @@
 # Roadmap implementation status
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 The user requested completion of the roadmap, excluding custom third-party extension
 setup, followed by a testable latest build and a short usage guide. This is a work log,
 not a claim that the entire roadmap is complete. The original baseline and foundational

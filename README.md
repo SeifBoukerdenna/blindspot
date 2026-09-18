@@ -6,7 +6,7 @@
 
 Press **⌘⇧Space**, type a few letters, press **Return**. Open apps, find a PDF by what it says,
 paste something you copied an hour ago, join your next meeting, or ask your own documents a
-question. Nothing is sent to the cloud.
+question, or manage your local containers. Search, indexing and AI processing stay on your Mac.
 
 [![CI](https://github.com/SeifBoukerdenna/blindspot/actions/workflows/ci.yml/badge.svg)](https://github.com/SeifBoukerdenna/blindspot/actions/workflows/ci.yml)
 
@@ -21,12 +21,20 @@ question. Nothing is sent to the cloud.
 Blindspot needs **macOS 26 (Tahoe) or later on an Apple silicon Mac**. There's no Dock icon:
 press **⌘⇧Space** to open it.
 
+The first launch shows a native setup guide. Open an app immediately, or follow the optional
+steps for document indexing, clipboard history, Accessibility and local AI. Resume anytime from
+**Set up Blindspot…** in the menu bar or **Settings → General**. Put the app in a writable
+Applications folder (such as `~/Applications`) to use the built-in updater.
+
 ### Updating
 
-Open **Settings → Status → Updates** and press **Check for updates**. If there's a newer release,
+Open **Settings → About → Updates** and press **Check for updates**. If there's a newer release,
 press **Install**. Blindspot downloads it, checks its checksum and code signature, asks, then
 replaces itself and reopens. Your settings, clipboard history and index stay as they are. Blindspot
 only contacts GitHub when you press the button.
+
+This README follows the repository code. For a downloaded version, use its bundled
+**START-HERE.md** and **FEATURE-GUIDE.md**; the repository may contain newer features.
 
 ## What you can do
 
@@ -34,7 +42,7 @@ only contacts GitHub when you press the button.
 |---|---|
 | `sl` | Slack, or whatever app you meant. Apps you use often rise to the top |
 | `?quarterly report` | Files by name. **⌘Return** shows the file in Finder |
-| `documents about genetec` | Notes, PDFs and Word files that *mention* Genetec, with the matching sentence |
+| `documents about trail maintenance` | Notes, PDFs and Word files about trail maintenance, with the matching sentence |
 | `>docs what did we decide about signaling?` | An answer from your own documents, with sources you can open |
 | `;tracking` | Something you copied earlier, from your clipboard history |
 | `fix grammar` | Select text anywhere first, and it comes back corrected (also `make shorter`, `bullet points`…) |
@@ -42,21 +50,32 @@ only contacts GitHub when you press the button.
 | `schedule lunch with Sam friday at noon` | A preview of the event; Return adds it to your calendar |
 | `lock`, `sleep`, `dark mode`, `empty trash` | Control your Mac. Anything destructive asks first |
 | `:3000` | What's using port 3000, and a safe way to stop it |
+| `:containers`, `:docker`, `:podman` | Local containers and images, reviewed creation with .env overrides, monitoring, logs and lifecycle controls |
 | `15% * 89`, `72f`, `5 km to miles`, `uuid` | Quick maths, unit conversions and developer utilities |
 | `3pm montreal in tokyo`, `time in paris` | Time zones, daylight saving included |
 | `ocr` | Select part of the screen and copy the text in it |
 | `!sig` | Paste a snippet you saved with `:snippet sig Best regards…` |
 
-Type **:** to see every command. **⌘K** shows more actions for any result, **⌘Y** previews a
+Type **:** for recent commands first, or **:help** for the complete catalog. **⌘K** shows more actions for any result, **⌘Y** previews a
 file, and **⌘,** opens Settings.
 
-The full guide with real examples ships inside the download as **START-HERE.md**. You can also read
-it here: [docs/new-features.md](docs/new-features.md).
+The download includes a short **START-HERE.md** and a complete **FEATURE-GUIDE.md**. Read the
+[quick start](docs/quick-start.md) or the full reference here: [docs/new-features.md](docs/new-features.md).
+
+### Your local container workspace
+
+Open **:containers** and choose a Docker or Podman engine. **Images → Create container…**
+guides a name, localhost port mapping, `.env` file plus masked overrides, mounts, CPU/memory
+limits and restart policy, followed by a review. **Containers** has Overview, Resources, Logs
+and Events tabs, confirmed lifecycle controls, and searchable logs with local export.
+The glass window stays open when focus changes; **⌘W** closes it. See the
+[container guide](docs/new-features.md#local-containers) for runtime requirements and limits.
 
 ## Media
 
 See Blindspot in action: app search, document search, conversions and clipboard history,
-all from the keyboard. These captures use fictional demo documents and clipboard entries.
+all from the keyboard. The gallery also covers guided setup and the container workspace.
+Captures use fictional demo documents and isolated fixtures, never personal files or workloads.
 
 ![Blindspot switching between app search, document search, byte conversions and clipboard history](media/launcher.gif)
 
@@ -64,6 +83,10 @@ all from the keyboard. These captures use fictional demo documents and clipboard
 
 Click a screenshot to view it at full size. For still images without animation, open the
 [media gallery](media/README.md#screenshots).
+
+| Guided local AI setup | Container workspace |
+|---|---|
+| [![Native setup with hardware-based local model suggestions](media/onboarding-ai.png)](media/onboarding-ai.png) | [![Container overview with local fixture metadata and controls](media/containers.png)](media/containers.png) |
 
 | Search inside documents | Clipboard history |
 |---|---|
@@ -97,23 +120,30 @@ citing the files it used.
 Blindspot works without any of these and only asks when you use the feature that needs one.
 
 - **Accessibility:** to read text you've selected and to paste snippets for you.
+- **Screen Recording:** for copying text from a selected screen area.
 - **Calendars:** for `my schedule`.
 - **Automation:** to control Finder or System Events, for example `empty trash` or `dark mode`.
 
 ## Local AI (optional)
 
 The question-answering and writing features use a model running on your own Mac through
-[Ollama](https://ollama.com). Install it, download any model you like, and choose it in
-**Settings → Agent**. Blindspot never downloads a model by itself and never talks to a cloud AI.
+[Ollama](https://ollama.com). Open **Set up Blindspot → Local AI** for installation instructions,
+a model suggestion based on your Mac's memory, an explicitly confirmed download, and a local
+response test. You can reuse an installed model instead. Setup verifies local model metadata;
+cloud-backed models are refused. **Settings → AI** holds advanced choices.
 Everything else works without Ollama.
 
 ## Privacy
 
 - Indexing, search, clipboard history, calendar and AI all run on your Mac. No accounts, no
   telemetry, no analytics.
-- You choose which folders are indexed (Desktop and Downloads by default). Settings → Index shows
+- New installs wait for you to choose folders and enable indexing or clipboard capture. Existing
+  installs retain their choices. Settings → Index shows
   exactly what's been read and how much disk and CPU it uses.
-- Passwords copied from password managers are never saved to clipboard history.
+- Clipboard entries marked concealed, transient or sensitive by their source app are excluded.
+  Plain text without those markers cannot reliably be recognized as a password.
+- Update checks, model downloads, opening browser links and web searches use the network only
+  when requested. Container logs are retained in memory unless you explicitly copy or export them.
 
 ## Build it yourself
 
@@ -131,3 +161,6 @@ signature keeps macOS permissions across rebuilds.
 
 Maintainers publish a release with `scripts/release.sh`; see [docs/releasing.md](docs/releasing.md).
 For how it's built, see [docs/architecture.md](docs/architecture.md).
+
+For documentation by topic, see [docs/README.md](docs/README.md). Contributor setup is in
+[SETUP.md](SETUP.md); verification and local delivery are in [the agent workflow](docs/agent-workflow.md).

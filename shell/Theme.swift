@@ -1,5 +1,17 @@
 import AppKit
 
+@MainActor
+enum WindowPresentation {
+    static func show(_ window: NSWindow) {
+        window.collectionBehavior.remove(.canJoinAllSpaces)
+        window.collectionBehavior.formUnion([.moveToActiveSpace, .fullScreenAuxiliary])
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        NSApp.activate()
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+}
+
 /// The plate: one flat surface, hairlines instead of shadows, and a single accent spent
 /// on exactly one thing per screen.
 ///
@@ -273,7 +285,7 @@ struct Palette {
     static let ember = Palette(
         name: "Ember", note: "Warm dark, amber.",
         surface: 0x131210, ground: 0x1C1A17, ink: 0xF0ECE5, inkSoft: 0xD4CFC5,
-        muted: 0xB3ADA3, faint: 0x99938B, accent: 0xE0A533,
+        muted: 0xB3ADA3, faint: 0xAAA49B, accent: 0xE0A533,
         ok: 0x6EC28B, warn: 0x74A9DB, danger: 0xE8705C, dark: true,
         hairline: 0.13, rule: 0.30, border: 0.18, selection: 0.16)
 
@@ -282,7 +294,7 @@ struct Palette {
     static let graphite = Palette(
         name: "Graphite", note: "Neutral dark, periwinkle.",
         surface: 0x1A1A1C, ground: 0x232326, ink: 0xF2F2F4, inkSoft: 0xD6D6DA,
-        muted: 0x94949C, faint: 0x6E6E77, accent: 0x4D8DFF,
+        muted: 0xB0B0B9, faint: 0xA5A5AF, accent: 0x4D8DFF,
         ok: 0x4ADE80, warn: 0xFBBF24, danger: 0xF87171, dark: true,
         hairline: 0.13, rule: 0.30, border: 0.18, selection: 0.18)
 
@@ -290,7 +302,7 @@ struct Palette {
     static let slate = Palette(
         name: "Slate", note: "Cool dark, cyan.",
         surface: 0x0F1416, ground: 0x171E21, ink: 0xE6EDEE, inkSoft: 0xC6D0D2,
-        muted: 0x849498, faint: 0x5F6E71, accent: 0x4FD1E0,
+        muted: 0xA7B6BA, faint: 0x9BAEB2, accent: 0x4FD1E0,
         ok: 0x7BD88F, warn: 0xE0B457, danger: 0xF0776B, dark: true,
         hairline: 0.13, rule: 0.30, border: 0.18, selection: 0.16)
 
@@ -299,7 +311,7 @@ struct Palette {
     static let nocturne = Palette(
         name: "Nocturne", note: "Indigo dark, rose.",
         surface: 0x14131C, ground: 0x1D1B28, ink: 0xEDEAF5, inkSoft: 0xCFCBDE,
-        muted: 0x8F8AA3, faint: 0x6B6780, accent: 0xF07BA0,
+        muted: 0xB2ADC6, faint: 0xA9A4BC, accent: 0xF07BA0,
         ok: 0x7DD3A0, warn: 0xF3C969, danger: 0xEF6F6F, dark: true,
         hairline: 0.14, rule: 0.30, border: 0.20, selection: 0.16)
 
@@ -307,7 +319,7 @@ struct Palette {
     static let parchment = Palette(
         name: "Parchment", note: "Warm light, ink blue.",
         surface: 0xFFFFFF, ground: 0xF4F2ED, ink: 0x16150F, inkSoft: 0x33302A,
-        muted: 0x6F6B63, faint: 0x9A958C, accent: 0x1F4FD8,
+        muted: 0x625E57, faint: 0x68635B, accent: 0x1F4FD8,
         ok: 0x1A7F37, warn: 0x9A6700, danger: 0xB42318, dark: false,
         hairline: 0.11, rule: 0.30, border: 0.15, selection: 0.09)
 
@@ -315,7 +327,7 @@ struct Palette {
     static let coolPaper = Palette(
         name: "Cool paper", note: "Cool light, vermilion.",
         surface: 0xFFFFFF, ground: 0xF1F3F5, ink: 0x111315, inkSoft: 0x2E3338,
-        muted: 0x69707A, faint: 0x99A1AB, accent: 0xE2552F,
+        muted: 0x59606A, faint: 0x606771, accent: 0xE2552F,
         ok: 0x0E7C4A, warn: 0x9A6700, danger: 0xC0341B, dark: false,
         hairline: 0.11, rule: 0.30, border: 0.15, selection: 0.10)
 

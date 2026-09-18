@@ -2,11 +2,11 @@
 # Releases Blindspot in one command. Run it yourself, from main:
 #
 #   scripts/release.sh           the Makefile VERSION if it has no tag yet, otherwise the next patch
-#   scripts/release.sh minor     0.2.8 → 0.3.0 (also: patch, major)
+#   scripts/release.sh minor     next minor version (also: patch, major)
 #   scripts/release.sh 1.0.0     an exact version
 #
 # It sets VERSION, adds release notes to docs/new-features.md from the commit messages when the
-# guide has none for that version, runs the checks CI runs, and asks once before it commits,
+# guide has none for that version, runs local preflight checks, and asks once before it commits,
 # tags and pushes. The Release workflow then builds and publishes the GitHub release; this
 # script follows the run and prints the release link.
 #
@@ -107,7 +107,7 @@ python3 scripts/release-notes.py "$guide" "$version" >/dev/null
 
 if [[ $checks == 1 ]]; then
     echo
-    echo "Running the checks CI runs (skip with --no-checks)…"
+    echo "Running local preflight checks (skip with --no-checks)…"
     make check-header check test test-actions
 fi
 

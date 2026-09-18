@@ -1,12 +1,14 @@
-# Blindspot 0.3.1 — quick start
+# Search inside files with Blindspot
 
-> **0.3.1 uses your existing index.** No rebuild is needed. It adds file diagnostics, richer passage previews and ⌘W for Settings.
-
-For future local builds, run `make install` from the repository root. It builds, signs and installs the app. `scripts/release.sh` handles the release workflow; running `scripts/install.sh` directly requires an already complete, freshly signed bundle.
+Start with [installation and onboarding](quick-start.md) if this is your first launch.
+Existing installations retain their index and chosen folders; a normal update does not require
+a rebuild. This guide covers the current search workflow.
 
 ## 1. Choose what Blindspot can search
 
-Open Blindspot and press **⌘,** for Settings, then select **Content**.
+For guided setup, open **Set up Blindspot… → Document search** and choose folders, then
+**Start indexing**. For detailed controls, press **⌘,** for Settings and select **Content**;
+ensure content indexing is enabled before requesting a scan.
 
 - Add the folders containing your documents and notes. Start with specific folders, not your entire home directory.
 - Enable **Index PDF and Office documents** for PDF, Word, RTF, ODT, PowerPoint (`.pptx`) and Excel (`.xlsx`) text.
@@ -46,6 +48,7 @@ Select a result with **↑ / ↓**.
 - **⌘Y:** read the full stored passage with source location and query-word highlights. Use **← / →** buttons or **⌘[ / ⌘]** for previous/next passage results, including other files.
 - **View document:** switch from the passage reader to the PDF page preview or whole-file Quick Look.
 - **Escape / ⌘Y / ⌘W:** close the passage reader and return to your search.
+- **⌘K → Why this result?:** see the recorded word, meaning or blended evidence and freshness status.
 - **⌘K → Copy Passage:** copy the stored passage, not just the short preview text.
 - **⌘K → Ask About This Passage…:** ask local AI about that passage.
 - **⌘K → Open at Line N:** jump to a code line where a supported editor is available.
@@ -64,7 +67,10 @@ Type this and press **Return**:
 
 Blindspot retrieves passages and gives them to your local question model. Read the numbered sources to check the answer.
 
-This requires an available local Ollama question model, selected in **Settings → AI** (formerly Agent). The question model and **Content → Embedding model** do different jobs. Blindspot does not automatically download either.
+This requires an installed local Ollama question model. **Set up Blindspot → Local AI** guides
+installation, suggests a model for your Mac, and offers an explicitly confirmed download/test.
+**Settings → AI** holds the advanced choices. The question model and **Content → Embedding model**
+do different jobs; neither is silently downloaded.
 
 ## 5. Read the Index dashboard
 

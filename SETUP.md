@@ -1,146 +1,75 @@
-# blindspot — Claude Code setup
+# Build and work on Blindspot
 
-Do these in order. Each step is independently useful; stop wherever you've had enough.
+For the downloaded app, start with [the installation and onboarding guide](docs/quick-start.md).
+This page is for contributors working in the existing repository; no project scaffolding or
+agent-specific configuration is required.
 
----
+## Prerequisites
 
-## Step 1 — Repo skeleton
+- An Apple silicon Mac running macOS 26 or later.
+- Xcode 26 with its command-line tools selected. CI's exact toolchain pins live in
+  [.github/workflows/ci.yml](.github/workflows/ci.yml).
+- Rust/Cargo and `cbindgen` (`cargo install cbindgen --version 0.29.4 --locked`).
+- A Developer ID identity for stable local signing, or explicit ad-hoc signing for a personal build.
 
-```bash
-mkdir -p blindspot && cd blindspot
-git init
-mkdir -p core/src shell include .claude/hooks .claude/rules .claude/skills .claude/agents
-cargo init --lib core --name blindspot_core
+```sh
+git clone https://github.com/SeifBoukerdenna/blindspot.git
+cd blindspot
+make agent-context
+make app
 ```
 
-In `core/Cargo.toml`:
+The Makefile builds the Rust workspace library and Swift shell directly; there is no Xcode
+project. Dependencies are locked in Cargo.lock and the vector helper's own lockfile.
 
-```toml
-[lib]
-crate-type = ["staticlib", "rlib"]
+## Install a personal build
+
+```sh
+make install SIGN_ID=-
 ```
 
-The `rlib` matters — without it you can't write unit tests or benches against the crate.
+This builds, signs ad hoc, installs to `~/Applications/Blindspot.app`, and opens the app.
+Ad-hoc signatures can cause macOS permissions to be requested again after rebuilding.
+With your own identity, use `SIGN_ID="Developer ID Application: …"` instead. The repository's
+default identity is configured in Makefile; it must exist in your keychain to use `make install`
+without an override. Signing disables timestamps; builds are not notarized.
 
-Drop `CLAUDE.md` at the repo root (the one from earlier).
+First launch guides the shortcut and optional document, clipboard, Accessibility and Ollama
+setup. These features are not prerequisites for compiling or launching the app.
 
----
+## Make and verify changes
 
-## Step 2 — Copy in the `.claude/` directory
+Read [AGENTS.md](AGENTS.md) and the relevant [source map](docs/agent-map.md) section.
+Preserve existing working-tree edits and user data. Tests use disposable fixtures; never repair,
+rebuild or erase a live index as a way to make a test pass.
 
-Everything in this bundle goes at the repo root. Then:
-
-```bash
-chmod +x .claude/hooks/*.sh
+```sh
+make agent-check PLAN=1
+make agent-check
 ```
 
-Commit `.claude/settings.json`, the rules, skills, and agents. Anything machine-specific
-goes in `.claude/settings.local.json`, which stays out of git.
+The helper chooses checks from changed paths. Focused targets include `test-onboarding`,
+`test-containers`, `test-actions`, `smoke-panel`, and the search/helper checks in the source map.
+Native UI fixtures need a logged-in macOS session; loopback fixtures need local socket access.
+Scale/stress benchmarks are separate and are not routine validation.
 
-Restart your session after adding agent files — subagents load at session start.
+For a maintainer app-code delivery with an existing signed installation, use:
 
----
-
-## Step 3 — Verify the hooks actually fire
-
-Don't trust that config works. Test it:
-
-```bash
-echo '{"tool_input":{"command":"git push --force origin main"}}' | bash .claude/hooks/guard-bash.sh; echo "exit=$?"
-# expect: BLOCKED on stderr, exit=2
-
-echo '{"tool_input":{"command":"cargo build"}}' | bash .claude/hooks/guard-bash.sh; echo "exit=$?"
-# expect: exit=0
+```sh
+make agent-deliver PLAN=1
+make agent-deliver
 ```
 
-Exit code 2 blocks the tool call and feeds your stderr message back to Claude, so the
-wording of the block message matters — it's an instruction Claude will read and act on.
+This performs full verification, signing, packaging, a verified rollback archive, installation,
+and installed-state checks. It does not bump the version or publish. See the
+[delivery workflow](docs/agent-workflow.md) for requirements and recovery.
 
-Then in a session, run `/hooks` to confirm Claude Code registered them.
+## Optional tools and publication
 
----
+Codex CLI/IDE, Claude Code, and ordinary editors all use the same repository instructions.
+[CLAUDE.md](CLAUDE.md) points to the shared agreement; optional hooks are reminders, not a
+substitute for checks. No global agent configuration, hook trust or plugin setup is required.
 
-## Step 4 — Understand what you just installed
-
-**`guard-bash.sh`** (PreToolUse on Bash) blocks force pushes, hard resets, recursive
-deletes, `tccutil reset`, and any attempt to touch Spotlight's hotkey binding. That last
-one is the interesting case: your CLAUDE.md says the Cmd+Space unbind is a manual user
-step, but an instruction in CLAUDE.md is a request, not a guarantee. The hook is the
-guarantee.
-
-**`guard-paths.sh`** (PreToolUse on writes) blocks `.env`, signing material, build
-artifacts, and the cbindgen-generated header.
-
-**`rust-check.sh`** (PostToolUse on writes) formats the file and runs clippy with
-warnings as errors. On failure it exits 2, so the errors land back in Claude's context
-and it fixes them before moving on instead of at the end of a twenty-file change. It
-greps to the first 40 diagnostic lines — an unbounded dump would be worse than nothing.
-
-**`swift-check.sh`** does a `swiftc -parse` syntax gate only. A full `xcodebuild` on
-every edit would be far too slow for a per-edit hook.
-
-**`.claude/rules/ffi.md`** and **`appkit.md`** are path-scoped, so they only load when
-Claude opens matching files. That keeps CLAUDE.md short while still putting the
-memory-safety rules in front of Claude at exactly the moment it edits `ffi.rs`.
-
-**`/bench`** is set `disable-model-invocation: true` — it costs zero context and only
-you can fire it. Correct setting for anything with side effects or that you want to
-control the timing of.
-
-**`macos-researcher`** has read and search tools only, no write access. It burns
-context reading Apple docs in an isolated window and hands back a short answer.
-
----
-
-## Step 5 — Working rhythm
-
-The config is maybe a third of the value. The loop is the rest.
-
-**Plan before executing anything nontrivial.** Enter plan mode, read the plan yourself,
-approve it, then let it run. The failure mode of agentic coding isn't bad syntax — it's
-confidently correct code built on a wrong premise, and the plan is the only cheap place
-to catch that.
-
-**Delegate the reading, keep the writing.** `Ask macos-researcher what collection
-behavior flags I need for a panel that shows over fullscreen apps` costs you three lines
-of context instead of forty pages of docs.
-
-**One milestone per session.** Your CLAUDE.md has M1–M5 for a reason. Start a fresh
-session at each boundary rather than letting one context window sprawl across the whole
-project.
-
-**Run `/context` when things feel off.** Skill descriptions and MCP tool names load
-every request; if Claude starts forgetting your conventions, context pressure is the
-usual cause before capability is.
-
----
-
-## Step 6 — Add later, when triggered
-
-Don't build these now. Add each when the specific trigger fires.
-
-| Trigger | Add |
-| --- | --- |
-| You've typed the same prompt three times | A skill |
-| M4 arrives and you're auditing the whole index for correctness | A dynamic workflow (`/config` to enable on Pro) |
-| Rust core and Swift shell are both big enough to work on independently | Two sessions in separate git worktrees |
-| You start a second Rust+Swift project | Package this `.claude/` as a plugin |
-
-A dynamic workflow is worth it specifically because the script can have independent
-agents cross-check each other's findings before you see them — that's a quality
-mechanism, not just parallelism. Overkill for M1.
-
----
-
-## Step 7 — First real prompt
-
-Once it's wired up, open a session and start with something that exercises the whole
-setup:
-
-> Read CLAUDE.md. Plan M1 only — global hotkey, panel, fuzzy match over /Applications,
-> Enter to launch. Don't write code yet. Flag anything in the plan where you're
-> guessing at an AppKit API rather than knowing it, and delegate those to
-> macos-researcher before we start.
-
-That last sentence is the one that matters. It converts the model's uncertainty into
-research instead of into plausible-looking wrong code.
+[Media capture](media/README.md#capture-new-media) uses fictional data in an isolated home.
+[Release instructions](docs/releasing.md) describe the user-run `./scripts/release.sh` command.
+Commit and push the complete feature work, including new source files, before publishing.

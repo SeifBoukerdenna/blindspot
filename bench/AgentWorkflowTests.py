@@ -43,7 +43,8 @@ def archive_app(path, bundle, prefix=""):
             if source.is_file():
                 archive.write(source, prefix + str(source.relative_to(bundle.parent)))
         if prefix:
-            archive.writestr(prefix + "START-HERE.md", "fixture guide")
+            archive.writestr(prefix + "START-HERE.md", "fixture quick start")
+            archive.writestr(prefix + "FEATURE-GUIDE.md", "fixture guide")
 
 
 class Fixture(unittest.TestCase):
@@ -269,6 +270,16 @@ class DeliveryTests(Fixture):
         with zipfile.ZipFile(archive, "w") as stream:
             stream.writestr("Blindspot-0.3.2/../escape", "bad")
         with self.assertRaisesRegex(RuntimeError, "archive path"):
+            delivery.verify_archive(archive, "0.3.2")
+
+    def test_missing_full_guide_refuses_archive(self):
+        bundle = self.root / "fixture/Blindspot.app"
+        app(bundle, "0.3.2")
+        archive = self.directory / "missing-guide.zip"
+        with zipfile.ZipFile(archive, "w") as stream:
+            stream.write(bundle / "Contents/Info.plist", "Blindspot-0.3.2/Blindspot.app/Contents/Info.plist")
+            stream.writestr("Blindspot-0.3.2/START-HERE.md", "quick start")
+        with self.assertRaisesRegex(RuntimeError, "FEATURE-GUIDE"):
             delivery.verify_archive(archive, "0.3.2")
 
     def test_symlinked_delivery_lock_refused(self):

@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let owner = AppDelegate()
 
     private var core: Core?
+    private var onboarding: Onboarding?
     private var panel: Panel?
     private var hotKey: HotKey?
     /// The optional second hotkey, which opens the agent directly.
@@ -65,6 +66,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if quitIfDuplicate() { return }
+        let setup: (SetupStore, SetupRecord, Bool)
+        do {
+            setup = try SetupStore.prepare(home: ProcessInfo.processInfo.environment["HOME"])
+        } catch {
+            die("Blindspot could not prepare setup.", "Your existing data was preserved. " + error.localizedDescription)
+            return
+        }
         guard let core = Core() else {
             die(
                 "blindspot could not start.",
@@ -99,9 +107,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.applySettings()
         }
         window.onChange = { [weak self] in self?.applySettings() }
+        window.onSetup = { [weak self] in self?.openSetup() }
         window.onPalette = { [weak self] in self?.rebuildPanel() }
         settingsWindow = window
+        let onboarding = Onboarding(core: core, store: setup.0, record: setup.1)
+        onboarding.onChange = { [weak self] in self?.applySettings() }
+        onboarding.onOpen = { [weak self] in self?.panel?.show() }
+        onboarding.onSettings = { [weak self] key in self?.settingsWindow?.show(settingKey: key) }
+        self.onboarding = onboarding
         statusItem = StatusItem(
+            onOpen: { [weak self] in self?.panel?.show() },
+            onSetup: { [weak self] in self?.openSetup() },
+            onRestartSetup: { [weak self] in
+                self?.onboarding?.navigate(.welcome)
+                self?.openSetup()
+            },
             onSettings: { [weak self] in self?.openSettings() },
             onReindex: { [weak core] in core?.reindex(); core?.refreshContent() })
 
@@ -113,7 +133,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // `[weak self]`, not `[weak panel]`: this closure outlives any one panel, and
             // a palette change rebuilds it. Capturing the object would leave the hotkey
             // firing at a window that is no longer on screen.
-        ) { [weak self] in self?.panel?.toggle() }
+        ) { [weak self] in
+            self?.onboarding?.receivedShortcut()
+            self?.panel?.toggle()
+        }
         self.hotKey = hotKey
 
         let wantsCommandSpace =
@@ -182,6 +205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        if setup.2 { onboarding.show() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -289,6 +313,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// No target on the menu item, so this is reached through the responder chain — which
     /// is what lets it work while the panel is up, since the panel hands an unrecognised
     /// ⌘ chord to `super` and `super` walks the main menu.
+    @objc func openSetup() {
+        panel?.standDown()
+        onboarding?.show()
+    }
+
     @objc func openSettings() {
         // Before the window activates, not after: the panel tears itself down from
         // `windowDidResignKey`, and letting the two race is how a window ends up behind

@@ -1,5 +1,9 @@
 # Blindspot 0.3.1
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 ## What's new
 
 - **Check a file…** in Settings → Index → Diagnostics explains why a selected file may be missing from content search, with relevant settings links.

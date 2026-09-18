@@ -2,7 +2,10 @@
 
 Screenshots and recordings of Blindspot's native macOS interface. These captures use
 fictional Northwind documents, demo clipboard entries and saved snippets in an isolated
-demo home. They were captured on September 15, 2026, with the repository at version 0.2.8.
+demo home. Refreshed September 18, 2026 from the working tree preparing the 0.3.3 release
+(the build version remained 0.3.2). Onboarding and container scenes use synthetic UI fixtures;
+they do not query personal configuration or operate on real workloads. The document-answer
+scene uses an already installed local Ollama model against the fictional demo index.
 
 [Back to the project](../README.md) · [Feature guide](../docs/new-features.md) ·
 [Screenshots](#screenshots) · [Recordings](#recordings) · [Capture new media](#capture-new-media)
@@ -10,6 +13,38 @@ demo home. They were captured on September 15, 2026, with the repository at vers
 ## Screenshots
 
 The PNGs below are still images. Click any image to open the original at full resolution.
+
+### Guided local AI setup
+
+The native guide suggests a model from the Mac's memory, offers an installed model or an
+explicit download, and provides a local response test. This scene supplies an Apple M3 / 16 GB
+hardware fixture and a synthetic connected state; it is not a download or performance measurement.
+
+[![Native local AI setup with model recommendations and optional download controls](onboarding-ai.png)](onboarding-ai.png)
+
+### Container workspace
+
+Open `:containers`, `:docker` or `:podman`. The workspace separates local images from container
+instances and keeps Overview, Resources, Logs and Events within reach. It stays open until closed;
+Keep on top controls stacking. This screenshot's engine, identity and metadata are demo fixtures.
+
+[![Glass container window with overview metadata and lifecycle controls](containers.png)](containers.png)
+
+### Reviewed container creation
+
+Choose an installed image and configure environment, mounts, resource limits and restart policy.
+Review masks values and identifies file versus inline overrides. This synthetic review was
+cancelled; no container was created and no runtime was contacted.
+
+[![Container creation review with masked environment values, resource limits and a named volume](container-create.png)](container-create.png)
+
+### Container logs
+
+Read or follow bounded logs, search loaded output, and copy/export all or filtered output.
+Paused/disconnected/truncated status makes gaps explicit. The example below is synthetic paused
+output, not evidence of a live connection or completed export.
+
+[![Container Logs tab with timestamped demo output and search, follow and export controls](container-logs.png)](container-logs.png)
 
 ### Search inside documents
 
@@ -54,7 +89,8 @@ answers in one unit you name.
 
 ### Command catalog
 
-Type `:` to discover available commands and their descriptions.
+Type `:` for recently invoked commands first, followed by the catalog; `:help` shows the full
+registry order. The isolated capture starts with empty command history.
 
 [![Command catalog with content search and process commands](commands.png)](commands.png)
 
@@ -72,7 +108,7 @@ Type `!` to find a saved snippet, or use its name directly, such as `!sig`.
 
 ### Ask your documents
 
-`>docs When is the Northwind renewal due?` answered by the local model (qwen3.5 4B through
+`>docs When is the Northwind renewal due?` answered by the local model (`qwen3.5:4b-mlx` through
 Ollama) from the demo documents: "October 31, 2026", citing the renewal proposal, with the
 retrieved sources listed below the answer. It is one example, not a retrieval-quality benchmark.
 
@@ -114,9 +150,14 @@ Run from the repository root:
 make media
 ```
 
+To retake specific scenes, use `MEDIA_ONLY=onboarding-ai,containers make media`. The `containers`
+scene writes overview, logs and creation-review images together. Other scene names match their
+asset filenames. This retains existing assets for scenes not selected.
+
 The capture workflow needs Screen Recording permission for the terminal, `ffmpeg`, and
 the normal build tools. The AI scene also needs Ollama running with the configured local
-model; the script skips that scene if the model is unavailable. `MEDIA_MODEL` selects an
+model; the script skips that scene if the model is unavailable (and leaves any older asset untouched,
+so do not describe it as newly captured). `MEDIA_MODEL` selects an
 already installed model, and `MEDIA_OUT` selects an output directory relative to the repo.
 
 The script creates and removes `/Users/Shared/Demo`, and refuses to start if that path

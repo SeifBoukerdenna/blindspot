@@ -12,7 +12,7 @@ final class StatusItem {
     /// item silently disappears from the menu bar.
     private let item: NSStatusItem
 
-    init(onSettings: @escaping () -> Void, onReindex: @escaping () -> Void) {
+    init(onOpen: @escaping () -> Void = {}, onSetup: @escaping () -> Void = {}, onRestartSetup: @escaping () -> Void = {}, onSettings: @escaping () -> Void, onReindex: @escaping () -> Void) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // The command glyph rather than a magnifying glass: this is a hotkey launcher, and
         // a magnifying glass in the menu bar is Spotlight's.
@@ -21,13 +21,17 @@ final class StatusItem {
         item.button?.image?.isTemplate = true
 
         let menu = NSMenu()
+        let open = NSMenuItem(title: "Open Blindspot", action: #selector(Actions.open), keyEquivalent: "")
+        let containers = NSMenuItem(title: "Containers…", action: #selector(Actions.containers), keyEquivalent: "")
+        let setup = NSMenuItem(title: "Set up Blindspot…", action: #selector(Actions.setup), keyEquivalent: "")
+        let restartSetup = NSMenuItem(title: "Restart onboarding…", action: #selector(Actions.restartSetup), keyEquivalent: "")
         let settings = NSMenuItem(
             title: "Settings…", action: #selector(Actions.settings), keyEquivalent: ",")
         let reindex = NSMenuItem(
             title: "Reindex now", action: #selector(Actions.reindex), keyEquivalent: "")
-        let actions = Actions(onSettings: onSettings, onReindex: onReindex)
+        let actions = Actions(onOpen: onOpen, onSetup: onSetup, onRestartSetup: onRestartSetup, onSettings: onSettings, onReindex: onReindex)
         self.actions = actions
-        for entry in [settings, reindex] {
+        for entry in [open, containers, setup, restartSetup, settings, reindex] {
             entry.target = actions
             menu.addItem(entry)
         }
@@ -45,14 +49,24 @@ final class StatusItem {
 
     @MainActor
     private final class Actions: NSObject {
+        private let onOpen: () -> Void
+        private let onSetup: () -> Void
+        private let onRestartSetup: () -> Void
         private let onSettings: () -> Void
         private let onReindex: () -> Void
 
-        init(onSettings: @escaping () -> Void, onReindex: @escaping () -> Void) {
+        init(onOpen: @escaping () -> Void = {}, onSetup: @escaping () -> Void = {}, onRestartSetup: @escaping () -> Void = {}, onSettings: @escaping () -> Void, onReindex: @escaping () -> Void) {
+            self.onOpen = onOpen
+            self.onSetup = onSetup
+            self.onRestartSetup = onRestartSetup
             self.onSettings = onSettings
             self.onReindex = onReindex
         }
 
+        @objc func open() { onOpen() }
+        @objc func containers() { ContainerWindow.shared.show() }
+        @objc func setup() { onSetup() }
+        @objc func restartSetup() { onRestartSetup() }
         @objc func settings() { onSettings() }
         @objc func reindex() { onReindex() }
     }

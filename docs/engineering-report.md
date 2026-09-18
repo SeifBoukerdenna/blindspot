@@ -1,5 +1,9 @@
 # Engineering report — 2026-09-13
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 This is a validated foundational iteration, **not completion of the full product roadmap**.
 Existing uncommitted work was preserved. No production installation or user database was migrated.
 

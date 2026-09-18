@@ -1,5 +1,9 @@
 # Local content index: implementation and measurements
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 This is an internal implementation note. The opt-in storage/scanner now runs through
 background workers, live Content settings and launcher search. Validation uses synthetic
 fixtures; this work has not enabled indexing of personal files. Existing Spotlight

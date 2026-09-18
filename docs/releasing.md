@@ -1,93 +1,111 @@
 # Continuous integration and releases
 
-Releases go to GitHub Releases only. Nothing is sent to Apple, and nothing is committed, tagged
-or pushed unless you run `scripts/release.sh` and answer yes.
+GitHub Releases is the publication channel. Builds are not notarized and signing uses
+`--timestamp=none`. The user owns commits, pushes, tags, signing secrets and publication.
+The release entry point is **`./scripts/release.sh` from the repository root**; there is no
+root-level `./release.sh`.
 
-| Workflow | When it runs | What it does |
-|---|---|---|
-| **CI** (`.github/workflows/ci.yml`) | Every push to `main` and every pull request | Checks the C header, runs clippy and every core test, then builds the app and runs the action, content-watcher, helper and panel smoke tests. The built zip is kept with the run for 7 days. |
-| **Release** (`.github/workflows/release.yml`) | A pushed `vX.Y.Z` tag | Checks that the tag matches the Makefile `VERSION` and is on `main`, runs the tests, builds and signs the app, and **publishes** the release with the zip, the cheatsheet and SHA-256 checksums. |
+## Prepare and publish
 
-Both use GitHub's `macos-26` Apple silicon runners with Xcode 26.6 and Rust 1.95.0, like this Mac.
-No setup is required.
-
-## Release a version
-
-```sh
-scripts/release.sh
-```
-
-That's all. The script:
-
-1. **Picks the version.** If the Makefile `VERSION` has no tag yet it uses that (so the first run
-   releases 0.2.8); otherwise it bumps the patch number. You can also pass `minor`, `major` or an
-   exact version such as `1.0.0`.
-2. **Adds release notes when there are none.** It writes a `**X.Y.Z changes**` list into
-   `docs/new-features.md` from your commit messages since the last release, and offers to open it
-   for editing.
-3. **Runs the checks CI runs:** header, clippy, tests and action tests.
-4. **Asks once**, then commits `Release X.Y.Z`, tags `vX.Y.Z` and pushes both.
-5. **Follows the GitHub run** and prints the link to the published release.
-
-Options:
-
-- `--yes`: no questions.
-- `--no-checks`: skip step 3.
-- `--no-watch`: stop after pushing.
-
-If a check fails, fix it and run the script again: its own edits to the Makefile and guide are kept.
-
-## Try a build on this Mac first
-
-```sh
-make install
-```
-
-This builds and signs the app, replaces `~/Applications/Blindspot.app`, and relaunches it. Only one
-copy is kept on disk.
-
-## Opening a downloaded release
-
-The app is not notarized, so macOS blocks the first launch of a downloaded copy. The release notes
-tell people to open **System Settings → Privacy & Security** and click **Open Anyway**, once, or to run
-`xattr -dr com.apple.quarantine /Applications/Blindspot.app`. Builds you make with `make install`
-are not affected.
-
-## In-app updates
-
-Settings → Status → Updates installs the latest release (shell/Updater.swift). It depends on what
-the Release workflow publishes, so keep these as they are:
-
-- **Tags:** `vX.Y.Z`, published as a normal release (drafts and prereleases are ignored).
-- **Asset names:** `Blindspot-X.Y.Z.zip` holding `Blindspot-X.Y.Z/Blindspot.app`, and
-  `Blindspot-X.Y.Z-SHA256SUMS.txt`.
-- **Repository:** `RELEASE_REPO` in the Makefile, written into Info.plist. A fork sets its own.
-
-Without the Developer ID secret below, releases are signed ad hoc. The updater then warns before
-installing, because macOS treats each update as a new app for permissions.
-
-## Optional: keep permissions across updates
-
-By default the Release workflow signs ad hoc. That works, but the signature changes with every
-build, so after each update macOS asks again for Accessibility and other permissions. To sign
-releases with your Developer ID instead:
-
-1. In Keychain Access, select **Developer ID Application: seif boukerdenna (VZR89A8Z89)** together with
-   its private key, choose **File → Export Items…**, and save `DeveloperID.p12` with a password.
-2. Add it to GitHub, then delete the file:
+1. Review the working tree, including untracked files. Commit the complete feature and
+   documentation changes on `main`, then push `main` to origin. New Swift files, fixtures,
+   guides and media must be included; the release script only stages Makefile and release notes.
+2. Check [the feature guide's release notes](new-features.md#14-privacy-limitations-and-release-notes).
+   The release script reuses a matching `**X.Y.Z changes**` entry; otherwise it drafts one from
+   commit subjects and offers to open it for editing. Review generated notes for user-facing accuracy.
+3. Run:
 
    ```sh
-   base64 -i DeveloperID.p12 | gh secret set MACOS_CERTIFICATE_P12_BASE64 --repo SeifBoukerdenna/blindspot
-   gh secret set MACOS_CERTIFICATE_PASSWORD --repo SeifBoukerdenna/blindspot
-   rm DeveloperID.p12
+   ./scripts/release.sh
    ```
 
-The next release picks it up automatically. This uses only your certificate and does not contact Apple.
+The script fetches tags and checks that local `main` equals `origin/main`. If the Makefile version
+is untagged it uses that version; otherwise it selects the next patch. `minor`, `major`, `patch`
+or an explicit version such as `1.0.0` can be passed instead. It updates Makefile and the guide's
+release header, validates the notes, and runs `make check-header check test test-actions`.
+These are local preflight checks, not the entire CI/native verification suite.
 
-## If something fails
+After confirmation it commits the version/notes if needed, creates the annotated version tag,
+and atomically pushes `main` and the tag. The GitHub Release workflow builds the tagged source
+and publishes the app. If `gh` is installed and authenticated, the script follows the run and
+prints the release URL. It does **not** rebuild or reinstall your local app.
 
-| Problem | Fix |
-|---|---|
-| The release run failed | Run `gh run view --log-failed` to see why. Fix and push to `main`, then delete the tag (`git push --delete origin vX.Y.Z && git tag -d vX.Y.Z`) and run `scripts/release.sh X.Y.Z` again. |
-| Tag does not match VERSION | Only happens with tags made by hand; `scripts/release.sh` always keeps them in step. |
-| A release for the tag already exists | Delete it on the Releases page, then re-run the workflow from the Actions tab. |
+Options: `--yes` answers the publication confirmation automatically, `--no-checks` skips local
+preflight, and `--no-watch` returns after pushing. The default interactive path is recommended.
+A failed run keeps its version/notes edits so they can be inspected and retried.
+
+## Workflows and artifacts
+
+| Workflow | Trigger | Verification and output |
+|---|---|---|
+| [CI](../.github/workflows/ci.yml) | Push to `main`, pull request, or manual dispatch | Tooling lint/fixtures, header/clippy/core/retrieval tests, ad-hoc app build, action/updater/content/semantic/vector checks and panel smoke tests (including onboarding and containers); app ZIP retained for 7 days |
+| [Release](../.github/workflows/release.yml) | Push of a `vX.Y.Z` tag | Tag/version/main-ancestry and notes checks, tooling/core/native checks, signing and packaging, then publication of ZIP, cheatsheet and checksums |
+
+Exact runner and compiler pins belong to the workflow files. Both use macOS arm64 runners.
+Release uploads:
+
+- `Blindspot-X.Y.Z.zip`, containing `Blindspot-X.Y.Z/Blindspot.app`, `START-HERE.md` and `FEATURE-GUIDE.md`.
+- `Blindspot-X.Y.Z-Cheatsheet.md`, the full feature guide as a standalone download.
+- `Blindspot-X.Y.Z-SHA256SUMS.txt`, checksums for the ZIP and cheatsheet.
+
+Download both named assets before checking the entire checksum file with
+`shasum -a 256 -c Blindspot-X.Y.Z-SHA256SUMS.txt`.
+
+## Verify a local build first
+
+For the complete maintainer delivery workflow with an existing Developer ID installation:
+
+```sh
+make agent-deliver PLAN=1
+make agent-deliver
+```
+
+This performs fresh release checks, signs, packages, verifies a rollback archive, installs,
+and checks the installed version/process/signature plus preservation of local state. Reports
+and rollback paths are printed under `build/agent/`. It does not publish or choose a new version.
+See [agent-workflow.md](agent-workflow.md).
+
+For a personal developer installation, `make install SIGN_ID=-` builds/signs ad hoc and installs
+without that full verification/rollback workflow. Use your own Developer ID for a stable signature.
+
+## Downloaded apps and updates
+
+Follow [quick-start.md](quick-start.md) for the non-notarized first launch and optional onboarding.
+Use **System Settings → Privacy & Security → Open Anyway** if macOS blocks a trusted release.
+New installations choose indexing, clipboard and model setup; upgrades preserve existing choices.
+
+**Settings → About → Updates** uses [shell/Updater.swift](../shell/Updater.swift). Preserve:
+
+- Normal published `vX.Y.Z` releases; drafts and prereleases are ignored.
+- The ZIP structure and checksum filenames above.
+- Makefile's `RELEASE_REPO`, written into Info.plist; forks set their own repository.
+- A writable installation directory, such as `~/Applications`.
+
+## Signing on GitHub
+
+The workflow uses a Developer ID certificate when its secrets are configured; otherwise it
+signs ad hoc. Ad-hoc identity changes can prompt for macOS permissions again after an update.
+The updater warns about that signing mode. Local delivery requires the existing stable identity.
+
+A maintainer can export their Developer ID Application certificate and private key as a
+password-protected P12 from Keychain Access, then configure these repository secrets:
+
+- `MACOS_CERTIFICATE_P12_BASE64`: base64-encoded P12.
+- `MACOS_CERTIFICATE_PASSWORD`: the P12 password.
+
+Keep that material outside the repository and remove temporary exports after setup. The workflow
+imports it into a temporary keychain and cleans up afterward. Configuring secrets is a user-run
+administrative step, not a prerequisite for an ad-hoc fork build. No notarization is performed.
+
+## Recovery
+
+- **Local preflight fails:** fix the cause, review retained version/notes changes and rerun.
+- **Atomic push fails:** the local release commit/tag may exist. Inspect them before following
+  the script's printed retry command; do not blindly create another tag.
+- **GitHub build fails:** inspect `gh run view --log-failed` or the Actions page. Retry a transient
+  failed job on the same commit. For a code fix, commit it on `main` and publish a new version;
+  do not rewrite an already published release tag.
+- **Tag/version mismatch:** compare the tagged Makefile with the tag. The release script keeps
+  these aligned; hand-created tags can bypass that check.
+- **Local installed build needs rollback:** use the archive recorded by `make agent-deliver`
+  and the recovery instructions in [agent-workflow.md](agent-workflow.md).

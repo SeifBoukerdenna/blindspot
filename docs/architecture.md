@@ -1,70 +1,65 @@
-# Command layer engineering map
+# Blindspot architecture
 
-## Source baseline (2026-09-13)
+Blindspot is a local macOS launcher with a Rust workspace static library and a Swift 6 shell
+using AppKit and SwiftUI. [Makefile](../Makefile) owns the version, arm64 macOS deployment target,
+compiler flags, helpers, signing and packaging. There is no Xcode project.
 
-The application is Rust (static library and testable rlib) plus Swift 6/AppKit,
-built directly with Cargo, cbindgen and swiftc. It targets arm64 macOS 26.
-There is no application sandbox entitlement or XPC service. The existing working
-tree contains user changes; this iteration builds on them without resetting them.
+## Native shell and Rust core
 
-Dependency direction: AppDelegate → Panel/ResultsView → Bridge → C ABI (ffi.rs)
-→ independent core providers. Rust allocates/frees all ABI buffers. AppKit owns
-activation, Carbon hotkeys, focus restoration, Quick Look, pasteboard and Vision.
+`AppDelegate` prepares first-run settings before initializing `Core`, owns app lifecycle and
+installs the menu bar/global shortcuts. `Panel` and `ResultsView` provide the launcher and pooled
+result rows. `Bridge.swift` translates the generated C ABI from `core/src/ffi.rs` and `ffi/`.
+Rust owns its ABI allocations and matching free functions; the shell owns native windows,
+keyboard focus, previews and OS interaction. Expensive queries and process work stay off the UI
+thread, with cancellation and stale-result guards.
 
-| Subsystem | Owner and behavior | Constraint / risk |
+| Area | Owners | Behavior |
 |---|---|---|
-| Query routing | ffi.rs, prefix modes, calculator/tools | Provider composition lives in the ABI implementation |
-| Apps | index/apps.rs, depth-limited plist scan; Arc snapshots | Initial scan synchronous; rescan background/throttled |
-| Matching | match.rs, reusable nucleo scratch | Full candidate sort and retained capacity; linear scan |
-| Ranking | relevance.rs, frecency.rs, usage.rs | Deliberate lexicographic file policy; bounded frequency boost |
-| Files | files.rs, Spotlight mdfind, 500 retained / 20K read | Line format ambiguous for newline filenames; caller waits during cancellation |
-| Recents | recent.rs, cached Spotlight query | Whole subprocess output buffered before truncation |
-| Persistence | store.rs/redb visits; clips.rs/redb metadata and blobs | Corrupt stores preserved, session fallback; no content/embedding index |
-| Clipboard | ClipboardWatcher, ImageClip, Clips | Sensitive markers excluded; detached encoding can accumulate; clear/add ordering needs audit |
-| Settings | settings.rs layered TOML; Settings.swift | User config is never overwritten; overrides separate; no system-settings search provider found |
-| Ports | ports.rs lsof fields and ps executable resolution | Superseded worker can take newer child; stale cache across launcher opens |
-| AI | agent HTTP/session/history, selectable loopback Ollama | Model is external Ollama, not embedded weights; default question model Qwen 3.8 27B |
-| Execution | exec.rs lexical denylist followed by zsh -c | Confirmation does not make arbitrary interpreter execution safe |
-| UI | pooled NSTableView rows, Panel, ActionHint | Repeated refresh creates unowned poll Tasks; action switches spread across shell |
-| Privacy | loopback checks, local stores, clip markers | agent.log includes prompts and commands; history persists explicitly; open errors log paths |
-| Tests | Rust unit + mock HTTP + real redb tests, Criterion, Swift latency harness | No standard Swift XCTest target; no semantic/migration/plugin tests |
+| Query routing and ranking | `core/src/query.rs`, `commands.rs`, `match.rs`, `relevance.rs`, `ffi/` | Prefix modes, deterministic matching/ranking, provider composition |
+| Apps and filenames | `core/src/index/`, `files.rs`, `recent.rs` | App snapshots and bounded Spotlight-backed file discovery, separate from content indexing |
+| Document search | `core/src/content/`, `content_indexer.rs`, `content_service/`, `crates/retrieval/` | SQLite WAL/FTS, bounded passage extraction, word/semantic fusion and authoritative scope validation |
+| Embeddings and vectors | `core/src/semantic/`, `helpers/SemanticWorker.swift`, `helpers/vector-worker/` | Installed local embedding models, generation isolation and derived vector shards |
+| Document extraction | `helpers/ExtractWorker.swift`, `OfficeExtract.swift` | Bounded local PDF/Office/OCR work in an isolated no-network helper |
+| Local AI | `core/src/agent/`, `exec.rs`, `shell/LocalRequest.swift` | Explicit loopback Ollama requests, cited document answers and validated typed actions; no arbitrary model-generated shell execution |
+| Actions and context | `shell/Actions.swift`, `Context.swift`, `PassagePreview.swift`, `Preview.swift` | ⌘K actions, permission-aware selected text, passage reader and native previews |
+| Clipboard and saved data | `core/src/clips.rs`, `store.rs`, `shortcuts.rs`, `shell/ClipboardWatcher.swift` | Local history, pins, retention, frecency and shortcuts; sensitive pasteboard markers excluded |
+| Settings and indexing UI | `core/src/settings.rs`, `shell/Settings.swift`, `IndexDashboard.swift`, `ContentWatcher.swift` | Layered settings, FSEvents reconciliation, power policy, read-only diagnostics and explicit maintenance |
+| Onboarding | `shell/Onboarding*.swift` | Optional first-run setup, hardware-based model suggestions, explicit downloads, local verification and resumable progress |
+| Containers | `shell/Containers.swift`, `ContainerCreation.swift`, `ContainerMonitoring.swift`, `ContainerWindow.swift` | Fixed-argument Docker/Podman CLIs pinned to local Unix sockets; images, reviewed creation, lifecycle controls, inspection, monitoring and logs |
+| Native appearance and presentation | `shell/Theme.swift` | Shared transparent material/palette, accessibility fallbacks and consistent auxiliary-window activation |
+| Updates | `shell/Updater.swift` | User-triggered GitHub checks, checksum/signature verification and replacement/relaunch |
 
-Important existing abstractions to preserve: immutable index snapshots, core-owned
-allocation, deterministic relevance tiers, capped clipboard blobs, AppKit row pooling,
-prewarmed panel, explicit local AI submission, layered settings and separate stores.
+## State and privacy
 
-## Safe implementation order
+User configuration at `~/.config/blindspot/config.toml` is read, not rewritten by the app's settings
+UI. Overrides and local stores live under `~/.local/share/blindspot/`. Clipboard/frecency stores,
+the content database, embeddings and command history have separate lifecycles. Colon history
+stores registered command names, not arguments or queries.
 
-1. Baseline build, tests and existing microbenchmarks. Add reproducible synthetic scale tooling.
-2. Fix worker ownership, cancellation, bounded subprocess output and HTTP framing.
-3. Introduce validated native AI intents; retain answer streaming and confirmation UI.
-   Never pass model text to a shell. Unsupported chores must explain the limitation.
-4. Typed developer-console grammar with live, throttled snapshots and graceful failures.
-5. Typed action/provider contracts with a native keyboard action surface, then context.
-6. Opt-in content indexing only after durable job/migration/exclusion design and measured
-   retrieval needs. Preserve Spotlight fallback. Embeddings require an explicit model
-   contract (dimension/version) and evaluation corpus before claiming semantic quality.
+New installations start with indexing, clipboard capture and login startup off until chosen in
+setup. Existing installations keep their choices. Normal upgrades preserve data; migration
+failure never authorizes erasing or rebuilding a live store. Vector caches are derived data,
+with source identities/generations revalidated before returning results.
 
-No migration of existing redb files is needed for the first groups. Do not silently
-recreate corrupt files. External plugins must eventually execute out of process; an
-in-process Swift/Rust registry is for trusted first-party code only and cannot isolate
-a crash or forcibly cancel arbitrary code. Do not promise that a timeout does so.
+Document processing and inference stay local. Ollama endpoints are loopback-only; ordinary
+inference uses installed models. Onboarding can download a model only after confirmation.
+GitHub updates, opening download pages, browser links and explicit web searches are deliberate
+network actions. Container environment values are masked in review and excluded from argv and
+saved preferences; transient private env files and their cleanup limits are documented in the
+[feature guide](new-features.md#local-containers). Logs/events/metrics are bounded in memory;
+log export is an explicit local action.
 
-## Platform boundaries
+## Platform boundaries and verification
 
-Frontmost app is available through NSWorkspace. Selected text/focused window require
-Accessibility and cannot be assumed to exist in every app. Finder selections and
-browser tabs generally require app-specific Apple Events and Automation permission.
-Do not scrape UI or read browser databases as substitutes. Terminal working directory
-and editor project state have no universal macOS API. Process paths and sockets are
-best effort, constrained by ownership/TCC; PID identity must be revalidated before
-destructive actions. Restarting a process safely requires its original environment,
-arguments and supervisor contract and is not inferable from its display name.
+Accessibility, Screen Recording, Calendars and Automation are requested for relevant features.
+Missing access degrades those features; ordinary launching still works. App-specific context,
+Spotlight metadata, process visibility and runtime metrics may be unavailable. There is no
+untrusted in-process plugin mechanism, remote container control, or guarantee of hard indexing
+resource quotas or multi-million-document retrieval quality.
 
-## Baseline
+[The source map](agent-map.md) routes changes to focused checks. Rust tests cover parsers,
+storage and worker contracts; native harnesses cover UI, actions, helpers, onboarding and
+container fixtures. Fixtures do not operate on live workloads. `make agent-deliver` adds full
+release checks, signing, rollback, installation and state-preservation verification.
 
-230 Rust tests pass with loopback permitted. In the restricted sandbox 21 tests fail
-because socket binding/process inspection is denied; these are environment failures.
-Swift requires a writable CLANG_MODULE_CACHE_PATH in this environment.
-620-record Criterion typical query: 9.048–9.123 µs; two-character: 10.409–10.440 µs.
-These are ranker measurements, not end-to-end launcher latency.
+Earlier design and measurement checkpoints are catalogued in [the documentation index](README.md#historical-reports).

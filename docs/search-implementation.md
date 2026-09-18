@@ -1,5 +1,9 @@
 # Search upgrade implementation — September 16, 2026
 
+> **Historical record.** The implementation status, measurements and release instructions below
+> describe their recorded revision, not the current app. See the [documentation index](README.md),
+> [current feature guide](new-features.md) and [current release workflow](releasing.md).
+
 Version **0.2.9** is now signed, installed at `~/Applications/Blindspot.app`, and running.
 The user created the existing `v0.2.9` release tag; the agent did not commit, push or change it.
 The local follow-up changes below remain uncommitted. Existing user configuration was preserved.
