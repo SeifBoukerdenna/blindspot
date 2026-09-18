@@ -1,6 +1,6 @@
 # Blindspot — complete feature guide and workflows
 
-**Release: 0.3.2.** Build version; the release script updates this header. This guide follows
+**Release: 0.3.3.** Build version; the release script updates this header. This guide follows
 repository code, which can be ahead of the published release. It describes implemented features,
 not the full proposed roadmap.
 The release notes at the end distinguish new behavior from platform limitations.
